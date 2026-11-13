@@ -36,6 +36,8 @@
       <symbol id="i-check" viewBox="0 0 24 24"><path d="M20 6L9 17l-5-5"/></symbol>
       <symbol id="i-alert" viewBox="0 0 24 24"><path d="M12 9v4M12 17h.01M10.3 3.9L1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></symbol>
       <symbol id="i-back" viewBox="0 0 24 24"><path d="M1 4v6h6"/><path d="M3.5 15a9 9 0 1 0 2.1-9.4L1 10"/></symbol>
+      <symbol id="i-pip" viewBox="0 0 24 24"><rect x="2" y="4" width="20" height="16" rx="2"/><rect x="12" y="11" width="8" height="6" rx="1" fill="currentColor"/></symbol>
+      <symbol id="i-pip-exit" viewBox="0 0 24 24"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M17 17l-6-6M11 11v4M11 11h4"/></symbol>
       <symbol id="i-fwd" viewBox="0 0 24 24"><path d="M23 4v6h-6"/><path d="M20.5 15a9 9 0 1 1-2.1-9.4L23 10"/></symbol>
     </defs>
   </svg>
@@ -139,6 +141,7 @@
                   <button id="m-subs" class="icon-btn" title="Subtitles"><svg><use href="#i-cc"/></svg></button>
                   <div id="m-subs-menu" class="menu" hidden></div>
                 </div>
+                <button id="m-pip" class="icon-btn" title="Picture-in-picture (p)" hidden><svg><use href="#i-pip"/></svg></button>
                 <button id="m-full" class="icon-btn" title="Full screen (f)"><svg><use href="#i-expand"/></svg></button>
               </div>
             </div>
@@ -211,6 +214,12 @@
       <label>Subtitle size
         <select id="set-subsize">
           <option value="0.8">Small</option><option value="1" selected>Normal</option><option value="1.25">Large</option><option value="1.5">Huge</option>
+        </select>
+      </label>
+      <label id="set-pipstyle-label" hidden>Picture-in-picture style
+        <select id="set-pipstyle">
+          <option value="floating" selected>Floating player (controls and menus, browser title bar)</option>
+          <option value="compact">Compact video (no title bar, play/pause only)</option>
         </select>
       </label>
       <label>Subtitle delay (only for you, seconds) <input id="set-subdelay" type="number" step="0.1" value="0"></label>
