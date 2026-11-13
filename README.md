@@ -142,6 +142,25 @@ Tip: use headphones during the movie, so your microphone doesn't send the film's
 
 Usually not. STUN is enough for most home connections. Some friends may be behind very strict NAT, like certain mobile carriers or corporate networks. Their tile then shows "connection failed", and only they are affected. A TURN server ([coturn](https://github.com/coturn/coturn)) fixes this by relaying *their* media. That uses bandwidth on whatever host runs coturn, so it's opt-in. Configure coturn with `use-auth-secret` and `static-auth-secret=...`, then set `TURN_URLS` and `TURN_SECRET`.
 
+## Customizing the look
+
+All colors are CSS variables at the top of `public/assets/css/style.css` (the `:root` block). The admin page uses the same stylesheet.
+
+To change the accent color (yellow/orange by default), edit:
+
+```css
+--accent: #f2a541;      /* buttons, logo, seek bar, highlights, links, focus rings */
+--accent-ink: #1b1305;  /* text drawn on top of the accent (e.g. primary buttons) */
+```
+
+If you pick a darker accent, set `--accent-ink` to a light color (e.g. `#ffffff`) so button text stays readable.
+
+The browser-tab icon has the color hard-coded: also change `fill="#f2a541"` in `public/assets/icon.svg`.
+
+Other colors in the same block: `--bg`, `--bg-2`, `--bg-3` (backgrounds), `--line` (borders), `--text`, `--muted` (text), `--danger` (leave/delete), `--ok` (speaking indicator).
+
+When running with Docker, rebuild the image after editing: `docker compose up -d --build`.
+
 ## Development and tests
 
 ```bash
