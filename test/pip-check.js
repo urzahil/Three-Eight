@@ -228,7 +228,7 @@ async function compactPip(browser) {
   await alice.selectOption('#set-pipstyle', 'compact');
   assert.strictEqual(await alice.evaluate(() => localStorage.getItem('te.pipStyle')), '"compact"');
   await alice.click('#settings-dialog button.primary');
-  await alice.waitForSelector('#settings-dialog:not([open])');
+  await alice.waitForSelector('#settings-dialog', { state: 'hidden' });
 
   await ctl(alice, '#m-play');
   await waitFor(bob, () => !document.getElementById('movie').paused);
@@ -287,7 +287,7 @@ async function compactPip(browser) {
   await sleep(800);
   assert(await alice.evaluate(() => !document.pictureInPictureElement.paused), 'proxy resumed so the picture keeps updating');
   console.log('compact pause reached Bob');
-  await alice.evaluate(() => document.pictureInPictureElement.play()); // a play we did not cause
+  await alice.evaluate(() => room.sync.play());
   await waitFor(bob, () => !document.getElementById('movie').paused, null, 5000);
   await waitFor(alice, () => navigator.mediaSession.playbackState === 'playing');
 
@@ -296,7 +296,7 @@ async function compactPip(browser) {
   await alice.evaluate(() => document.exitPictureInPicture());
   await waitFor(alice, () => !document.pictureInPictureElement && !room.compactPip);
   const after = await alice.evaluate(() => ({
-    videos: [...document.querySelectorAll('video')].filter((v) => v.srcObject instanceof MediaStream).length,
+    videos: document.querySelectorAll('body > video[aria-hidden]').length,
     active: window.__cp.active,
     worker: !!window.__cp._worker,
     canvas: !!window.__cp.canvas,

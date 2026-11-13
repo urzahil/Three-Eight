@@ -35,7 +35,9 @@ Simple files with a single audio track play natively.
 
 The PiP button (or `p`) behaves differently per browser, because our subtitles are drawn by the page rather than by the video element:
 
-- **Chrome and Edge** use Document Picture-in-Picture. The whole player moves into a floating window, so our subtitles, controls, audio and subtitle menus, and the seek bar keep working. Close the window or click *Bring it back* to return it to the page.
+- **Chrome and Edge** offer two styles, chosen in *Settings* under *Picture-in-picture style* (changing it closes an open PiP window; the next click uses the new style):
+  - *Floating player* (default) uses Document Picture-in-Picture. The whole player moves into a floating window, so our subtitles, controls, audio and subtitle menus, and the seek bar keep working. Close the window or click *Bring it back* to return it to the page. The browser adds a title bar showing the site address, which pages cannot remove.
+  - *Compact video* has no title bar: the window shows only the video and our subtitles, with play/pause (shared with the room). There are no menus or seek bar in the window, so change audio and subtitle tracks from the page. This style redraws the movie frames and subtitles on a canvas and plays that in the browser's native video PiP, which costs slightly more CPU.
 - **Safari** (desktop and iOS) uses the system video PiP. Our subtitles are mirrored into a native caption track, which Safari shows as captions in the PiP window. Pausing or playing from the system PiP controls is sent to the room.
 - **Firefox** has no PiP API for pages, so use Firefox's own PiP toggle on the video. The subtitles are exposed as a caption track, which Firefox may show there (best effort).
 
@@ -165,7 +167,7 @@ node test/e2e.js
 node test/pip-check.js
 ```
 
-`player-check.js` tests the in-browser player on its own: native or remux mode, audio track switching, seeking and subtitles. `e2e.js` tests the whole flow: the admin creates a room, a wrong password is rejected, two people join with fake cameras, video flows peer to peer, mute and camera state and chat arrive on the other side, and the movie syncs. The movie part covers play, pause, seeking, audio and subtitle changes, a shared subtitle file, and a late joiner. Finally the admin deletes the room and everyone is disconnected. `pip-check.js` tests picture-in-picture: the Document PiP window (the movie box moves there, subtitles still render, controls inside it drive the other person, and closing it brings the player back), and the native-PiP fallback (the subtitles are mirrored into a caption track, and a pause made directly on the `<video>` reaches the room).
+`player-check.js` tests the in-browser player on its own: native or remux mode, audio track switching, seeking and subtitles. `e2e.js` tests the whole flow: the admin creates a room, a wrong password is rejected, two people join with fake cameras, video flows peer to peer, mute and camera state and chat arrive on the other side, and the movie syncs. The movie part covers play, pause, seeking, audio and subtitle changes, a shared subtitle file, and a late joiner. Finally the admin deletes the room and everyone is disconnected. `pip-check.js` tests picture-in-picture: the Document PiP window (the movie box moves there, subtitles still render, controls inside it drive the other person, and closing it brings the player back), the native-PiP fallback (the subtitles are mirrored into a caption track, and a pause made directly on the `<video>` reaches the room), and the compact style (chosen in Settings: the canvas stream is in native PiP, the subtitles and video are drawn on the canvas, a pause on the PiP element reaches the room, and leaving PiP cleans up).
 
 ## License
 

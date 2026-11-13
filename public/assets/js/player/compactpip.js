@@ -188,7 +188,8 @@ export class CompactPip extends EventTarget {
     let curW = 0;
     for (const run of runs) {
       ctx.font = this._font(run, fs);
-      for (const word of run.text.split(/(?<= )/)) {
+      // Words with their trailing spaces (no lookbehind: older Safari can't parse it).
+      for (const word of run.text.match(/[^ ]+ *| +/g) || []) {
         const width = ctx.measureText(word).width;
         if (curW + width > maxW && cur.length && word.trim()) {
           out.push(cur);
