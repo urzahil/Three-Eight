@@ -1,0 +1,18 @@
+.admin { max-width: 900px; margin: 0 auto; padding: 16px; display: flex; flex-direction: column; gap: 16px; }
+.admin-head { display: flex; align-items: center; gap: 12px; padding: 4px 0; }
+.admin-card { width: 100%; display: flex; flex-direction: column; gap: 14px; }
+.create-form { display: grid; grid-template-columns: 1fr 1fr auto; gap: 12px; align-items: end; }
+.rooms { width: 100%; border-collapse: collapse; font-size: 14px; }
+.rooms th { text-align: left; color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; padding: 8px; border-bottom: 1px solid var(--line); }
+.rooms td { padding: 10px 8px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+.rooms td:last-child { text-align: right; white-space: nowrap; }
+.rooms a { font-weight: 600; text-decoration: none; }
+.rooms .btn { padding: 6px 10px; font-size: 13px; }
+code { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 1px 6px; font-size: 13px; }
+@media (max-width: 640px) {
+  .create-form { grid-template-columns: 1fr; }
+  .rooms thead { display: none; }
+  .rooms tr { display: grid; grid-template-columns: 1fr auto; padding: 8px 0; border-bottom: 1px solid var(--line); }
+  .rooms td { border: 0; padding: 4px 8px; }
+  .rooms td:last-child { grid-column: 1 / -1; text-align: left; }
+}

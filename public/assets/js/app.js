@@ -1,0 +1,1188 @@
+import { Signaling } from './signaling.js';
+import { Mesh } from './mesh.js';
+import { MovieSync, sameMovie } from './sync.js';
+import { MoviePlayer } from './player/player.js';
+import { LocalMedia, watchLevel, audioContext } from './media.js';
+
+const $ = (id) => document.getElementById(id);
+const store = {
+  get(k, d = null) {
+    try {
+      const v = localStorage.getItem('te.' + k);
+      return v == null ? d : JSON.parse(v);
+    } catch {
+      return d;
+    }
+  },
+  set(k, v) {
+    try {
+      if (v == null) localStorage.removeItem('te.' + k);
+      else localStorage.setItem('te.' + k, JSON.stringify(v));
+    } catch {
+      /* private mode */
+    }
+  },
+};
+
+function show(screen) {
+  for (const id of ['landing', 'lobby', 'message', 'room']) $(id).hidden = id !== screen;
+}
+
+function showMessage(title, text) {
+  $('message-title').textContent = title;
+  $('message-text').textContent = text;
+  show('message');
+}
+
+function toast(text, kind = '') {
+  const el = document.createElement('div');
+  el.className = 'toast ' + kind;
+  el.textContent = text;
+  $('toasts').appendChild(el);
+  setTimeout(() => el.remove(), kind === 'warn' ? 6000 : 3500);
+  while ($('toasts').children.length > 4) $('toasts').firstChild.remove();
+}
+
+function icon(name) {
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  const use = document.createElementNS('http://www.w3.org/2000/svg', 'use');
+  use.setAttribute('href', '#i-' + name);
+  svg.appendChild(use);
+  return svg;
+}
+
+function setIcon(btn, name) {
+  btn.querySelector('use').setAttribute('href', '#i-' + name);
+}
+
+function fmtTime(s) {
+  if (!Number.isFinite(s) || s < 0) s = 0;
+  s = Math.floor(s);
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+  return h ? `${h}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}` : `${m}:${String(sec).padStart(2, '0')}`;
+}
+
+function fmtSize(b) {
+  if (!b) return '';
+  const u = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let i = 0;
+  while (b >= 1024 && i < u.length - 1) { b /= 1024; i++; }
+  return `${b.toFixed(i >= 3 ? 2 : i ? 1 : 0)} ${u[i]}`;
+}
+
+const COLORS = ['#c2410c', '#0f766e', '#7c3aed', '#be123c', '#1d4ed8', '#4d7c0f', '#a16207', '#0e7490', '#9d174d', '#4338ca'];
+function colorFor(id) {
+  let h = 0;
+  for (const c of id) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+  return COLORS[h % COLORS.length];
+}
+function initials(name) {
+  const parts = String(name || '?').trim().split(/\s+/);
+  return ((parts[0]?.[0] || '?') + (parts.length > 1 ? parts[parts.length - 1][0] : '')).toUpperCase();
+}
+
+function randomId() {
+  const a = new Uint8Array(12);
+  crypto.getRandomValues(a);
+  return [...a].map((b) => b.toString(36).padStart(2, '0')).join('').slice(0, 20);
+}
+
+async function hashText(text) {
+  try {
+    const d = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+    return [...new Uint8Array(d)].slice(0, 8).map((b) => b.toString(16).padStart(2, '0')).join('');
+  } catch {
+    let h = 2166136261;
+    for (let i = 0; i < text.length; i++) h = Math.imul(h ^ text.charCodeAt(i), 16777619);
+    return (h >>> 0).toString(16) + text.length.toString(16);
+  }
+}
+
+function linkify(text, parent) {
+  const re = /\bhttps?:\/\/[^\s<>"']+/g;
+  let last = 0, m;
+  while ((m = re.exec(text))) {
+    parent.append(text.slice(last, m.index));
+    const a = document.createElement('a');
+    a.href = m[0];
+    a.textContent = m[0];
+    a.target = '_blank';
+    a.rel = 'noopener noreferrer';
+    parent.append(a);
+    last = re.lastIndex;
+  }
+  parent.append(text.slice(last));
+}
+
+// ---------------------------------------------------------------------------
+// Entry
+// ---------------------------------------------------------------------------
+const roomName = decodeURIComponent(location.pathname.replace(/^\/+|\/+$/g, ''));
+
+if (!roomName) {
+  show('landing');
+  $('landing-form').addEventListener('submit', (e) => {
+    e.preventDefault();
+    const r = $('landing-room').value.trim();
+    if (r) location.href = '/' + encodeURIComponent(r);
+  });
+} else {
+  startLobby(roomName).catch((err) => {
+    console.error(err);
+    showMessage('Something went wrong', err.message || String(err));
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Lobby
+// ---------------------------------------------------------------------------
+async function startLobby(room) {
+  const res = await fetch('/api/rooms/' + encodeURIComponent(room));
+  if (res.status === 404) {
+    showMessage('Room not found', `There is no room called “${room}”. Check the link with whoever invited you.`);
+    return;
+  }
+  if (!res.ok) throw new Error('Server error');
+  const info = await res.json();
+  document.title = `${info.name} · Three-Eight`;
+  $('lobby-room-name').textContent = info.name;
+  $('lobby-name').value = store.get('name', '');
+  const pwKey = 'pw.' + info.name.toLowerCase();
+  $('lobby-password-wrap').hidden = !info.passwordRequired;
+  $('lobby-remember-wrap').hidden = !info.passwordRequired;
+  const savedPw = store.get(pwKey, '');
+  $('lobby-password').value = savedPw;
+  $('lobby-remember').checked = !!savedPw;
+  $('lobby-password').required = info.passwordRequired;
+  show('lobby');
+  (store.get('name') ? (info.passwordRequired && !savedPw ? $('lobby-password') : $('lobby-join')) : $('lobby-name')).focus();
+
+  const media = new LocalMedia({ ...store.get('media', {}), processing: store.get('processing', true) });
+  const preview = $('lobby-video');
+  let stopMeter = () => {};
+  const refreshPreview = () => {
+    preview.srcObject = media.videoTrack ? new MediaStream([media.videoTrack]) : null;
+    preview.hidden = !media.videoTrack;
+    $('lobby-avatar').hidden = !!media.videoTrack;
+    $('lobby-avatar').textContent = initials($('lobby-name').value || '?');
+    $('lobby-avatar').style.background = colorFor($('lobby-name').value || 'x');
+    $('lobby-mic').classList.toggle('off', !media.micOn || !media.audioTrack);
+    setIcon($('lobby-mic'), media.micOn && media.audioTrack ? 'mic' : 'mic-off');
+    $('lobby-cam').classList.toggle('off', !media.camOn);
+    setIcon($('lobby-cam'), media.camOn ? 'cam' : 'cam-off');
+    stopMeter();
+    stopMeter = watchLevel(media.audioTrack, (l) => {
+      $('lobby-meter').style.height = media.micOn ? `${Math.round(l * 100)}%` : '0';
+    });
+  };
+  media.addEventListener('change', refreshPreview);
+  $('lobby-name').addEventListener('input', refreshPreview);
+  await media.init();
+  refreshPreview();
+  if (media.errors.audio || media.errors.video) {
+    const e = media.errors.audio || media.errors.video;
+    if (e.name === 'NotAllowedError') toast('Camera/microphone access was blocked. You can still join and watch.', 'warn');
+    else if (e.name === 'NotSupportedError') toast(e.message, 'warn');
+  }
+  const fillDevices = async () => {
+    const d = await media.devices();
+    for (const kind of ['audio', 'video']) {
+      const sel = $(`lobby-${kind}-dev`);
+      sel.replaceChildren(...d[kind].map((dev, i) => new Option(dev.label || `${kind === 'audio' ? 'Microphone' : 'Camera'} ${i + 1}`, dev.deviceId)));
+      sel.value = media.currentDeviceId(kind);
+    }
+  };
+  fillDevices();
+  $('lobby-audio-dev').onchange = (e) => media.setDevice('audio', e.target.value);
+  $('lobby-video-dev').onchange = (e) => media.setDevice('video', e.target.value);
+  $('lobby-mic').onclick = () => media.setMic(!media.micOn);
+  $('lobby-cam').onclick = async () => {
+    const ok = await media.setCam(!media.camOn);
+    if (!ok) toast('Could not start the camera.', 'warn');
+    fillDevices();
+  };
+
+  $('lobby-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const name = $('lobby-name').value.trim().slice(0, 40);
+    if (!name) return;
+    store.set('name', name);
+    $('lobby-error').hidden = true;
+    $('lobby-join').disabled = true;
+    $('lobby-join').textContent = 'Joining…';
+    audioContext(); // unlock audio during the click
+    const password = $('lobby-password').value;
+    try {
+      const cfg = await (await fetch('/api/config')).json();
+      const id = sessionStorage.getItem('te.id') || randomId();
+      sessionStorage.setItem('te.id', id);
+      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const signaling = new Signaling(`${proto}//${location.host}/ws`);
+      const welcome = await signaling.join({ room: info.name, id, name, password });
+      store.set(pwKey, $('lobby-remember').checked && password ? password : null);
+      store.set('media', { mic: media.micOn, cam: media.camOn, audioDevice: media.deviceIds.audio, videoDevice: media.deviceIds.video });
+      stopMeter();
+      media.removeEventListener('change', refreshPreview);
+      preview.srcObject = null;
+      new Room({ signaling, welcome, media, name, id, iceServers: cfg.iceServers, roomName: welcome.room || info.name });
+    } catch (err) {
+      $('lobby-error').textContent = err.message || 'Could not join the room.';
+      $('lobby-error').hidden = false;
+      $('lobby-join').disabled = false;
+      $('lobby-join').textContent = 'Join room';
+      if (err.code === 'bad-password') {
+        $('lobby-password').select();
+        store.set(pwKey, null);
+      }
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Room
+// ---------------------------------------------------------------------------
+class Room {
+  constructor({ signaling, welcome, media, name, id, iceServers, roomName }) {
+    this.signaling = signaling;
+    this.media = media;
+    this.name = name;
+    this.id = id;
+    this.roomName = roomName;
+    this.tiles = new Map();
+    this.profiles = new Map(); // peerId -> {name, audio, video}
+    this.chat = [];
+    this.chatIds = new Set();
+    this.unread = 0;
+
+    this.mesh = new Mesh(signaling, id, iceServers);
+    this.mesh.setTrack('audio', media.audioTrack);
+    this.mesh.setTrack('video', media.videoTrack);
+    this.player = new MoviePlayer($('movie'), $('subs-layer'));
+    this.player.video.volume = store.get('movieVolume', 1);
+    this.sync = new MovieSync({ mesh: this.mesh, signaling, player: this.player, selfId: id });
+
+    if (new URLSearchParams(location.search).has('debug')) window.room = this;
+    document.title = `${roomName} · Three-Eight`;
+    $('room-title').textContent = roomName;
+    show('room');
+
+    this._initTiles();
+    this._initToolbar();
+    this._initChat();
+    this._initMovie();
+    this._initSettings();
+    this._initKeyboard();
+
+    for (const p of welcome.peers) {
+      this.profiles.set(p.id, { name: p.name, audio: false, video: false });
+      this.mesh.addPeer(p.id, p.name);
+    }
+
+    signaling.addEventListener('disconnected', () => this._setConn('Reconnecting to server…'));
+    signaling.addEventListener('reconnected', () => this._setConn(''));
+    signaling.addEventListener('fatal', (e) => {
+      this.leave(false);
+      showMessage('Disconnected', e.detail.message || 'You were disconnected from the room.');
+    });
+    window.addEventListener('pagehide', () => this.leave(false));
+    this._wakeLock();
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') this._wakeLock();
+    });
+    if (!welcome.peers.length) this._systemMessage('You are the first one here. Click “Invite” to copy the room link.');
+  }
+
+  async _wakeLock() {
+    try {
+      this.lock = await navigator.wakeLock?.request('screen');
+    } catch {
+      /* not supported */
+    }
+  }
+
+  _setConn(text) {
+    $('conn-status').textContent = text;
+    $('conn-status').hidden = !text;
+  }
+
+  profileOf(peerId) {
+    if (peerId === this.id) return { name: this.name, audio: this.media.micOn && !!this.media.audioTrack, video: !!this.media.videoTrack };
+    return this.profiles.get(peerId) || { name: this.mesh.peers.get(peerId)?.name || 'Guest', audio: false, video: false };
+  }
+
+  _broadcastProfile(peer) {
+    const msg = { type: 'profile', name: this.name, audio: this.media.micOn && !!this.media.audioTrack, video: !!this.media.videoTrack };
+    if (peer) peer.send(msg);
+    else this.mesh.broadcast(msg);
+  }
+
+  // ---- video tiles -------------------------------------------------------------
+  _initTiles() {
+    const self = this._makeTile(this.id, true);
+    self.video.muted = true;
+    this._refreshSelfTile();
+    this.media.addEventListener('change', async (e) => {
+      const kind = e.detail.kind;
+      await this.mesh.setTrack(kind, kind === 'audio' ? this.media.audioTrack : this.media.videoTrack);
+      this._refreshSelfTile();
+      this._broadcastProfile();
+      this._refreshToolbar();
+      this._renderPeople();
+    });
+
+    this.mesh.addEventListener('peer-added', (e) => {
+      const peer = e.detail.peer;
+      if (!this.profiles.has(peer.id)) this.profiles.set(peer.id, { name: peer.name || 'Guest', audio: false, video: false });
+      this._makeTile(peer.id, false);
+      this._updateTile(peer.id);
+      this._renderPeople();
+    });
+    this.mesh.addEventListener('peer-removed', (e) => {
+      const peer = e.detail.peer;
+      const t = this.tiles.get(peer.id);
+      t?.stopLevel?.();
+      t?.el.remove();
+      this.tiles.delete(peer.id);
+      const prof = this.profiles.get(peer.id);
+      this._systemMessage(`${prof?.name || 'Someone'} left`);
+      this.profiles.delete(peer.id);
+      this._layout();
+      this._renderPeople();
+    });
+    this.mesh.addEventListener('track', (e) => {
+      const peer = e.detail.peer;
+      const t = this.tiles.get(peer.id);
+      if (!t) return;
+      t.video.srcObject = peer.stream;
+      t.video.play().catch(() => {});
+      const at = peer.stream.getAudioTracks()[0];
+      if (at && t.levelTrack !== at) {
+        t.stopLevel?.();
+        t.levelTrack = at;
+        t.stopLevel = watchLevel(at, (l) => t.el.classList.toggle('speaking', l > 0.08 && this.profileOf(peer.id).audio));
+      }
+    });
+    this.mesh.addEventListener('channel-open', (e) => {
+      const peer = e.detail.peer;
+      this._broadcastProfile(peer);
+      if (this.chat.length) peer.send({ type: 'chat-history', messages: this.chat.slice(-100) });
+    });
+    this.mesh.addEventListener('peer-state', (e) => {
+      const t = this.tiles.get(e.detail.peer.id);
+      if (!t) return;
+      const s = e.detail.state;
+      t.state.textContent = s === 'connected' ? '' : s === 'failed' ? 'connection failed' : s === 'new' || s === 'connecting' ? 'connecting…' : s;
+      t.state.hidden = !t.state.textContent;
+      if (s === 'failed') toast(`Can't reach ${this.profileOf(e.detail.peer.id).name} directly. A TURN server may be needed (see README).`, 'warn');
+    });
+    this.mesh.addEventListener('message', (e) => {
+      const { peer, msg } = e.detail;
+      if (msg.type === 'profile') {
+        const prev = this.profiles.get(peer.id);
+        const name = String(msg.name || 'Guest').slice(0, 40);
+        const first = !prev || !prev.seen;
+        this.profiles.set(peer.id, { name, audio: !!msg.audio, video: !!msg.video, seen: true });
+        if (first) this._systemMessage(`${name} joined`);
+        this._updateTile(peer.id);
+        this._renderPeople();
+      }
+    });
+    new ResizeObserver(() => this._layout()).observe($('grid'));
+    this._layout();
+  }
+
+  _makeTile(id, self) {
+    const el = document.createElement('div');
+    el.className = 'tile' + (self ? ' self' : '');
+    const video = document.createElement('video');
+    video.autoplay = true;
+    video.playsInline = true;
+    const avatar = document.createElement('div');
+    avatar.className = 'avatar';
+    const label = document.createElement('div');
+    label.className = 'label';
+    const micIcon = icon('mic-off');
+    const nameEl = document.createElement('span');
+    label.append(micIcon, nameEl);
+    const state = document.createElement('div');
+    state.className = 'state';
+    state.hidden = true;
+    if (!self) {
+      state.textContent = 'connecting…';
+      state.hidden = false;
+    }
+    el.append(video, avatar, label, state);
+    $('grid').appendChild(el);
+    const tile = { el, video, avatar, nameEl, micIcon, state };
+    this.tiles.set(id, tile);
+    this._layout();
+    return tile;
+  }
+
+  _refreshSelfTile() {
+    const t = this.tiles.get(this.id);
+    t.video.srcObject = this.media.videoTrack ? new MediaStream([this.media.videoTrack]) : null;
+    this._updateTile(this.id);
+    if (this.media.audioTrack !== t.levelTrack) {
+      t.stopLevel?.();
+      t.levelTrack = this.media.audioTrack;
+      t.stopLevel = watchLevel(this.media.audioTrack, (l) => t.el.classList.toggle('speaking', l > 0.08 && this.media.micOn));
+    }
+  }
+
+  _updateTile(id) {
+    const t = this.tiles.get(id);
+    if (!t) return;
+    const p = this.profileOf(id);
+    t.nameEl.textContent = id === this.id ? `${p.name} (you)` : p.name;
+    t.avatar.textContent = initials(p.name);
+    t.avatar.style.background = colorFor(id);
+    t.el.classList.toggle('no-video', !p.video);
+    t.micIcon.style.display = p.audio ? 'none' : '';
+  }
+
+  _layout() {
+    const grid = $('grid');
+    const n = this.tiles.size;
+    if ($('main').classList.contains('watching')) {
+      grid.style.removeProperty('--cols');
+      return;
+    }
+    const W = grid.clientWidth || 1, H = grid.clientHeight || 1;
+    let best = 1, bestSize = 0;
+    for (let cols = 1; cols <= n; cols++) {
+      const rows = Math.ceil(n / cols);
+      const w = Math.min(W / cols, ((H / rows) * 16) / 9);
+      if (w > bestSize) { bestSize = w; best = cols; }
+    }
+    grid.style.setProperty('--cols', best);
+  }
+
+  // ---- toolbar -------------------------------------------------------------------
+  _initToolbar() {
+    $('t-mic').onclick = () => this.toggleMic();
+    $('t-cam').onclick = () => this.toggleCam();
+    $('t-chat').onclick = () => this.toggleSidebar('chat');
+    $('t-movie').onclick = () => this.openMovieDialog();
+    $('t-settings').onclick = () => this.openSettings();
+    $('t-leave').onclick = () => {
+      this.leave(true);
+      showMessage('You left the room', 'Thanks for hanging out!');
+      const again = document.createElement('a');
+      again.className = 'btn primary';
+      again.href = location.pathname;
+      again.textContent = 'Rejoin';
+      $('message-text').after(again);
+    };
+    $('copy-link').onclick = async () => {
+      const url = location.origin + '/' + encodeURIComponent(this.roomName);
+      try {
+        await navigator.clipboard.writeText(url);
+        toast('Room link copied. Share the password separately.');
+      } catch {
+        prompt('Room link', url);
+      }
+    };
+    $('sidebar-close').onclick = () => this.toggleSidebar(null);
+    for (const tab of document.querySelectorAll('.tab')) tab.onclick = () => this._selectTab(tab.dataset.tab);
+    this._refreshToolbar();
+  }
+
+  _refreshToolbar() {
+    const micOn = this.media.micOn && !!this.media.audioTrack;
+    $('t-mic').classList.toggle('off', !micOn);
+    setIcon($('t-mic'), micOn ? 'mic' : 'mic-off');
+    $('t-mic').querySelector('span').textContent = micOn ? 'Mute' : 'Unmute';
+    const camOn = !!this.media.videoTrack;
+    $('t-cam').classList.toggle('off', !camOn);
+    setIcon($('t-cam'), camOn ? 'cam' : 'cam-off');
+    $('t-cam').querySelector('span').textContent = camOn ? 'Stop video' : 'Start video';
+    $('t-chat').classList.toggle('active', !$('sidebar').hidden);
+    $('t-movie').classList.toggle('active', !$('stage').hidden);
+  }
+
+  async toggleMic() {
+    const ok = await this.media.setMic(!this.media.micOn);
+    if (!ok) toast('Could not access a microphone.', 'warn');
+    store.set('media', { ...store.get('media', {}), mic: this.media.micOn });
+  }
+
+  async toggleCam() {
+    const ok = await this.media.setCam(!this.media.camOn);
+    if (!ok) toast('Could not start the camera.', 'warn');
+    store.set('media', { ...store.get('media', {}), cam: this.media.camOn });
+  }
+
+  toggleSidebar(tab) {
+    const sb = $('sidebar');
+    if (!tab || (!sb.hidden && this.tab === tab)) sb.hidden = true;
+    else {
+      sb.hidden = false;
+      this._selectTab(tab);
+    }
+    this._refreshToolbar();
+    this._layout();
+  }
+
+  _selectTab(tab) {
+    this.tab = tab;
+    for (const t of document.querySelectorAll('.tab')) t.classList.toggle('active', t.dataset.tab === tab);
+    $('tab-chat').hidden = tab !== 'chat';
+    $('tab-people').hidden = tab !== 'people';
+    if (tab === 'chat') {
+      this.unread = 0;
+      $('chat-badge').hidden = true;
+      $('chat-log').scrollTop = $('chat-log').scrollHeight;
+      if (matchMedia('(pointer: fine)').matches) $('chat-input').focus();
+    }
+    if (tab === 'people') this._renderPeople();
+  }
+
+  _renderPeople() {
+    const ids = [this.id, ...this.mesh.peers.keys()];
+    $('people-count').textContent = ids.length;
+    if ($('tab-people').hidden) return;
+    const movie = this.sync.state.movie;
+    $('people').replaceChildren(...ids.map((id) => {
+      const p = this.profileOf(id);
+      const li = document.createElement('li');
+      const av = document.createElement('div');
+      av.className = 'avatar';
+      av.textContent = initials(p.name);
+      av.style.background = colorFor(id);
+      const who = document.createElement('div');
+      who.className = 'who';
+      const nm = document.createElement('div');
+      nm.textContent = id === this.id ? `${p.name} (you)` : p.name;
+      who.append(nm);
+      if (movie) {
+        const st = id === this.id ? { file: this.sync.localFile, matches: this.sync.fileMatches } : this.sync.peerStatus.get(id);
+        const small = document.createElement('small');
+        small.textContent = !st || !st.file ? 'no movie file loaded' : st.matches ? (st.buffering ? 'loading…' : 'ready to watch') : 'different file';
+        who.append(small);
+      }
+      const mic = icon(p.audio ? 'mic' : 'mic-off');
+      if (!p.audio) mic.classList.add('bad');
+      const cam = icon(p.video ? 'cam' : 'cam-off');
+      if (!p.video) cam.classList.add('bad');
+      li.append(av, who, mic, cam);
+      return li;
+    }));
+  }
+
+  // ---- chat --------------------------------------------------------------------------
+  _initChat() {
+    $('chat-form').addEventListener('submit', (e) => {
+      e.preventDefault();
+      const text = $('chat-input').value.trim();
+      if (!text) return;
+      $('chat-input').value = '';
+      const msg = { id: randomId(), from: this.id, name: this.name, text: text.slice(0, 2000), ts: this.signaling.now() };
+      this._addChat(msg);
+      this.mesh.broadcast({ type: 'chat', msg });
+    });
+    this.mesh.addEventListener('message', (e) => {
+      const { peer, msg } = e.detail;
+      if (msg.type === 'chat' && msg.msg) this._addChat(this._cleanChat(msg.msg, peer));
+      if (msg.type === 'chat-history' && Array.isArray(msg.messages)) {
+        for (const m of msg.messages.slice(-100)) this._addChat(this._cleanChat(m, null), true);
+      }
+    });
+  }
+
+  _cleanChat(m, peer) {
+    return {
+      id: String(m.id || randomId()).slice(0, 40),
+      from: peer ? peer.id : String(m.from || ''),
+      name: String((peer ? this.profileOf(peer.id).name : m.name) || 'Guest').slice(0, 40),
+      text: String(m.text || '').slice(0, 2000),
+      ts: Number(m.ts) || this.signaling.now(),
+    };
+  }
+
+  _addChat(m, quiet = false) {
+    if (!m.text || this.chatIds.has(m.id)) return;
+    this.chatIds.add(m.id);
+    this.chat.push(m);
+    this.chat.sort((a, b) => a.ts - b.ts);
+    if (this.chat.length > 500) this.chat.shift();
+    const log = $('chat-log');
+    const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+    const el = document.createElement('div');
+    el.className = 'msg';
+    el.dataset.ts = m.ts;
+    const meta = document.createElement('div');
+    meta.className = 'meta';
+    const b = document.createElement('b');
+    b.textContent = m.from === this.id ? 'You' : m.name;
+    meta.append(b, new Date(m.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
+    const body = document.createElement('div');
+    body.className = 'body';
+    linkify(m.text, body);
+    el.append(meta, body);
+    // Insert in timestamp order (history may arrive late).
+    const after = [...log.children].reverse().find((c) => Number(c.dataset.ts || 0) <= m.ts);
+    if (after) after.after(el);
+    else log.prepend(el);
+    if (atBottom || m.from === this.id) log.scrollTop = log.scrollHeight;
+    const visible = !$('sidebar').hidden && this.tab === 'chat';
+    if (!visible && m.from !== this.id && !quiet) {
+      this.unread++;
+      $('chat-badge').textContent = this.unread > 9 ? '9+' : this.unread;
+      $('chat-badge').hidden = false;
+      toast(`${m.name}: ${m.text.slice(0, 80)}`);
+    }
+  }
+
+  _systemMessage(text) {
+    const el = document.createElement('div');
+    el.className = 'msg system';
+    el.dataset.ts = this.signaling.now();
+    el.textContent = text;
+    $('chat-log').appendChild(el);
+    $('chat-log').scrollTop = $('chat-log').scrollHeight;
+  }
+
+  // ---- movie ---------------------------------------------------------------------------
+  _initMovie() {
+    const p = this.player;
+    const sync = this.sync;
+    const box = $('movie-box');
+
+    $('movie-file').addEventListener('change', (e) => {
+      const f = e.target.files[0];
+      e.target.value = '';
+      $('movie-dialog').close();
+      if (f) this.chooseMovieFile(f);
+    });
+    $('movie-dialog').addEventListener('close', () => {
+      const v = $('movie-dialog').returnValue;
+      if (v === 'unload') {
+        p.unload();
+        sync.clearLocalFile();
+      } else if (v === 'close') {
+        p.unload();
+        sync.clearLocalFile();
+        sync.closeMovie();
+      }
+    });
+    $('sub-file').addEventListener('change', async (e) => {
+      const f = e.target.files[0];
+      e.target.value = '';
+      if (!f) return;
+      if (f.size > 5 * 1024 * 1024) return toast('Subtitle file is too large.', 'warn');
+      let text = await f.text();
+      if (text.includes('�')) {
+        // Not UTF-8: most older subtitle files are Windows-1252 / Latin-1.
+        try {
+          text = new TextDecoder('windows-1252').decode(await f.arrayBuffer());
+        } catch {
+          /* keep */
+        }
+      }
+      const id = 'x' + (await hashText(text));
+      sync.addSubtitleFile({ id, name: f.name, text });
+      toast(`Subtitles “${f.name}” shared with everyone.`);
+    });
+
+    // Controls
+    $('m-play').onclick = () => this._userAction(() => sync.toggle());
+    $('m-back').onclick = () => this._userAction(() => sync.seek(Math.max(0, this._pos() - 10)));
+    $('m-fwd').onclick = () => this._userAction(() => sync.seek(this._pos() + 10));
+    box.querySelector('video').addEventListener('click', () => this._userAction(() => sync.toggle()));
+    box.querySelector('video').addEventListener('dblclick', () => this.toggleFullscreen());
+    $('m-volume').value = p.video.volume;
+    $('m-volume').oninput = (e) => {
+      p.video.volume = Number(e.target.value);
+      p.video.muted = false;
+      store.set('movieVolume', p.video.volume);
+      this._refreshVolume();
+    };
+    $('m-mute').onclick = () => {
+      p.video.muted = !p.video.muted;
+      this._refreshVolume();
+    };
+    $('m-full').onclick = () => this.toggleFullscreen();
+    this._initSeekBar();
+    this._initMenus();
+
+    // Hide controls when idle.
+    let idleTimer = 0;
+    const wake = () => {
+      box.classList.remove('idle');
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        if (!p.paused && !box.querySelector('.menu:not([hidden])')) box.classList.add('idle');
+      }, 3000);
+    };
+    box.addEventListener('pointermove', wake);
+    box.addEventListener('pointerdown', wake);
+    p.addEventListener('pause', wake);
+
+    // Player events
+    p.addEventListener('tracks', () => this._renderMenus());
+    p.addEventListener('notice', (e) => toast(e.detail.text, 'warn'));
+    p.addEventListener('fatal', (e) => {
+      toast(e.detail.text, 'warn');
+      this._renderStage();
+    });
+    p.addEventListener('status', (e) => {
+      if (e.detail.text) $('m-ready').textContent = e.detail.text;
+    });
+    for (const ev of ['play', 'pause', 'ended']) p.addEventListener(ev, () => this._refreshPlayButton());
+
+    sync.addEventListener('state', () => {
+      this._renderStage();
+      this._renderMenus();
+      this._renderPeople();
+    });
+    sync.addEventListener('status', () => {
+      this._renderReady();
+      this._renderPeople();
+    });
+    sync.addEventListener('blocked', () => this._renderStage());
+    sync.addEventListener('remote-change', (e) => this._announce(e.detail));
+
+    setInterval(() => this._renderTime(), 250);
+    this._renderStage();
+  }
+
+  _pos() {
+    return this.sync.fileMatches && this.player.loaded ? this.player.time : this.sync.expectedPosition();
+  }
+
+  _userAction(fn) {
+    audioContext();
+    fn();
+  }
+
+  openMovieDialog() {
+    const s = this.sync.state;
+    const has = this.sync.localFile;
+    $('movie-dialog-current').hidden = !has && !s.movie;
+    $('movie-unload').hidden = !has;
+    if (s.movie && !has) {
+      $('movie-dialog-text').textContent = `Everyone is watching “${s.movie.name}” (${fmtSize(s.movie.size)}). Choose your copy of the same file — nothing gets uploaded.`;
+    } else if (has) {
+      $('movie-dialog-text').textContent = `You're watching “${has.name}”. Pick another file to switch, or stop.`;
+    } else {
+      $('movie-dialog-text').textContent = 'Everyone needs their own copy of the movie file. Nothing is uploaded — only play/pause/seek and track choices are shared.';
+    }
+    $('movie-dialog').showModal();
+  }
+
+  async chooseMovieFile(file) {
+    const s = this.sync.state;
+    const quick = { name: file.name, size: file.size, duration: 0 };
+    let asRoom = !s.movie;
+    if (s.movie && !sameMovie(quick, s.movie) && file.name !== s.movie.name) {
+      $('mismatch-text').textContent = `Everyone else is watching “${s.movie.name}” (${fmtSize(s.movie.size)}), but you picked “${file.name}” (${fmtSize(file.size)}).`;
+      const choice = await new Promise((resolve) => {
+        const d = $('mismatch-dialog');
+        d.addEventListener('close', () => resolve(d.returnValue), { once: true });
+        d.returnValue = 'cancel';
+        d.showModal();
+      });
+      if (choice === 'cancel') return;
+      asRoom = choice === 'room';
+    }
+    this.loadingMovie = true;
+    this._renderStage();
+    try {
+      await this.player.load(file, { audioIndex: asRoom ? 0 : s.audio });
+    } catch (err) {
+      console.error(err);
+      toast('Could not open this file: ' + (err.message || err), 'warn');
+      this.loadingMovie = false;
+      this._renderStage();
+      return;
+    }
+    if (!this.loadingMovie || this.player.file !== file) return; // cancelled
+    this.loadingMovie = false;
+    // Prime playback inside this user gesture so later remote "play" commands
+    // aren't blocked by autoplay rules (Safari).
+    const v = this.player.video;
+    if (v.paused) {
+      const wasMuted = v.muted;
+      v.muted = true;
+      v.play().then(() => {
+        if (this.sync.state.paused) v.pause();
+        v.muted = wasMuted;
+      }).catch(() => { v.muted = wasMuted; });
+    }
+    const info = { name: file.name, size: file.size, duration: Math.round(this.player.duration * 10) / 10 };
+    this.sync.setLocalFile(info, asRoom);
+    if (asRoom) this.mesh.broadcast({ type: 'chat', msg: { id: randomId(), from: this.id, name: this.name, text: `🎬 Started a movie: ${file.name}`, ts: this.signaling.now() } });
+    this._renderStage();
+    this._renderMenus();
+  }
+
+  _renderStage() {
+    const s = this.sync.state;
+    const active = !!s.movie || !!this.sync.localFile || !!this.loadingMovie;
+    const wasHidden = $('stage').hidden;
+    $('stage').hidden = !active;
+    $('main').classList.toggle('watching', active);
+    if (wasHidden !== !active) this._layout();
+    this._refreshToolbar();
+    const ov = $('movie-overlay');
+    ov.replaceChildren();
+    let overlay = null;
+    if (this.loadingMovie) {
+      overlay = this._overlay('Opening movie…', 'Reading the file on your device.', 'Cancel', () => {
+        this.loadingMovie = false;
+        this.player.unload();
+        this._renderStage();
+      });
+    } else if (s.movie && !this.sync.localFile) {
+      overlay = this._overlay(
+        `“${s.movie.name}”`,
+        `${fmtSize(s.movie.size)}${s.movie.duration ? ' · ' + fmtTime(s.movie.duration) : ''}. Choose your copy of this file to join in. ${s.paused ? '' : 'The movie is already playing — you will jump right in.'}`,
+        'Choose file…',
+        () => $('movie-file').click(),
+      );
+    } else if (!s.movie && this.sync.localFile) {
+      overlay = this._overlay('Movie closed', 'The movie was closed for everyone.', 'OK', () => {
+        this.player.unload();
+        this.sync.clearLocalFile();
+      });
+    } else if (this.sync.blocked) {
+      overlay = this._overlay('Ready', 'Your browser needs a click before it can play.', 'Start playback', () => {
+        this.sync.unblock();
+        this._renderStage();
+      });
+    }
+    if (overlay) ov.appendChild(overlay);
+    ov.hidden = !overlay;
+    this._refreshPlayButton();
+    this._renderReady();
+  }
+
+  _overlay(title, text, button, onClick) {
+    const wrap = document.createElement('div');
+    wrap.className = 'stack';
+    const h = document.createElement('h2');
+    h.textContent = title;
+    const p = document.createElement('p');
+    p.className = 'muted';
+    p.textContent = text;
+    const b = document.createElement('button');
+    b.className = 'btn primary';
+    b.textContent = button;
+    b.onclick = onClick;
+    wrap.append(h, p, b);
+    return wrap;
+  }
+
+  _renderReady() {
+    const s = this.sync.state;
+    if (!s.movie) return;
+    let ready = this.sync.fileMatches ? 1 : 0;
+    let total = 1;
+    const waiting = [];
+    for (const [id] of this.mesh.peers) {
+      total++;
+      const st = this.sync.peerStatus.get(id);
+      if (st && st.matches) ready++;
+      else waiting.push(this.profileOf(id).name);
+    }
+    $('m-ready').textContent = total === 1 ? '' : ready === total ? `Everyone ready (${total})` : `${ready}/${total} ready${waiting.length ? ' · waiting for ' + waiting.slice(0, 2).join(', ') : ''}`;
+  }
+
+  _refreshPlayButton() {
+    const playing = !this.sync.state.paused;
+    setIcon($('m-play'), playing ? 'pause' : 'play');
+  }
+
+  _refreshVolume() {
+    const v = this.player.video;
+    setIcon($('m-mute'), v.muted || v.volume === 0 ? 'volume-off' : 'volume');
+    $('m-volume').value = v.muted ? 0 : v.volume;
+  }
+
+  _renderTime() {
+    if ($('stage').hidden || this._dragging) return;
+    const d = this.sync.state.movie?.duration || this.player.duration || 0;
+    const t = this._pos();
+    $('m-time').textContent = fmtTime(t);
+    $('m-duration').textContent = fmtTime(d);
+    $('m-progress').style.width = d ? `${Math.min(100, (t / d) * 100)}%` : '0';
+    const b = this.player.loaded ? this.player.buffered.find(([a, e]) => a <= t + 0.5 && e >= t) : null;
+    $('m-buffered').style.left = b && d ? `${(b[0] / d) * 100}%` : '0';
+    $('m-buffered').style.width = b && d ? `${((b[1] - b[0]) / d) * 100}%` : '0';
+  }
+
+  _initSeekBar() {
+    const bar = $('m-seek');
+    const timeAt = (x) => {
+      const r = bar.getBoundingClientRect();
+      const d = this.sync.state.movie?.duration || this.player.duration || 0;
+      return Math.max(0, Math.min(1, (x - r.left) / r.width)) * d;
+    };
+    const showHover = (x) => {
+      const r = bar.getBoundingClientRect();
+      $('m-hover').hidden = false;
+      $('m-hover').style.left = `${Math.max(0, Math.min(r.width, x - r.left))}px`;
+      $('m-hover').textContent = fmtTime(timeAt(x));
+    };
+    bar.addEventListener('pointermove', (e) => {
+      showHover(e.clientX);
+      if (this._dragging) {
+        const d = this.sync.state.movie?.duration || this.player.duration || 1;
+        $('m-progress').style.width = `${(timeAt(e.clientX) / d) * 100}%`;
+        $('m-time').textContent = fmtTime(timeAt(e.clientX));
+      }
+    });
+    bar.addEventListener('pointerleave', () => { if (!this._dragging) $('m-hover').hidden = true; });
+    bar.addEventListener('pointerdown', (e) => {
+      this._dragging = true;
+      bar.setPointerCapture(e.pointerId);
+      showHover(e.clientX);
+    });
+    bar.addEventListener('pointerup', (e) => {
+      if (!this._dragging) return;
+      this._dragging = false;
+      $('m-hover').hidden = true;
+      this._userAction(() => this.sync.seek(timeAt(e.clientX)));
+    });
+    bar.addEventListener('pointercancel', () => { this._dragging = false; });
+    bar.addEventListener('keydown', (e) => {
+      if (e.key === 'ArrowLeft') this.sync.seek(Math.max(0, this._pos() - 5));
+      else if (e.key === 'ArrowRight') this.sync.seek(this._pos() + 5);
+      else return;
+      e.preventDefault();
+      e.stopPropagation();
+    });
+  }
+
+  _initMenus() {
+    const pairs = [['m-audio', 'm-audio-menu'], ['m-subs', 'm-subs-menu']];
+    for (const [btn, menu] of pairs) {
+      $(btn).onclick = (e) => {
+        e.stopPropagation();
+        const m = $(menu);
+        const open = m.hidden;
+        for (const [, other] of pairs) $(other).hidden = true;
+        m.hidden = !open;
+        this._renderMenus();
+      };
+    }
+    document.addEventListener('click', (e) => {
+      if (!e.target.closest('.menu')) for (const [, m] of pairs) $(m).hidden = true;
+    });
+  }
+
+  _menuItem(label, on, onClick, note, disabled) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = on ? 'on' : '';
+    const tick = icon('check');
+    tick.classList.add('tick');
+    const span = document.createElement('span');
+    span.textContent = label;
+    b.append(tick, span);
+    if (note) {
+      const s = document.createElement('small');
+      s.textContent = note;
+      b.append(s);
+    }
+    b.disabled = !!disabled;
+    b.onclick = (e) => {
+      e.stopPropagation();
+      onClick();
+      for (const id of ['m-audio-menu', 'm-subs-menu']) $(id).hidden = true;
+    };
+    return b;
+  }
+
+  _renderMenus() {
+    const info = this.player.info;
+    const s = this.sync.state;
+    // Audio
+    const am = $('m-audio-menu');
+    const ah = document.createElement('h4');
+    ah.textContent = 'Audio (changes it for everyone)';
+    const audioTracks = info?.audioTracks || [];
+    am.replaceChildren(ah, ...(audioTracks.length
+      ? audioTracks.map((t) => this._menuItem(t.label, s.audio === t.index, () => this.sync.setAudio(t.index), t.supported ? '' : t.note || 'not playable here'))
+      : [this._menuItem(this.player.loaded ? 'Default' : 'Load the movie first', true, () => {}, '', true)]));
+    $('m-audio').hidden = audioTracks.length < 2;
+
+    // Subtitles
+    const sm = $('m-subs-menu');
+    const sh = document.createElement('h4');
+    sh.textContent = 'Subtitles (changes it for everyone)';
+    const items = [this._menuItem('Off', !s.sub, () => this.sync.setSubtitle(null))];
+    for (const t of info?.subtitleTracks || []) {
+      let note = '';
+      if (t.unsupported) note = 'not supported';
+      else if (t.progress < 1) note = `loading ${Math.round(t.progress * 100)}%`;
+      else if (t.source === 'external') note = 'file';
+      items.push(this._menuItem(t.label, s.sub === t.id, () => this.sync.setSubtitle(t.id), note, !!t.unsupported));
+    }
+    // Shared subtitle files we haven't received yet.
+    for (const f of s.subFiles) {
+      if (!info?.subtitleTracks.some((t) => t.id === f.id)) items.push(this._menuItem(f.name, s.sub === f.id, () => this.sync.setSubtitle(f.id), 'receiving…', true));
+    }
+    const load = document.createElement('button');
+    load.type = 'button';
+    load.append(icon('folder'), document.createTextNode('Load subtitle file (.srt, .vtt, .ass)…'));
+    load.onclick = (e) => {
+      e.stopPropagation();
+      sm.hidden = true;
+      $('sub-file').click();
+    };
+    sm.replaceChildren(sh, ...items, load);
+  }
+
+  _announce({ peer, prev, state }) {
+    const who = this.profileOf(peer.id).name;
+    const by = state.by === peer.id ? who : this.profileOf(state.by).name;
+    if (!sameMovie(prev.movie, state.movie)) {
+      if (state.movie) toast(`${by} started “${state.movie.name}”. Open your copy to watch along.`);
+      else toast(`${by} closed the movie.`);
+      return;
+    }
+    if (prev.paused !== state.paused) toast(`${by} ${state.paused ? 'paused' : 'pressed play'}`);
+    else if (Math.abs(state.pos - this.sync.expectedPosition(prev)) > 2) toast(`${by} jumped to ${fmtTime(state.pos)}`);
+    if (prev.audio !== state.audio) {
+      const t = this.player.audioTracks?.[state.audio];
+      toast(`${by} switched audio${t ? ' to ' + t.label : ''}`);
+    }
+    if (prev.sub !== state.sub) {
+      const t = state.sub ? this.player.subtitles.get(state.sub) : null;
+      toast(state.sub ? `${by} turned on subtitles${t ? ': ' + t.label : ''}` : `${by} turned subtitles off`);
+    }
+  }
+
+  toggleFullscreen() {
+    const el = document.documentElement;
+    const fsEl = document.fullscreenElement || document.webkitFullscreenElement;
+    if (fsEl) {
+      (document.exitFullscreen || document.webkitExitFullscreen).call(document);
+    } else if (el.requestFullscreen || el.webkitRequestFullscreen) {
+      const r = (el.requestFullscreen || el.webkitRequestFullscreen).call(el);
+      r?.catch?.(() => {});
+    } else if (this.player.video.webkitEnterFullscreen) {
+      this.player.video.webkitEnterFullscreen(); // iPhone: video-only full screen
+    }
+  }
+
+  // ---- settings ------------------------------------------------------------------
+  _initSettings() {
+    const onFs = () => {
+      const fs = !!(document.fullscreenElement || document.webkitFullscreenElement);
+      document.body.classList.toggle('fullscreen', fs);
+      setIcon($('m-full'), fs ? 'shrink' : 'expand');
+    };
+    document.addEventListener('fullscreenchange', onFs);
+    document.addEventListener('webkitfullscreenchange', onFs);
+
+    const subScale = store.get('subScale', 1);
+    $('subs-layer').style.setProperty('--sub-scale', subScale);
+    $('set-subsize').value = String(subScale);
+    $('set-lowband').checked = store.get('lowBandwidth', false);
+    this.mesh.setLowPower($('set-lowband').checked);
+    $('set-noise').checked = this.media.processing;
+
+    $('set-audio-dev').onchange = (e) => this._changeDevice('audio', e.target.value);
+    $('set-video-dev').onchange = (e) => this._changeDevice('video', e.target.value);
+    $('set-noise').onchange = (e) => {
+      this.media.setProcessing(e.target.checked);
+      store.set('processing', e.target.checked);
+    };
+    $('set-lowband').onchange = (e) => {
+      this.mesh.setLowPower(e.target.checked);
+      store.set('lowBandwidth', e.target.checked);
+    };
+    $('set-subsize').onchange = (e) => {
+      $('subs-layer').style.setProperty('--sub-scale', e.target.value);
+      store.set('subScale', Number(e.target.value));
+    };
+    $('set-subdelay').oninput = (e) => {
+      this.player.subtitleDelay = Number(e.target.value) || 0;
+    };
+    $('settings-dialog').addEventListener('close', () => {
+      const name = $('set-name').value.trim().slice(0, 40);
+      if (name && name !== this.name) {
+        this.name = name;
+        store.set('name', name);
+        this.signaling.rename(name);
+        this._broadcastProfile();
+        this._updateTile(this.id);
+        this._renderPeople();
+      }
+    });
+  }
+
+  async _changeDevice(kind, deviceId) {
+    await this.media.setDevice(kind, deviceId);
+    store.set('media', { ...store.get('media', {}), [kind === 'audio' ? 'audioDevice' : 'videoDevice']: deviceId });
+  }
+
+  async openSettings() {
+    $('set-name').value = this.name;
+    const d = await this.media.devices();
+    for (const kind of ['audio', 'video']) {
+      const sel = $(`set-${kind}-dev`);
+      sel.replaceChildren(...d[kind].map((dev, i) => new Option(dev.label || `${kind === 'audio' ? 'Microphone' : 'Camera'} ${i + 1}`, dev.deviceId)));
+      sel.value = this.media.currentDeviceId(kind);
+    }
+    $('settings-dialog').showModal();
+  }
+
+  // ---- keyboard ----------------------------------------------------------------------
+  _initKeyboard() {
+    document.addEventListener('keydown', (e) => {
+      if (e.target.closest('input, textarea, select, dialog') || e.metaKey || e.ctrlKey || e.altKey) return;
+      const movie = !$('stage').hidden && this.sync.fileMatches;
+      switch (e.key) {
+        case ' ':
+        case 'k':
+          if (!movie) return;
+          this._userAction(() => this.sync.toggle());
+          break;
+        case 'ArrowLeft':
+          if (!movie) return;
+          this.sync.seek(Math.max(0, this._pos() - 10));
+          break;
+        case 'ArrowRight':
+          if (!movie) return;
+          this.sync.seek(this._pos() + 10);
+          break;
+        case 'f':
+          this.toggleFullscreen();
+          break;
+        case 'm':
+          this.toggleMic();
+          break;
+        case 'v':
+          this.toggleCam();
+          break;
+        case 'c':
+          this.toggleSidebar('chat');
+          break;
+        default:
+          return;
+      }
+      e.preventDefault();
+    });
+  }
+
+  leave(explicit) {
+    if (this.left) return;
+    this.left = true;
+    try {
+      this.lock?.release();
+    } catch {
+      /* ignore */
+    }
+    this.sync.destroy();
+    this.player.unload();
+    this.mesh.close();
+    this.media.stop();
+    this.signaling.close();
+    for (const t of this.tiles.values()) t.stopLevel?.();
+    if (explicit) show('message');
+  }
+}
