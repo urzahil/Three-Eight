@@ -1,7 +1,7 @@
 // Unit tests for the browser-side subtitle parsers and fMP4 writer (pure functions).
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { parseSrt, parseVtt, parseAss, normalizeEmbeddedCue, activeCues } from '../public/assets/js/player/subtitles.js';
+import { parseSrt, parseVtt, parseAss, normalizeEmbeddedCue, activeCues, cueToVtt } from '../public/assets/js/player/subtitles.js';
 import { fragment, initSegment } from '../public/assets/js/player/fmp4.js';
 import { avcCodecString, aacCodecString, makeAsc } from '../public/assets/js/player/codecs.js';
 
@@ -59,4 +59,9 @@ test('fMP4 boxes are well formed', () => {
   const moof = fdv.getUint32(0);
   assert.strictEqual(String.fromCharCode(...frag.subarray(moof + 4, moof + 8)), 'mdat');
   assert.strictEqual(fdv.getUint32(moof), 8 + 15);
+});
+
+test('cue text is escaped for native WebVTT tracks', () => {
+  assert.strictEqual(cueToVtt('<i>Tom & Jerry</i>\n1 < 2 > 0'), '<i>Tom &amp; Jerry</i>\n1 &lt; 2 &gt; 0');
+  assert.strictEqual(cueToVtt('<b><u>x</u></b>'), '<b><u>x</u></b>');
 });

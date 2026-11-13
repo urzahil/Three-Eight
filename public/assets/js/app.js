@@ -4,7 +4,10 @@ import { MovieSync, sameMovie } from './sync.js';
 import { MoviePlayer } from './player/player.js';
 import { LocalMedia, watchLevel, audioContext } from './media.js';
 
-const $ = (id) => document.getElementById(id);
+// While the movie is in a Document Picture-in-Picture window, its controls live in that document.
+let pipWindow = null;
+let pipDocument = null;
+const $ = (id) => document.getElementById(id) || pipDocument?.getElementById(id);
 const store = {
   get(k, d = null) {
     try {
@@ -253,6 +256,7 @@ class Room {
     this.chat = [];
     this.chatIds = new Set();
     this.unread = 0;
+    this._mediaSession = false; // handlers registered for the loaded movie
 
     this.mesh = new Mesh(signaling, id, iceServers);
     this.mesh.setTrack('audio', media.audioTrack);
@@ -272,6 +276,7 @@ class Room {
     this._initMovie();
     this._initSettings();
     this._initKeyboard();
+    this._initPip();
 
     for (const p of welcome.peers) {
       this.profiles.set(p.id, { name: p.name, audio: false, video: false });
@@ -805,7 +810,9 @@ class Room {
     if (v.paused) {
       const wasMuted = v.muted;
       v.muted = true;
+      this.sync.expectMediaChange(2000);
       v.play().then(() => {
+        this.sync.expectMediaChange(1000);
         if (this.sync.state.paused) v.pause();
         v.muted = wasMuted;
       }).catch(() => { v.muted = wasMuted; });
@@ -824,6 +831,8 @@ class Room {
     $('stage').hidden = !active;
     $('main').classList.toggle('watching', active);
     if (wasHidden !== !active) this._layout();
+    if (!active) this.closePip();
+    this._syncMediaSession();
     this._refreshToolbar();
     const ov = $('movie-overlay');
     ov.replaceChildren();
@@ -936,7 +945,11 @@ class Room {
     bar.addEventListener('pointerleave', () => { if (!this._dragging) $('m-hover').hidden = true; });
     bar.addEventListener('pointerdown', (e) => {
       this._dragging = true;
-      bar.setPointerCapture(e.pointerId);
+      try {
+        bar.setPointerCapture(e.pointerId);
+      } catch {
+        /* pointer already gone */
+      }
       showHover(e.clientX);
     });
     bar.addEventListener('pointerup', (e) => {
@@ -967,9 +980,11 @@ class Room {
         this._renderMenus();
       };
     }
-    document.addEventListener('click', (e) => {
+    // Also attached to the Picture-in-Picture document while it is open.
+    this._onDocClick = (e) => {
       if (!e.target.closest('.menu')) for (const [, m] of pairs) $(m).hidden = true;
-    });
+    };
+    document.addEventListener('click', this._onDocClick);
   }
 
   _menuItem(label, on, onClick, note, disabled) {
@@ -1056,6 +1071,7 @@ class Room {
   }
 
   toggleFullscreen() {
+    if (pipWindow) return; // the floating window has no full screen
     const el = document.documentElement;
     const fsEl = document.fullscreenElement || document.webkitFullscreenElement;
     if (fsEl) {
@@ -1133,7 +1149,8 @@ class Room {
 
   // ---- keyboard ----------------------------------------------------------------------
   _initKeyboard() {
-    document.addEventListener('keydown', (e) => {
+    // Also attached to the Picture-in-Picture document while it is open.
+    this._onKeydown = (e) => {
       if (e.target.closest('input, textarea, select, dialog') || e.metaKey || e.ctrlKey || e.altKey) return;
       const movie = !$('stage').hidden && this.sync.fileMatches;
       switch (e.key) {
@@ -1162,11 +1179,174 @@ class Room {
         case 'c':
           this.toggleSidebar('chat');
           break;
+        case 'p':
+          if (!movie || !this.player.loaded || !this.pipMode) return;
+          this.togglePip();
+          break;
         default:
           return;
       }
       e.preventDefault();
+    };
+    document.addEventListener('keydown', this._onKeydown);
+  }
+
+  // ---- picture-in-picture ---------------------------------------------------------------
+  _initPip() {
+    const video = this.player.video;
+    const documentPip = 'documentPictureInPicture' in window;
+    const nativePip = !!document.pictureInPictureEnabled;
+    this.pipMode = documentPip ? 'document' : nativePip ? 'native' : null;
+    $('m-pip').hidden = !this.pipMode;
+    $('m-pip').onclick = () => this.togglePip();
+    if (!documentPip && !('pictureInPictureEnabled' in document)) {
+      // Firefox: its own PiP button renders the caption track, so keep it
+      // showing, but hide Firefox's in-page rendering (our overlay draws it).
+      document.documentElement.classList.add('native-cue-hidden');
+      this.player.setNativeCaptionsMode('showing');
+    }
+    video.addEventListener('enterpictureinpicture', () => this._refreshPip());
+    video.addEventListener('leavepictureinpicture', () => this._refreshPip());
+  }
+
+  togglePip() {
+    if (pipWindow) return this.closePip();
+    if (!this.player.loaded) return;
+    if (this.pipMode === 'document') return this._openDocumentPip();
+    if (this.pipMode === 'native') return this._toggleNativePip();
+  }
+
+  closePip() {
+    pipWindow?.close();
+  }
+
+  async _toggleNativePip() {
+    const v = this.player.video;
+    try {
+      if (document.pictureInPictureElement === v) await document.exitPictureInPicture();
+      else await v.requestPictureInPicture();
+    } catch (err) {
+      console.warn('Picture-in-picture failed', err);
+      toast('Picture-in-picture is not available for this video.', 'warn');
+    }
+  }
+
+  async _openDocumentPip() {
+    if (this._pipOpening) return;
+    this._pipOpening = true;
+    const box = $('movie-box');
+    const v = this.player.video;
+    const aspect = v.videoWidth && v.videoHeight ? v.videoWidth / v.videoHeight : 16 / 9;
+    const width = 480;
+    const height = Math.max(200, Math.min(600, Math.round(width / aspect)));
+    let win;
+    try {
+      win = await documentPictureInPicture.requestWindow({ width, height });
+      await this._preparePipDocument(win.document);
+    } catch (err) {
+      console.warn('Could not open the floating window', err);
+      win?.close();
+      toast('Could not open the floating window.', 'warn');
+      return;
+    } finally {
+      this._pipOpening = false;
+    }
+    if (win.closed) return;
+
+    const placeholder = document.createElement('div');
+    placeholder.id = 'pip-placeholder';
+    placeholder.className = 'pip-placeholder';
+    placeholder.append(this._overlay('Playing in a floating window', 'The movie, its subtitles and the controls are in their own window.', 'Bring it back', () => this.closePip()));
+
+    pipWindow = win;
+    pipDocument = win.document;
+    $('stage').append(placeholder);
+    this._moveMovieBox(() => pipDocument.body.append(box), win);
+    for (const [type, fn] of [['keydown', this._onKeydown], ['click', this._onDocClick]]) pipDocument.addEventListener(type, fn);
+    win.addEventListener('resize', () => this.player.renderer.layout());
+    win.setInterval(() => this._renderTime(), 250); // the main tab's timers may be throttled
+    win.addEventListener('pagehide', () => this._onPipClosed(), { once: true });
+    this._refreshPip();
+  }
+
+  /** Make the PiP document look like the page: same styles and icon sprite. */
+  async _preparePipDocument(doc) {
+    doc.title = this.sync.localFile?.name || document.title;
+    doc.body.className = 'pip-window';
+    const sprite = document.body.querySelector(':scope > svg');
+    if (sprite) doc.body.prepend(doc.importNode(sprite, true));
+    const loads = [...document.querySelectorAll('link[rel="stylesheet"]')].map((link) => {
+      const copy = link.cloneNode(true);
+      copy.href = link.href; // absolute: the new document's base URL is not ours
+      doc.head.append(copy);
+      return new Promise((resolve) => {
+        copy.addEventListener('load', resolve);
+        copy.addEventListener('error', resolve);
+      });
     });
+    await Promise.race([Promise.all(loads), new Promise((r) => setTimeout(r, 1500))]);
+  }
+
+  /**
+   * Moving a <video> between documents can pause it: don't let that look like a
+   * user action, then resume if the room is playing.
+   */
+  _moveMovieBox(move, win) {
+    this.sync.expectMediaChange(2000);
+    move();
+    this.player.renderer.layout();
+    this.player.kickRenderLoop();
+    if (win) win.requestAnimationFrame?.(() => this.player.renderer.layout());
+    if (!this.sync.state.paused && this.player.paused) this.player.play().catch(() => {});
+  }
+
+  _onPipClosed() {
+    if (!pipWindow) return;
+    const box = $('movie-box');
+    pipWindow = null;
+    pipDocument = null;
+    document.getElementById('pip-placeholder')?.remove();
+    this._moveMovieBox(() => $('stage').prepend(box));
+    this.sync.expectMediaChange(2000);
+    this._refreshPip();
+  }
+
+  _refreshPip() {
+    const active = !!pipWindow || document.pictureInPictureElement === this.player.video;
+    const btn = $('m-pip');
+    btn.classList.toggle('active', active);
+    setIcon(btn, active ? 'pip-exit' : 'pip');
+    btn.title = active ? (pipWindow ? 'Return to page (p)' : 'Exit picture-in-picture (p)') : 'Picture-in-picture (p)';
+  }
+
+  // ---- media session (PiP window buttons, hardware media keys) ------------------------
+  _syncMediaSession() {
+    if (!('mediaSession' in navigator)) return;
+    const file = this.sync.localFile;
+    const on = !!file && this.player.loaded;
+    if (on === this._mediaSession) return;
+    this._mediaSession = on;
+    const sync = this.sync;
+    const seekBy = (d, dir) => this._userAction(() => sync.seek(Math.max(0, this._pos() + dir * (d?.seekOffset || 10))));
+    const handlers = on ? {
+      play: () => { if (sync.state.paused) this._userAction(() => sync.play()); },
+      pause: () => { if (!sync.state.paused) this._userAction(() => sync.pause()); },
+      seekbackward: (d) => seekBy(d, -1),
+      seekforward: (d) => seekBy(d, 1),
+      seekto: (d) => { if (Number.isFinite(d?.seekTime)) this._userAction(() => sync.seek(d.seekTime)); },
+    } : {};
+    for (const action of ['play', 'pause', 'seekbackward', 'seekforward', 'seekto']) {
+      try {
+        navigator.mediaSession.setActionHandler(action, handlers[action] || null);
+      } catch {
+        /* action not supported */
+      }
+    }
+    try {
+      navigator.mediaSession.metadata = on && typeof MediaMetadata !== 'undefined' ? new MediaMetadata({ title: file.name }) : null;
+    } catch {
+      /* ignore */
+    }
   }
 
   leave(explicit) {
@@ -1177,6 +1357,7 @@ class Room {
     } catch {
       /* ignore */
     }
+    this.closePip();
     this.sync.destroy();
     this.player.unload();
     this.mesh.close();

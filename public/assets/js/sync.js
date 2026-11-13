@@ -52,6 +52,7 @@ export class MovieSync extends EventTarget {
     // System PiP windows (Safari, Firefox) toggle the <video> directly.
     player.addEventListener('play', () => this._onMediaEvent('play'));
     player.addEventListener('pause', () => this._onMediaEvent('pause'));
+    player.addEventListener('reloading', () => this.expectMediaChange(3000));
     this._timer = setInterval(() => this._tick(), 500);
   }
 

@@ -4,6 +4,7 @@ Video meetups and movie nights with friends, entirely in the browser (Chrome, Fi
 
 - **Video call**: camera, microphone, mute and camera-off, device selection, speaking indicators, and chat.
 - **Watch a movie together**: everyone opens their own copy of the file and the room keeps playback in sync. If anyone plays, pauses or seeks, it happens for everybody. Choosing an **audio track** or **subtitles** also changes it for everybody.
+- **Picture-in-picture**: pop the movie out into a small floating window and keep chatting or browsing. Our subtitles and controls come with it, and play, pause and seek in the floating window still affect the whole room.
 - **Rooms with passwords**: rooms are created on an admin page. Each one lives at `https://threeeight.urzahil.rocks/ROOM_NAME`.
 - **Peer to peer**: audio, video, chat and sync messages go directly between browsers over WebRTC. The server only serves the page and relays the short connection handshake, so its CPU and bandwidth use are tiny.
 
@@ -29,6 +30,16 @@ Browsers don't let a page switch the audio track of a video file, except Safari.
 3. It extracts embedded text subtitles (SRT, ASS/SSA, WebVTT, MP4 timed text) and draws them over the video. It can also load external `.srt`, `.vtt` and `.ass` files. A loaded subtitle file is sent to everyone in the room automatically.
 
 Simple files with a single audio track play natively.
+
+### Picture-in-picture
+
+The PiP button (or `p`) behaves differently per browser, because our subtitles are drawn by the page rather than by the video element:
+
+- **Chrome and Edge** use Document Picture-in-Picture. The whole player moves into a floating window, so our subtitles, controls, audio and subtitle menus, and the seek bar keep working. Close the window or click *Bring it back* to return it to the page.
+- **Safari** (desktop and iOS) uses the system video PiP. Our subtitles are mirrored into a native caption track, which Safari shows as captions in the PiP window. Pausing or playing from the system PiP controls is sent to the room.
+- **Firefox** has no PiP API for pages, so use Firefox's own PiP toggle on the video. The subtitles are exposed as a caption track, which Firefox may show there (best effort).
+
+Media keys and the buttons of system PiP windows use the Media Session API and also control the room.
 
 **Codec limits** come from what browsers can decode. Video: H.264, HEVC (Safari, and Chrome/Edge with hardware support), VP9 and AV1. Audio: AAC, Opus, FLAC and MP3. **AC-3/E-AC-3** only plays in Safari. **DTS and TrueHD** play nowhere. Tracks a browser can't play are marked in the audio menu. **Image-based subtitles** (PGS/VobSub from Blu-ray/DVD rips) aren't supported, so use an `.srt` instead. If a movie only has AC-3/DTS audio, you can add an AAC track once, losslessly for the video:
 
@@ -106,7 +117,7 @@ For local testing, `http://localhost:4567` counts as a secure context, so camera
 1. Open `https://threeeight.urzahil.rocks/admin`, log in with `ADMIN_PASSWORD`, and create a room, for example `movienight`, with a password. The admin page also shows who is online in each room. From there you can change passwords (and optionally kick everyone) or delete rooms.
 2. Send friends `https://threeeight.urzahil.rocks/movienight` and the password.
 3. Each person enters a display name, which is remembered in the browser's local storage, plus the room password. They can also choose to remember the password on that device.
-4. To watch together, one person clicks **Movie** and picks a file. Everyone else is asked to pick their own copy. Use the player controls, the audio (🎧) and subtitle (CC) menus, or keyboard shortcuts: `space` play/pause, `←`/`→` ±10 s, `f` full screen, `m` mic, `v` camera, `c` chat.
+4. To watch together, one person clicks **Movie** and picks a file. Everyone else is asked to pick their own copy. Use the player controls, the audio (🎧) and subtitle (CC) menus, or keyboard shortcuts: `space` play/pause, `←`/`→` ±10 s, `f` full screen, `p` picture-in-picture, `m` mic, `v` camera, `c` chat.
 
 Tip: use headphones during the movie, so your microphone doesn't send the film's sound to your friends. Movie volume is per person.
 
@@ -150,7 +161,11 @@ node test/player-check.js test/fixtures/multi.mkv test/fixtures/multi.mp4
 node test/e2e.js
 ```
 
-`player-check.js` tests the in-browser player on its own: native or remux mode, audio track switching, seeking and subtitles. `e2e.js` tests the whole flow: the admin creates a room, a wrong password is rejected, two people join with fake cameras, video flows peer to peer, mute and camera state and chat arrive on the other side, and the movie syncs. The movie part covers play, pause, seeking, audio and subtitle changes, a shared subtitle file, and a late joiner. Finally the admin deletes the room and everyone is disconnected.
+```bash
+node test/pip-check.js
+```
+
+`player-check.js` tests the in-browser player on its own: native or remux mode, audio track switching, seeking and subtitles. `e2e.js` tests the whole flow: the admin creates a room, a wrong password is rejected, two people join with fake cameras, video flows peer to peer, mute and camera state and chat arrive on the other side, and the movie syncs. The movie part covers play, pause, seeking, audio and subtitle changes, a shared subtitle file, and a late joiner. Finally the admin deletes the room and everyone is disconnected. `pip-check.js` tests picture-in-picture: the Document PiP window (the movie box moves there, subtitles still render, controls inside it drive the other person, and closing it brings the player back), and the native-PiP fallback (the subtitles are mirrored into a caption track, and a pause made directly on the `<video>` reaches the room).
 
 ## License
 

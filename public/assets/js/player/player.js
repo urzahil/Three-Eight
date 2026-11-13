@@ -267,6 +267,8 @@ export class MoviePlayer extends EventTarget {
   }
 
   async _start(mode, startTime) {
+    // Swapping the source pauses the element; let listeners know it's not the user.
+    this._emit('reloading');
     this.engine?.destroy();
     this.engine = null;
     if (this.objectUrl) {
