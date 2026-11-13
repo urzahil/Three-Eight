@@ -12,6 +12,8 @@ services:
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Set ADMIN_PASSWORD in .env}
       # The app runs behind a TLS reverse proxy (needed for camera/mic access).
       TRUST_PROXY: "true"
+      # Max participants per room (default 12). Each person sends video to everyone else, so >8 gets heavy.
+      MAX_ROOM_SIZE: ${MAX_ROOM_SIZE:-12}
       # Optional TURN relay for friends behind very strict NATs (see README).
       TURN_URLS: ${TURN_URLS:-}
       TURN_SECRET: ${TURN_SECRET:-}
