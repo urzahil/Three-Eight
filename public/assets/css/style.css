@@ -160,6 +160,20 @@ button:focus-visible, .seek:focus-visible { outline: 2px solid var(--accent); ou
 .menu button.on .tick { visibility: visible; }
 .menu button small { color: var(--muted); margin-left: auto; padding-left: 8px; }
 
+/* ---- Picture-in-picture ---- */
+#m-pip.active { color: var(--accent); }
+.pip-placeholder { flex: 1; display: grid; place-items: center; text-align: center; padding: 24px; background: #000; border-radius: var(--tile-radius); }
+.pip-placeholder .stack { max-width: 460px; align-items: center; }
+/* Document PiP window: the movie box fills the whole window. */
+.pip-window { margin: 0; background: #000; overflow: hidden; }
+.pip-window #movie-box { position: fixed; inset: 0; width: 100vw; height: 100vh; margin: 0; border-radius: 0; background: #000; }
+.pip-window #m-full, .pip-window .ready-pill { display: none; }
+.pip-window .vol input { width: 56px; }
+.pip-window .movie-controls { padding: 24px 8px 6px; }
+.pip-window .menu { min-width: 200px; max-height: calc(100vh - 100px); }
+/* Firefox's own PiP renders the caption track; keep it out of the page, where our overlay already draws it. */
+.native-cue-hidden #movie::cue { color: transparent; background: transparent; text-shadow: none; }
+
 /* ---- Sidebar ---- */
 .tabs { display: flex; align-items: center; gap: 4px; padding: 8px; border-bottom: 1px solid var(--line); }
 .tab { border: 0; background: transparent; color: var(--muted); font: inherit; font-weight: 600; padding: 6px 12px; border-radius: 8px; cursor: pointer; }

@@ -39,6 +39,7 @@ export class MovieSync extends EventTarget {
     this.useAnyway = false; // user accepted a file that doesn't match
     this.seekLatency = 0.15;
     this.blocked = false;
+    this._selfUntil = 0; // media events before this time were caused by our own code
 
     mesh.addEventListener('message', (e) => this._onMessage(e.detail.peer, e.detail.msg));
     mesh.addEventListener('channel-open', (e) => this._hello(e.detail.peer));
@@ -48,7 +49,28 @@ export class MovieSync extends EventTarget {
     });
     for (const ev of ['waiting', 'playing', 'canplay', 'seeked']) player.addEventListener(ev, () => this._sendStatus());
     player.addEventListener('ended', () => this._sendStatus());
+    // System PiP windows (Safari, Firefox) toggle the <video> directly.
+    player.addEventListener('play', () => this._onMediaEvent('play'));
+    player.addEventListener('pause', () => this._onMediaEvent('pause'));
     this._timer = setInterval(() => this._tick(), 500);
+  }
+
+  /** Call right before code that makes the <video> play, pause, seek or move. */
+  expectMediaChange(ms = 500) {
+    this._selfUntil = Math.max(this._selfUntil, performance.now() + ms);
+  }
+
+  _onMediaEvent(kind) {
+    const p = this.player;
+    const v = p.video;
+    if (performance.now() < this._selfUntil) return;
+    if (!p.loaded || !this.fileMatches || v.ended || v.seeking) return;
+    // A hidden tab (e.g. iOS backgrounding) may pause media by itself; only
+    // trust events while the user can actually see or use the video.
+    const watching = document.visibilityState === 'visible' || document.pictureInPictureElement === v || !('pictureInPictureEnabled' in document);
+    if (!watching) return;
+    if (kind === 'pause' && !this.state.paused) this.pause();
+    else if (kind === 'play' && this.state.paused) this.play();
   }
 
   _emit(type, detail) {
@@ -150,13 +172,18 @@ export class MovieSync extends EventTarget {
     const p = this.player;
     if (!this.fileMatches || !p.loaded) return;
 
-    if (p.audioIndex !== s.audio && s.audio < (p.audioTracks?.length || 0)) await p.setAudioTrack(s.audio);
+    if (p.audioIndex !== s.audio && s.audio < (p.audioTracks?.length || 0)) {
+      this.expectMediaChange(1000);
+      await p.setAudioTrack(s.audio);
+      this.expectMediaChange(1000);
+    }
     const subId = s.sub && p.subtitles.has(s.sub) ? s.sub : null;
     if (p.subtitleId !== subId) p.setSubtitle(subId);
 
     const target = this.expectedPosition();
     const diff = p.time - target;
     if (s.paused) {
+      this.expectMediaChange();
       if (!p.paused) p.pause();
       p.playbackRate = 1;
       if (Math.abs(diff) > 0.15 || force) {
@@ -167,11 +194,13 @@ export class MovieSync extends EventTarget {
     const d = s.movie?.duration || p.duration;
     if (d && target >= d - 0.25) {
       // Movie is over for everyone.
+      this.expectMediaChange();
       if (!p.paused) p.pause();
       return;
     }
     if (Math.abs(diff) > (force ? 0.3 : DRIFT_SEEK)) this._seekTo(target + this.seekLatency);
     if (p.paused) {
+      this.expectMediaChange();
       try {
         await p.play();
         this.blocked = false;
@@ -187,6 +216,7 @@ export class MovieSync extends EventTarget {
   _seekTo(t) {
     const p = this.player;
     const started = performance.now();
+    this.expectMediaChange();
     p.seek(t);
     const onSeeked = () => {
       p.removeEventListener('playing', onSeeked);
@@ -200,6 +230,7 @@ export class MovieSync extends EventTarget {
   /** User clicked the "start playback" overlay after an autoplay block. */
   async unblock() {
     this.blocked = false;
+    this.expectMediaChange();
     try {
       await this.player.play();
     } catch {

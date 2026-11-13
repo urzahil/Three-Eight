@@ -257,3 +257,70 @@ export class SubtitleRenderer {
     }
   }
 }
+
+/** Our mini markup is valid WebVTT cue text once stray & < > are escaped. */
+export function cueToVtt(text) {
+  const esc = { '&': '&amp;', '<': '&lt;', '>': '&gt;' };
+  return text.replace(/<\/?[ibu]>|[&<>]/g, (m) => esc[m] || m);
+}
+
+/**
+ * Mirrors the selected subtitle into ONE native text track on the <video>, so
+ * system picture-in-picture windows (which can't show our DOM overlay) can
+ * still render captions. The track is created lazily.
+ */
+export class NativeCaptions {
+  constructor(video) {
+    this.video = video;
+    this.track = null;
+    this.baseMode = 'hidden'; // 'hidden' | 'showing'
+    this.cues = [];
+    this.offset = 0;
+    this._timer = 0;
+    const update = () => this._applyMode();
+    video.addEventListener('enterpictureinpicture', update);
+    video.addEventListener('leavepictureinpicture', update);
+  }
+
+  /** 'hidden' keeps the track silent in the page; 'showing' always renders it. */
+  setMode(mode) {
+    this.baseMode = mode === 'showing' ? 'showing' : 'hidden';
+    this._applyMode();
+  }
+
+  _applyMode() {
+    if (!this.track) return;
+    const inPip = document.pictureInPictureElement === this.video;
+    this.track.mode = inPip || this.baseMode === 'showing' ? 'showing' : 'hidden';
+  }
+
+  /** cues: our cue objects; offset: seconds added to each time (subtitle delay + media shift). */
+  set(cues, offset, immediate = false) {
+    this.cues = cues;
+    this.offset = offset;
+    clearTimeout(this._timer);
+    if (immediate) this._rebuild();
+    else this._timer = setTimeout(() => this._rebuild(), 300);
+  }
+
+  clear() {
+    this.set([], 0, true);
+  }
+
+  _rebuild() {
+    if (!this.track) {
+      if (!this.cues.length || typeof this.video.addTextTrack !== 'function' || typeof VTTCue === 'undefined') return;
+      this.track = this.video.addTextTrack('subtitles', 'Subtitles', 'und');
+      this._applyMode();
+    }
+    for (const c of [...(this.track.cues || [])]) this.track.removeCue(c);
+    for (const c of this.cues) {
+      const start = Math.max(0, c.start + this.offset);
+      const end = c.end + this.offset;
+      if (end <= start) continue;
+      const cue = new VTTCue(start, end, cueToVtt(c.text));
+      if (c.top) cue.line = 0;
+      this.track.addCue(cue);
+    }
+  }
+}

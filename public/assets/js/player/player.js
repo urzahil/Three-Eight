@@ -4,7 +4,7 @@
 import { MkvDemuxer } from './mkv.js';
 import { Mp4Demuxer } from './mp4.js';
 import { MseEngine, SHIFT, mseAvailable, mseSupports } from './mse.js';
-import { SubtitleRenderer, normalizeEmbeddedCue, parseSubtitleFile, sortCues } from './subtitles.js';
+import { NativeCaptions, SubtitleRenderer, normalizeEmbeddedCue, parseSubtitleFile, sortCues } from './subtitles.js';
 import { humanCodec } from './codecs.js';
 
 const LANG_NAMES = (() => {
@@ -69,6 +69,7 @@ export class MoviePlayer extends EventTarget {
     this.video = video;
     this.overlay = overlay;
     this.renderer = new SubtitleRenderer(overlay, video);
+    this.nativeCaptions = new NativeCaptions(video);
     this.file = null;
     this.demux = null;
     this.engine = null;
@@ -85,11 +86,43 @@ export class MoviePlayer extends EventTarget {
       video.addEventListener(ev, () => this.dispatchEvent(new Event(ev)));
     }
     video.addEventListener('error', () => this._onVideoError());
-    const loop = () => {
-      this._raf = requestAnimationFrame(loop);
+    // The overlay can live in a Document Picture-in-Picture window while the
+    // main tab is hidden (its rAF stops), so frames follow the overlay's window.
+    document.addEventListener('visibilitychange', () => this.kickRenderLoop());
+    this.kickRenderLoop();
+  }
+
+  /** (Re)start the subtitle render loop on the window that owns the overlay. */
+  kickRenderLoop() {
+    if (this._rafWin) this._rafWin.cancelAnimationFrame(this._raf);
+    this._rafWin = null;
+    clearTimeout(this._frameTimer);
+    const run = () => this.kickRenderLoop();
+    try {
       if (this.file) this.renderer.update(this.time);
-    };
-    loop();
+    } catch (err) {
+      console.warn('Subtitle render failed', err);
+    }
+    const win = this.overlay.ownerDocument.defaultView;
+    if (win && typeof win.requestAnimationFrame === 'function' && win.document.visibilityState === 'visible') {
+      this._rafWin = win;
+      this._raf = win.requestAnimationFrame(run);
+      this._frameTimer = setTimeout(run, 250); // safety net if that window goes away
+    } else {
+      this._frameTimer = setTimeout(run, 100);
+    }
+  }
+
+  /** 'hidden' | 'showing': how the native caption track (used by system PiP) is displayed. */
+  setNativeCaptionsMode(mode) {
+    this.nativeCaptions.setMode(mode);
+  }
+
+  _showCues(immediate = false) {
+    const s = this.subtitleId ? this.subtitles.get(this.subtitleId) : null;
+    const cues = s ? s.cues : [];
+    this.renderer.setCues(cues);
+    this.nativeCaptions.set(cues, this.renderer.delay + (this.mode === 'mse' ? SHIFT : 0), immediate);
   }
 
   _emit(type, detail) {
@@ -180,6 +213,7 @@ export class MoviePlayer extends EventTarget {
     this.mode = null;
     for (const [id, s] of this.subtitles) if (s.source === 'embedded') this.subtitles.delete(id);
     this.renderer.setCues([]);
+    this.nativeCaptions.clear();
     this._emit('tracks');
   }
 
@@ -258,7 +292,7 @@ export class MoviePlayer extends EventTarget {
       await metadata;
       if (startTime) this.video.currentTime = startTime;
       this._applyNativeAudio();
-      for (const tt of this.video.textTracks || []) tt.mode = 'disabled';
+      for (const tt of this.video.textTracks || []) if (tt !== this.nativeCaptions.track) tt.mode = 'disabled';
     } else {
       const engine = new MseEngine(this.video, this.demux);
       this.engine = engine;
@@ -271,6 +305,7 @@ export class MoviePlayer extends EventTarget {
       if (this.audioTrackList.length && !audio) this._emit('notice', { text: 'This audio track cannot be played in your browser — playing without sound.' });
     }
     this._emit('status', { text: '' });
+    this._showCues(true); // native caption times depend on the mode
     this._emit('modechange', { mode });
   }
 
@@ -305,14 +340,14 @@ export class MoviePlayer extends EventTarget {
 
   setSubtitle(id) {
     this.subtitleId = id;
-    const s = id ? this.subtitles.get(id) : null;
-    this.renderer.setCues(s ? s.cues : []);
+    this._showCues(true);
     this._emit('tracks');
   }
 
   set subtitleDelay(v) {
     this.renderer.delay = v;
     this.renderer.key = null;
+    this._showCues();
   }
 
   get subtitleDelay() {
@@ -325,7 +360,7 @@ export class MoviePlayer extends EventTarget {
     const cues = parseSubtitleFile(name, text);
     const label = name.replace(/\.(srt|vtt|ass|ssa|sub|txt)$/i, '');
     this.subtitles.set(id, { id, label, cues, source: 'external', progress: 1 });
-    if (this.subtitleId === id) this.renderer.setCues(cues);
+    if (this.subtitleId === id) this._showCues(true);
     this._emit('tracks');
     return id;
   }
@@ -346,7 +381,7 @@ export class MoviePlayer extends EventTarget {
             if (n) s.cues.push(n);
           }
           s.cues = sortCues(s.cues);
-          if (this.subtitleId === s.id) this.renderer.setCues(s.cues);
+          if (this.subtitleId === s.id) this._showCues();
         },
         (p) => {
           for (const s of pending) s.progress = p;
@@ -369,7 +404,7 @@ export class MoviePlayer extends EventTarget {
         if (s.cues[i].end > s.cues[i + 1].start && s.cues[i].end - s.cues[i].start === 4) s.cues[i].end = s.cues[i + 1].start;
       }
     }
-    if (this.subtitleId && byId.has(Number(this.subtitleId.slice(1)))) this.renderer.setCues(this.subtitles.get(this.subtitleId).cues);
+    if (this.subtitleId && byId.has(Number(this.subtitleId.slice(1)))) this._showCues(true);
     this._emit('tracks');
   }
 
