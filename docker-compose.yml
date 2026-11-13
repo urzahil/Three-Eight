@@ -1,0 +1,23 @@
+services:
+  three-eight:
+    build: .
+    image: three-eight:latest
+    container_name: three-eight
+    restart: unless-stopped
+    ports:
+      - "4567:4567"
+    environment:
+      # Password for https://<your-host>/admin (required).
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Set ADMIN_PASSWORD in .env}
+      # The app runs behind a TLS reverse proxy (needed for camera/mic access).
+      TRUST_PROXY: "true"
+      # Optional TURN relay for friends behind very strict NATs (see README).
+      TURN_URLS: ${TURN_URLS:-}
+      TURN_SECRET: ${TURN_SECRET:-}
+      TURN_USERNAME: ${TURN_USERNAME:-}
+      TURN_PASSWORD: ${TURN_PASSWORD:-}
+    volumes:
+      - three-eight-data:/data
+
+volumes:
+  three-eight-data:

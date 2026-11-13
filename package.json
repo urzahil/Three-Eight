@@ -1,0 +1,18 @@
+{
+  "name": "three-eight",
+  "version": "1.0.0",
+  "description": "Peer-to-peer video meetups with synchronized movie watching, running entirely in the browser.",
+  "main": "server/server.js",
+  "private": true,
+  "scripts": {
+    "start": "node server/server.js",
+    "test": "node --test test/server.test.js test/parsers.test.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "GPL-3.0",
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

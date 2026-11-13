@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="robots" content="noindex">
+  <title>Rooms · Three-Eight admin</title>
+  <link rel="icon" href="/assets/icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/assets/css/style.css">
+  <link rel="stylesheet" href="/assets/css/admin.css">
+</head>
+<body>
+  <main id="login" class="screen center" hidden>
+    <form id="login-form" class="card stack">
+      <div class="brand"><span class="logo">3·8</span><h1>Admin</h1></div>
+      <label>Admin password <input id="login-password" type="password" autocomplete="current-password" required autofocus></label>
+      <p id="login-error" class="error" role="alert" hidden></p>
+      <button class="btn primary">Log in</button>
+    </form>
+  </main>
+
+  <main id="panel" class="admin" hidden>
+    <header class="admin-head">
+      <div class="brand small"><span class="logo">3·8</span><span>Rooms</span></div>
+      <div class="spacer"></div>
+      <button id="logout" class="btn ghost">Log out</button>
+    </header>
+
+    <section class="card admin-card">
+      <h2>Create a room</h2>
+      <form id="create-form" class="create-form">
+        <label>Room name
+          <input id="create-name" required maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9_\-]{0,63}" placeholder="friday-movie" autocomplete="off">
+        </label>
+        <label>Password
+          <input id="create-password" type="text" autocomplete="off" placeholder="leave empty for no password">
+        </label>
+        <button class="btn primary">Create</button>
+      </form>
+      <p class="muted small">Letters, digits, “-” and “_”. The room will be at <code id="url-example"></code>.</p>
+      <p id="create-error" class="error" role="alert" hidden></p>
+    </section>
+
+    <section class="card admin-card">
+      <h2>Rooms</h2>
+      <table class="rooms">
+        <thead><tr><th>Room</th><th>Password</th><th>Online now</th><th></th></tr></thead>
+        <tbody id="rooms"></tbody>
+      </table>
+      <p id="empty" class="muted" hidden>No rooms yet.</p>
+    </section>
+  </main>
+
+  <dialog id="pw-dialog" class="dialog">
+    <form method="dialog" class="stack">
+      <h2>Change password for <span id="pw-room"></span></h2>
+      <label>New password <input id="pw-new" type="text" autocomplete="off" placeholder="leave empty to remove the password"></label>
+      <label class="check"><input id="pw-kick" type="checkbox"> Disconnect people currently in the room</label>
+      <button class="btn primary" value="save">Save</button>
+      <button class="btn ghost" value="cancel">Cancel</button>
+    </form>
+  </dialog>
+
+  <div id="toasts" class="toasts" aria-live="polite"></div>
+  <script type="module" src="/assets/js/admin.js"></script>
+</body>
+</html>
