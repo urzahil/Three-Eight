@@ -1,6 +1,7 @@
 // Picture-in-picture test (Chromium): Document PiP keeps our subtitles and
 // controls and drives the room; without it, the native video PiP gets the
-// subtitles as a caption track.
+// subtitles as a caption track; the compact style draws video + subtitles on a
+// canvas that plays in native PiP.
 // Usage: node test/pip-check.js   (server on BASE, default http://localhost:4567, ADMIN_PASSWORD=test)
 const { chromium } = require('playwright');
 const path = require('path');
@@ -216,12 +217,111 @@ async function nativePip(browser) {
   await bob.context().close();
 }
 
+async function compactPip(browser) {
+  console.log('--- Compact Picture-in-Picture (canvas stream in native PiP)');
+  const { alice, bob } = await pair(browser, 'compact');
+  // The style is chosen in the settings dialog (Document PiP is available in Chromium).
+  await alice.click('#t-settings');
+  await alice.waitForSelector('#settings-dialog[open]');
+  assert(await alice.isVisible('#set-pipstyle'), '#set-pipstyle should be visible in Chromium');
+  assert.strictEqual(await alice.inputValue('#set-pipstyle'), 'floating', 'floating is the default');
+  await alice.selectOption('#set-pipstyle', 'compact');
+  assert.strictEqual(await alice.evaluate(() => localStorage.getItem('te.pipStyle')), '"compact"');
+  await alice.click('#settings-dialog button.primary');
+  await alice.waitForSelector('#settings-dialog:not([open])');
+
+  await ctl(alice, '#m-play');
+  await waitFor(bob, () => !document.getElementById('movie').paused);
+  await chooseEnglish(alice, (sel) => ctl(alice, sel));
+
+  await ctl(alice, '#m-pip');
+  await waitFor(alice, () => document.pictureInPictureElement?.srcObject instanceof MediaStream, null, 8000);
+  const where = await alice.evaluate(() => ({
+    movieInPage: !!document.getElementById('stage').contains(document.getElementById('movie-box')),
+    docPip: !!documentPictureInPicture.window,
+    active: document.getElementById('m-pip').classList.contains('active'),
+    icon: document.querySelector('#m-pip use').getAttribute('href'),
+    playbackState: navigator.mediaSession.playbackState,
+  }));
+  console.log('compact open:', where);
+  assert(where.movieInPage && !where.docPip, 'compact mode keeps the movie in the page');
+  assert(where.active && where.icon === '#i-pip-exit', 'PiP button shows the active state');
+  assert.strictEqual(where.playbackState, 'playing');
+  await sleep(1500);
+  const a1 = await movie(alice), b1 = await movie(bob);
+  assert(!a1.paused && !b1.paused, 'both still playing');
+  assert(Math.abs(a1.time - b1.time) < 0.3, `in sync: ${a1.time} vs ${b1.time}`);
+
+  // Our subtitles are drawn into the canvas.
+  await alice.evaluate(() => room.sync.seek(21));
+  await waitFor(alice, () => room.compactPip.lastText.includes('Twenty seconds'));
+  await sleep(500);
+  const px = await alice.evaluate(() => {
+    const c = room.compactPip.canvas;
+    const ctx = c.getContext('2d');
+    const stat = (x, y, w, h) => {
+      const d = ctx.getImageData(Math.round(x), Math.round(y), Math.round(w), Math.round(h)).data;
+      let bright = 0, nonBlack = 0;
+      for (let i = 0; i < d.length; i += 4) {
+        if (d[i] + d[i + 1] + d[i + 2] > 60) nonBlack++;
+        if (d[i] > 225 && d[i + 1] > 225 && d[i + 2] > 225) bright++;
+      }
+      return { nonBlack, bright, n: d.length / 4 };
+    };
+    return {
+      w: c.width, h: c.height,
+      video: stat(0, c.height * 0.15, c.width, c.height * 0.5),
+      band: stat(c.width * 0.2, c.height * 0.8, c.width * 0.6, c.height * 0.14),
+    };
+  });
+  console.log('canvas pixels:', px);
+  assert(px.video.nonBlack > px.video.n * 0.05, 'video area has picture');
+  assert(px.band.bright > 50, 'subtitle band has white text pixels');
+
+  // A pause made on the proxy element (what the PiP button may do) reaches the room.
+  await sleep(700);
+  await alice.evaluate(() => document.pictureInPictureElement.pause());
+  await waitFor(bob, () => document.getElementById('movie').paused, null, 5000);
+  await waitFor(alice, () => navigator.mediaSession.playbackState === 'paused');
+  assert(await alice.evaluate(() => room.sync.state.paused), 'Alice committed the pause');
+  await sleep(800);
+  assert(await alice.evaluate(() => !document.pictureInPictureElement.paused), 'proxy resumed so the picture keeps updating');
+  console.log('compact pause reached Bob');
+  await alice.evaluate(() => document.pictureInPictureElement.play()); // a play we did not cause
+  await waitFor(bob, () => !document.getElementById('movie').paused, null, 5000);
+  await waitFor(alice, () => navigator.mediaSession.playbackState === 'playing');
+
+  // Leaving PiP removes the proxy and stops the loop.
+  await alice.evaluate(() => { window.__cp = room.compactPip; });
+  await alice.evaluate(() => document.exitPictureInPicture());
+  await waitFor(alice, () => !document.pictureInPictureElement && !room.compactPip);
+  const after = await alice.evaluate(() => ({
+    videos: [...document.querySelectorAll('video')].filter((v) => v.srcObject instanceof MediaStream).length,
+    active: window.__cp.active,
+    worker: !!window.__cp._worker,
+    canvas: !!window.__cp.canvas,
+    btn: document.getElementById('m-pip').classList.contains('active'),
+  }));
+  assert.deepStrictEqual(after, { videos: 0, active: false, worker: false, canvas: false, btn: false });
+
+  // Changing the setting while PiP is open closes it.
+  await ctl(alice, '#m-pip');
+  await waitFor(alice, () => document.pictureInPictureElement?.srcObject instanceof MediaStream, null, 8000);
+  await alice.click('#t-settings');
+  await alice.selectOption('#set-pipstyle', 'floating');
+  await waitFor(alice, () => !document.pictureInPictureElement && !room.compactPip);
+  console.log('setting change closed compact PiP');
+  await alice.context().close();
+  await bob.context().close();
+}
+
 (async () => {
   const browser = await chromium.launch({
     args: ['--use-fake-ui-for-media-stream', '--use-fake-device-for-media-stream', '--autoplay-policy=no-user-gesture-required'],
   });
   await documentPip(browser);
   await nativePip(browser);
+  await compactPip(browser);
   await browser.close();
   console.log('PIP OK');
 })().catch((err) => {

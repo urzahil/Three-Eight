@@ -2,6 +2,7 @@ import { Signaling } from './signaling.js';
 import { Mesh } from './mesh.js';
 import { MovieSync, sameMovie } from './sync.js';
 import { MoviePlayer } from './player/player.js';
+import { CompactPip } from './player/compactpip.js';
 import { LocalMedia, watchLevel, audioContext } from './media.js';
 
 // While the movie is in a Document Picture-in-Picture window, its controls live in that document.
@@ -274,9 +275,9 @@ class Room {
     this._initToolbar();
     this._initChat();
     this._initMovie();
+    this._initPip();
     this._initSettings();
     this._initKeyboard();
-    this._initPip();
 
     for (const p of welcome.peers) {
       this.profiles.set(p.id, { name: p.name, audio: false, video: false });
@@ -737,6 +738,7 @@ class Room {
     for (const ev of ['play', 'pause', 'ended']) p.addEventListener(ev, () => this._refreshPlayButton());
 
     sync.addEventListener('state', () => {
+      this._updatePlaybackState();
       this._renderStage();
       this._renderMenus();
       this._renderPeople();
@@ -1114,6 +1116,14 @@ class Room {
     $('set-subsize').onchange = (e) => {
       $('subs-layer').style.setProperty('--sub-scale', e.target.value);
       store.set('subScale', Number(e.target.value));
+      this.compactPip?.setSubScale(e.target.value);
+    };
+    // Only browsers with Document PiP have a choice of style.
+    $('set-pipstyle-label').hidden = this.pipMode !== 'document';
+    $('set-pipstyle').value = store.get('pipStyle', 'floating') === 'compact' ? 'compact' : 'floating';
+    $('set-pipstyle').onchange = (e) => {
+      store.set('pipStyle', e.target.value);
+      this.closePip(); // the next click uses the new style
     };
     $('set-subdelay').oninput = (e) => {
       this.player.subtitleDelay = Number(e.target.value) || 0;
@@ -1207,17 +1217,54 @@ class Room {
     }
     video.addEventListener('enterpictureinpicture', () => this._refreshPip());
     video.addEventListener('leavepictureinpicture', () => this._refreshPip());
+    // Compact mode puts a proxy <video> in PiP, not the movie element.
+    document.addEventListener('enterpictureinpicture', () => this._refreshPip(), true);
+    document.addEventListener('leavepictureinpicture', () => this._refreshPip(), true);
   }
 
   togglePip() {
-    if (pipWindow) return this.closePip();
+    if (pipWindow || this.compactPip) return this.closePip();
     if (!this.player.loaded) return;
-    if (this.pipMode === 'document') return this._openDocumentPip();
+    if (this.pipMode === 'document') return store.get('pipStyle', 'floating') === 'compact' ? this._openCompactPip() : this._openDocumentPip();
     if (this.pipMode === 'native') return this._toggleNativePip();
   }
 
   closePip() {
     pipWindow?.close();
+    this.compactPip?.close();
+  }
+
+  /** Canvas-based native PiP: no browser title bar, play/pause only. Must run inside the click handler. */
+  async _openCompactPip() {
+    if (this._pipOpening) return;
+    this._pipOpening = true;
+    const pip = new CompactPip(this.player, { subScale: store.get('subScale', 1) });
+    this.compactPip = pip;
+    pip.addEventListener('close', () => {
+      if (this.compactPip === pip) this.compactPip = null;
+      this._refreshPip();
+      this._updatePlaybackState();
+    });
+    // The PiP buttons may toggle the proxy <video> directly (outside Media Session handlers).
+    pip.addEventListener('userpause', () => {
+      if (!this.sync.state.paused) this._userAction(() => this.sync.pause());
+      pip.resume(); // keep the PiP picture updating
+    });
+    pip.addEventListener('userplay', () => {
+      if (this.sync.state.paused) this._userAction(() => this.sync.play());
+    });
+    try {
+      await pip.open();
+    } catch (err) {
+      console.warn('Could not open compact picture-in-picture', err);
+      pip.close();
+      toast('Picture-in-picture is not available for this video.', 'warn');
+      return;
+    } finally {
+      this._pipOpening = false;
+    }
+    this._refreshPip();
+    this._updatePlaybackState();
   }
 
   async _toggleNativePip() {
@@ -1312,7 +1359,8 @@ class Room {
   }
 
   _refreshPip() {
-    const active = !!pipWindow || document.pictureInPictureElement === this.player.video;
+    const pe = document.pictureInPictureElement;
+    const active = !!pipWindow || (!!pe && (pe === this.player.video || pe === this.compactPip?.proxy));
     const btn = $('m-pip');
     btn.classList.toggle('active', active);
     setIcon(btn, active ? 'pip-exit' : 'pip');
@@ -1324,6 +1372,7 @@ class Room {
     if (!('mediaSession' in navigator)) return;
     const file = this.sync.localFile;
     const on = !!file && this.player.loaded;
+    this._updatePlaybackState();
     if (on === this._mediaSession) return;
     this._mediaSession = on;
     const sync = this.sync;
@@ -1344,6 +1393,17 @@ class Room {
     }
     try {
       navigator.mediaSession.metadata = on && typeof MediaMetadata !== 'undefined' ? new MediaMetadata({ title: file.name }) : null;
+    } catch {
+      /* ignore */
+    }
+  }
+
+  /** Chrome's PiP play/pause button reflects this, so keep it equal to the shared state. */
+  _updatePlaybackState() {
+    if (!('mediaSession' in navigator)) return;
+    const on = !!this.sync.localFile && this.player.loaded;
+    try {
+      navigator.mediaSession.playbackState = on ? (this.sync.state.paused ? 'paused' : 'playing') : 'none';
     } catch {
       /* ignore */
     }
