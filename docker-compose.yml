@@ -2,6 +2,7 @@ services:
   three-eight:
     build: .
     image: three-eight:latest
+    pull_policy: build   # local image only: never try to pull it from Docker Hub
     container_name: three-eight
     restart: unless-stopped
     ports:
