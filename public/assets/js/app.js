@@ -74,11 +74,10 @@ function fmtSize(b) {
   return `${b.toFixed(i >= 3 ? 2 : i ? 1 : 0)} ${u[i]}`;
 }
 
-const COLORS = ['#c2410c', '#0f766e', '#7c3aed', '#be123c', '#1d4ed8', '#4d7c0f', '#a16207', '#0e7490', '#9d174d', '#4338ca'];
 function colorFor(id) {
   let h = 0;
   for (const c of id) h = (h * 31 + c.charCodeAt(0)) >>> 0;
-  return COLORS[h % COLORS.length];
+  return `var(--avatar-${(h % 10) + 1})`; // palette lives in style.css (:root)
 }
 function initials(name) {
   const parts = String(name || '?').trim().split(/\s+/);

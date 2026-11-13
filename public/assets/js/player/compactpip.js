@@ -70,6 +70,9 @@ export class CompactPip extends EventTarget {
     canvas.height = h;
     this.canvas = canvas;
     this._ctx = canvas.getContext('2d');
+    const rootStyle = getComputedStyle(document.documentElement);
+    const themed = (name, fallback) => rootStyle.getPropertyValue(name).trim() || fallback;
+    this._colors = { text: themed('--sub-text', '#fff'), outline: themed('--sub-outline', '#000'), bg: themed('--video-bg', '#000') };
     this._closed = false;
     this._draw();
 
@@ -134,7 +137,7 @@ export class CompactPip extends EventTarget {
     const { canvas } = this;
     const video = this.player.video;
     const cw = canvas.width, ch = canvas.height;
-    ctx.fillStyle = '#000';
+    ctx.fillStyle = this._colors.bg;
     ctx.fillRect(0, 0, cw, ch);
     const vw = video.videoWidth, vh = video.videoHeight;
     if (vw && vh && video.readyState >= 2) {
@@ -214,8 +217,8 @@ export class CompactPip extends EventTarget {
     for (const p of pieces) {
       ctx.font = this._font(p, fs);
       ctx.lineWidth = fs * 0.16;
-      ctx.strokeStyle = '#000';
-      ctx.fillStyle = '#fff';
+      ctx.strokeStyle = this._colors.outline;
+      ctx.fillStyle = this._colors.text;
       ctx.strokeText(p.text, x, baseline);
       ctx.fillText(p.text, x, baseline);
       if (p.u) {

@@ -155,9 +155,20 @@ To change the accent color (yellow/orange by default), edit:
 
 If you pick a darker accent, set `--accent-ink` to a light color (e.g. `#ffffff`) so button text stays readable.
 
-The browser-tab icon has the color hard-coded: also change `fill="#f2a541"` in `public/assets/icon.svg`.
+Two places can't read CSS variables, so change them by hand to match:
 
-Other colors in the same block: `--bg`, `--bg-2`, `--bg-3` (backgrounds), `--line` (borders), `--text`, `--muted` (text), `--danger` (leave/delete), `--ok` (speaking indicator).
+- The icon `public/assets/icon.svg` has both colors hard-coded: `fill="#f2a541"` (the accent background) and `fill="#1b1305"` (the `--accent-ink` text). Change both.
+- The `theme-color` meta tag in `public/index.html` (`#0f1115`, the color some mobile browsers paint their toolbar) matches `--bg`: change it if you change `--bg`.
+
+Other variable groups in the same block:
+
+- Backgrounds: `--bg`, `--bg-2`, `--bg-3`; borders: `--line`; text: `--text`, `--muted`.
+- Danger: `--danger`, `--danger-text`, `--danger-border` (leave/delete, muted mic and camera, errors); `--hover` (button hover).
+- Warning (pill and toast): `--warn-bg`, `--warn-text`, `--warn-border`.
+- `--ok`: speaking indicator and mic level meter.
+- Subtitles: `--sub-text`, `--sub-outline`. These are also used by the compact picture-in-picture window.
+- Avatars: `--avatar-1` ... `--avatar-10` (each participant gets one by hashing their id), plus `--avatar-fallback` and `--on-color` (text on avatars and badges).
+- Overlays and video: `--video-bg` (behind video), `--label-bg`, `--backdrop`, `--movie-overlay`, `--controls-scrim`, `--tooltip-bg`, `--round-bg`, `--meter-bg`, `--hover-overlay`, `--seek-track`, `--seek-buffered`, `--time-text`, `--shadow-color`.
 
 When running with Docker, rebuild the image after editing: `docker compose up -d --build`.
 
