@@ -22,6 +22,11 @@
 //       what this viewer can serve for the film it has open (key null: nothing). `local` = the whole file
 //       is on this device. `ranges` = pieces completely in its cache (merged, at most 32 ranges).
 //       Sent on change, at most once a second, and to every new peer.
+//     Embedded subtitles: `film-have` also carries `subs: ['e3', ...]`, the embedded subtitle tracks this viewer
+//     has completely extracted. A viewer whose selected embedded track is incomplete asks one holder at a time
+//     (local holders first, 5 s each): { type: 'sub-cues-req', key, track } -> { type: 'sub-cues', key, track,
+//     cues: [{ start, end, text, top? }] } (seconds; the player's own cue format). Answers are only accepted from
+//     the peer asked, for a track we asked for, at most MAX_CUES cues and MAX_CUE_TEXT characters in all.
 //   Channel 1 (binary frames, little endian), header of 16 bytes + payload:
 //       u8 type | u8 flags | u16 req | u32 keyId | u32 piece | u32 offset | payload
 //     WANT   (1)  receiver -> holder: please send piece (whole). `req` identifies the request.
@@ -63,6 +68,9 @@ const MAX_PIECES = 1 << 22; // 4 TiB of film
 const PIECE_LIMIT = 64 * MiB; // no sane piece size is larger: offsets beyond it are garbage
 const KEY_RE = /^(d:[A-Za-z0-9_-]{10,200}|s:[0-9]{1,15})$/;
 const noop = () => {};
+export const MAX_CUES = 20000;
+export const MAX_CUE_TEXT = 8 * MiB;
+const TRACK_RE = /^e[0-9]{1,6}$/;
 
 // ---- pure helpers --------------------------------------------------------------------------------------
 
@@ -159,7 +167,7 @@ export const inRanges = (ranges, p) => ranges.some((r) => p >= r[0] && p <= r[1]
 /** A peer's `film-have` message, validated; null if it is not well-formed. */
 export function parseHave(msg) {
   if (!msg || typeof msg !== 'object') return null;
-  if (msg.key === null) return { key: '', local: false, ranges: [], via: '' };
+  if (msg.key === null) return { key: '', local: false, ranges: [], via: '', subs: [] };
   if (typeof msg.key !== 'string' || !KEY_RE.test(msg.key) || typeof msg.local !== 'boolean') return null;
   if (!Array.isArray(msg.ranges) || msg.ranges.length > 64) return null;
   const ranges = [];
@@ -168,7 +176,23 @@ export function parseHave(msg) {
     ranges.push([r[0], r[1]]);
   }
   const via = msg.via === 'file' || msg.via === 'drive' || msg.via === 'peers' ? msg.via : '';
-  return { key: msg.key, local: msg.local, ranges: mergeRanges(ranges, 64), via };
+  const subs = Array.isArray(msg.subs) ? msg.subs.filter((t) => typeof t === 'string' && TRACK_RE.test(t)).slice(0, 64) : [];
+  return { key: msg.key, local: msg.local, ranges: mergeRanges(ranges, 64), via, subs };
+}
+
+/** Cues from a friend, checked and cleaned: [{ start, end, text, top? }], or null if anything is out of bounds. */
+export function sanitizeCues(raw) {
+  if (!Array.isArray(raw) || raw.length > MAX_CUES) return null;
+  const out = [];
+  let chars = 0;
+  for (const c of raw) {
+    if (!c || typeof c !== 'object' || typeof c.text !== 'string' || !Number.isFinite(c.start) || !Number.isFinite(c.end)) return null;
+    if (c.start < 0 || c.end <= c.start || c.end > 1e7 || c.text.length > 4000) return null;
+    chars += c.text.length;
+    if (chars > MAX_CUE_TEXT) return null;
+    out.push(c.top === true ? { start: c.start, end: c.end, text: c.text, top: true } : { start: c.start, end: c.end, text: c.text });
+  }
+  return out;
 }
 
 const abortError = () => Object.assign(new Error('Aborted'), { name: 'AbortError' });
@@ -298,6 +322,10 @@ export class Swarm extends EventTarget {
     this.bad = new Map(); // peerId -> time until which we don't ask it
     this.film = null;
     this.reqSeq = 0;
+    this.cueTimeoutMs = o.cueTimeoutMs ?? 5000;
+    this.cueReqs = new Map(); // `${peerId}|${track}` -> pending request
+    this.cueFetches = new Map(); // track -> shared promise
+    this.subSrc = null;
     this.stats = { server: 0, peers: 0, served: 0, dropped: 0, fallbacks: 0 }; // bytes (dropped, fallbacks: counts)
     this._lastSent = '';
     this._lastAt = 0;
@@ -309,7 +337,10 @@ export class Swarm extends EventTarget {
     };
     this._off = [
       this._on(mesh, 'message', (e) => {
-        if (e.detail.msg?.type === 'film-have') this._onHave(e.detail.peer, e.detail.msg);
+        const m = e.detail.msg;
+        if (m?.type === 'film-have') this._onHave(e.detail.peer, m);
+        else if (m?.type === 'sub-cues-req') this._onCueReq(e.detail.peer, m);
+        else if (m?.type === 'sub-cues') this._onCues(e.detail.peer, m);
       }),
       this._on(mesh, 'film', (e) => this._onFilm(e.detail.peer, e.detail.data)),
       this._on(mesh, 'channel-open', (e) => this._sendHave(e.detail.peer.id)),
@@ -423,10 +454,103 @@ export class Swarm extends EventTarget {
     if (!f || f.closed) return none;
     if (f.local) {
       if (!this.share) return none;
-      return { type: 'film-have', key: f.key, local: true, ranges: [[0, f.nPieces - 1]], via: 'file' };
+      return { type: 'film-have', key: f.key, local: true, ranges: [[0, f.nPieces - 1]], via: 'file', subs: this._subList() };
     }
     const ranges = f.store?.cachedPieces ? mergeRanges(f.store.cachedPieces(this.pieceSize), this.maxRanges) : [];
-    return { type: 'film-have', key: f.key, local: false, ranges, via: f.server ? 'drive' : 'peers' };
+    return { type: 'film-have', key: f.key, local: false, ranges, via: f.server ? 'drive' : 'peers', subs: this._subList() };
+  }
+
+  // ---- embedded subtitle cues ----------------------------------------------------------------------------------------
+  /**
+   * `src` tells the swarm about the player's embedded subtitle tracks: { list(): ids of tracks fully extracted,
+   * get(id): their cues, accepts(id): is this an embedded track of the open film }.
+   */
+  setSubSource(src) {
+    this.subSrc = src;
+    this._changed();
+  }
+
+  /** The player's set of extracted tracks changed. */
+  subsChanged() {
+    this._changed();
+  }
+
+  _subList() {
+    try {
+      return (this.subSrc?.list() || []).filter((t) => TRACK_RE.test(t)).slice(0, 64);
+    } catch {
+      return [];
+    }
+  }
+
+  /** Peers that advertise this track for the open film: local holders first, then the others, sorted by id. */
+  _cueHolders(track) {
+    const f = this.film;
+    if (!f || f.closed) return [];
+    const ids = [...this.have].filter(([id, h]) => h.subs?.includes(track) && f.keys.has(h.key) && this._usable(id));
+    const rank = (h) => (h.local ? 0 : 1);
+    return ids.sort((x, y) => rank(x[1]) - rank(y[1]) || (x[0] < y[0] ? -1 : 1)).map(([id, h]) => ({ id, key: h.key }));
+  }
+
+  /** Is anybody known to have this track? */
+  hasCueHolder(track) {
+    return this._cueHolders(track).length > 0;
+  }
+
+  /**
+   * Ask the room for an embedded subtitle track, one peer at a time (5 s each). Resolves to validated cues, or
+   * null when nobody has it or nobody answered. Calls for the same track share one request.
+   */
+  fetchCues(track) {
+    if (!TRACK_RE.test(track)) return Promise.resolve(null);
+    let p = this.cueFetches.get(track);
+    if (p) return p;
+    const film = this.film;
+    p = (async () => {
+      const asked = new Set();
+      for (;;) {
+        if (this.film !== film || film.closed) return null;
+        const h = this._cueHolders(track).find((x) => !asked.has(x.id));
+        if (!h) return null;
+        asked.add(h.id);
+        const cues = await new Promise((resolve) => {
+          const k = `${h.id}|${track}`;
+          const timer = setTimeout(() => { this.cueReqs.delete(k); resolve(null); }, this.cueTimeoutMs);
+          this.cueReqs.set(k, { resolve: (v) => { clearTimeout(timer); this.cueReqs.delete(k); resolve(v); } });
+          if (!this.mesh.send(h.id, { type: 'sub-cues-req', key: h.key, track })) this.cueReqs.get(k).resolve(null);
+        });
+        if (cues) return cues;
+      }
+    })().finally(() => this.cueFetches.delete(track));
+    this.cueFetches.set(track, p);
+    return p;
+  }
+
+  _onCueReq(peer, msg) {
+    const f = this.film;
+    if (!f || f.closed || typeof msg.key !== 'string' || !f.keys.has(msg.key) || typeof msg.track !== 'string' || !TRACK_RE.test(msg.track)) return;
+    if (f.local && !this.share) return;
+    let cues = null;
+    try {
+      if (this._subList().includes(msg.track)) cues = this.subSrc.get(msg.track);
+    } catch {
+      cues = null;
+    }
+    if (!cues) return;
+    this.mesh.send(peer.id, { type: 'sub-cues', key: msg.key, track: msg.track, cues });
+  }
+
+  _onCues(peer, msg) {
+    const f = this.film;
+    const pending = this.cueReqs.get(`${peer.id}|${msg.track}`);
+    if (!f || f.closed || !pending || typeof msg.key !== 'string' || !f.keys.has(msg.key)) return; // not asked for
+    if (this.subSrc?.accepts && !this.subSrc.accepts(msg.track)) return;
+    const cues = sanitizeCues(msg.cues);
+    if (!cues) {
+      this.stats.dropped++;
+      return;
+    }
+    pending.resolve(cues);
   }
 
   _sendHave(id) {

@@ -3,7 +3,7 @@
 // Run with: node --test test/swarm.test.mjs
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { Swarm, T, DENIED, HEADER, MAX_FRAME, MAX_PAYLOAD, assignFetcher, decodeFrame, encodeFrame, filmKey, keyId, mergeRanges, parseHave, movieKeys } from '../public/assets/js/player/swarm.js';
+import { sanitizeCues, MAX_CUES, Swarm, T, DENIED, HEADER, MAX_FRAME, MAX_PAYLOAD, assignFetcher, decodeFrame, encodeFrame, filmKey, keyId, mergeRanges, parseHave, movieKeys } from '../public/assets/js/player/swarm.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const P = 256 * 1024; // piece size used here (the real one is 1 MiB)
@@ -173,8 +173,8 @@ test('frames: anything malformed is rejected', () => {
 });
 
 test('film-have: validation and range merging', () => {
-  assert.deepEqual(parseHave({ key: 'd:ABCDEFGHIJ', local: false, ranges: [[3, 4], [0, 1], [2, 2]], via: 'drive' }), { key: 'd:ABCDEFGHIJ', local: false, ranges: [[0, 4]], via: 'drive' });
-  assert.deepEqual(parseHave({ key: null }), { key: '', local: false, ranges: [], via: '' });
+  assert.deepEqual(parseHave({ key: 'd:ABCDEFGHIJ', local: false, ranges: [[3, 4], [0, 1], [2, 2]], via: 'drive' }), { key: 'd:ABCDEFGHIJ', local: false, ranges: [[0, 4]], via: 'drive', subs: [] });
+  assert.deepEqual(parseHave({ key: null }), { key: '', local: false, ranges: [], via: '', subs: [] });
   for (const m of [null, 'x', {}, { key: 'x:1', local: false, ranges: [] }, { key: 's:12', local: 'yes', ranges: [] }, { key: 's:12', local: true, ranges: [[2, 1]] }, { key: 's:12', local: true, ranges: [[-1, 1]] }, { key: 's:12', local: true, ranges: [[0.5, 1]] }, { key: 's:12', local: true, ranges: 'all' }, { key: 's:12', local: true, ranges: new Array(65).fill([0, 0]) }, { key: 's:12', local: true, ranges: [[0, 1e12]] }, { key: 'd:short', local: false, ranges: [] }]) {
     assert.equal(parseHave(m), null, JSON.stringify(m)?.slice(0, 60));
   }
@@ -813,5 +813,108 @@ test('the sharer leaves: what streamers cached keeps flowing, the rest fails wit
   c.mesh.peers.delete('s');
   assert((await read(fc, 0, 2 * P)).equals(data.subarray(0, 2 * P)), 'c gets the cached pieces from b');
   await assert.rejects(read(fc, 3 * P, 4 * P), /Could not get this part|Nobody is sharing/);
+  net.closeAll();
+});
+
+// ---- embedded subtitle cues between viewers ----------------------------------------------------------------------------
+const CUES = [{ start: 1, end: 4, text: 'Hello' }, { start: 20, end: 25, text: 'Twenty seconds', top: true }];
+
+test('film-have: the list of extracted subtitle tracks is validated', () => {
+  const have = (subs) => parseHave({ key: 's:123', local: true, ranges: [[0, 1]], via: 'file', subs });
+  assert.deepEqual(have(['e1', 'e12']).subs, ['e1', 'e12']);
+  assert.deepEqual(have(['e1', 'x', 5, '../../a', 'e', 'e1234567']).subs, ['e1'], 'only track ids, nothing else');
+  assert.deepEqual(have(undefined).subs, []);
+  assert.equal(have(new Array(200).fill('e1')).subs.length, 64);
+});
+
+test('sanitizeCues: bounds and shape', () => {
+  assert.deepEqual(sanitizeCues(CUES), CUES);
+  assert.deepEqual(sanitizeCues([{ start: 1, end: 2, text: 'x', top: 'yes', extra: 1 }]), [{ start: 1, end: 2, text: 'x' }], 'only known fields, top only when true');
+  for (const bad of [null, 'x', {}, [null], [{ start: 1, end: 1, text: 'x' }], [{ start: -1, end: 1, text: 'x' }], [{ start: 1, end: 2, text: 5 }], [{ start: NaN, end: 2, text: 'x' }], [{ start: 1, end: Infinity, text: 'x' }], [{ start: 1, end: 2e7, text: 'x' }], [{ start: 1, end: 2, text: 'x'.repeat(5000) }], new Array(MAX_CUES + 1).fill({ start: 1, end: 2, text: 'x' })]) {
+    assert.equal(sanitizeCues(bad), null, JSON.stringify(bad)?.slice(0, 50));
+  }
+  const big = Array.from({ length: 3000 }, (_, i) => ({ start: i, end: i + 1, text: 'y'.repeat(3000) })); // 9 MB of text
+  assert.equal(sanitizeCues(big), null, 'total text is capped');
+});
+
+/** Two viewers of the same Drive film; `with` has the extracted tracks. */
+async function cueSetup({ lists = ['e3'], cueTimeoutMs = 80 } = {}) {
+  const net = new Net();
+  const data = makeData(2 * P);
+  const server = makeServer(data);
+  const a = net.node('a', { cueTimeoutMs });
+  const b = net.node('b', { cueTimeoutMs });
+  net.connect('a', 'b');
+  const fa = driveFile(a.swarm, data, server);
+  const fb = driveFile(b.swarm, data, server);
+  fa.swarm.activate();
+  fb.swarm.activate();
+  b.swarm.setSubSource({ list: () => lists, get: () => CUES, accepts: (t) => /^e\d+$/.test(t) });
+  a.swarm.setSubSource({ list: () => [], get: () => null, accepts: (t) => t === 'e3' });
+  await sleep(40);
+  return { net, a, b };
+}
+
+test('cues: a viewer asks the one that advertises the track and gets validated cues', async () => {
+  const { net, a, b } = await cueSetup();
+  assert.deepEqual(a.swarm.have.get('b').subs, ['e3']);
+  assert.equal(a.swarm.hasCueHolder('e3'), true);
+  assert.equal(a.swarm.hasCueHolder('e4'), false);
+  assert.equal(await a.swarm.fetchCues('e4'), null, 'nobody has it: no request is sent');
+  const got = await a.swarm.fetchCues('e3');
+  assert.deepEqual(got, CUES);
+  assert.equal(b.mesh.framesOut.length, 0, 'cues travel on the JSON channel, not the film channel');
+  net.closeAll();
+});
+
+test('cues: unsolicited, wrong-sender, wrong-film or oversized answers are ignored; the next peer is asked after a timeout', async () => {
+  const { net, a, b } = await cueSetup();
+  const deliver = (from, msg) => a.mesh.dispatchEvent(new CustomEvent('message', { detail: { peer: { id: from }, msg } }));
+  const key = a.swarm.film.key;
+  deliver('b', { type: 'sub-cues', key, track: 'e3', cues: CUES }); // nobody asked
+  assert.equal(a.swarm.cueReqs.size, 0);
+  net.silent.add('b');
+  b.swarm.subSrc = null; // b will not answer
+  const p = a.swarm.fetchCues('e3');
+  await sleep(10);
+  deliver('c', { type: 'sub-cues', key, track: 'e3', cues: CUES }); // not the peer asked
+  deliver('b', { type: 'sub-cues', key: 'd:OTHERFILE001', track: 'e3', cues: CUES }); // another film
+  deliver('b', { type: 'sub-cues', key, track: 'e3', cues: new Array(MAX_CUES + 1).fill({ start: 1, end: 2, text: 'x' }) }); // too many
+  deliver('b', { type: 'sub-cues', key, track: 'e3', cues: [{ start: 5, end: 1, text: 'x' }] }); // nonsense
+  assert.equal(await p, null, 'nothing valid arrived: no cues, after the timeout');
+  assert(a.swarm.stats.dropped >= 2);
+  net.closeAll();
+});
+
+test('cues: asks local holders first, then moves on when one does not answer', async () => {
+  const net = new Net();
+  const data = makeData(2 * P);
+  const a = net.node('a', { cueTimeoutMs: 80 });
+  const l = net.node('z-local', { cueTimeoutMs: 80 });
+  const s = net.node('b-streamer', { cueTimeoutMs: 80 });
+  net.connect('a', 'z-local', 'b-streamer');
+  l.swarm.openLocal(new Blob([data]));
+  const fa = peerFile(a.swarm, data);
+  fa.swarm.activate();
+  const fs_ = peerFile(s.swarm, data);
+  fs_.swarm.activate();
+  const src = { list: () => ['e3'], get: () => CUES, accepts: () => true };
+  l.swarm.setSubSource(src);
+  s.swarm.setSubSource(src);
+  a.swarm.setSubSource({ list: () => [], get: () => null, accepts: () => true });
+  await sleep(40);
+  const asked = [];
+  for (const n of [l, s]) n.mesh.addEventListener('message', (e) => { if (e.detail.msg.type === 'sub-cues-req') asked.push(n.id); });
+  assert.deepEqual(await a.swarm.fetchCues('e3'), CUES);
+  assert.deepEqual(asked, ['z-local'], 'the local holder was asked first (and alone)');
+  l.swarm.subSrc = null; // it stops answering (but still advertises)
+  asked.length = 0;
+  assert.deepEqual(await a.swarm.fetchCues('e3'), CUES);
+  assert.deepEqual(asked, ['z-local', 'b-streamer'], 'then the next one');
+  // sharing off: the local holder neither advertises nor answers
+  l.swarm.subSrc = src;
+  l.swarm.setShare(false);
+  await sleep(30);
+  assert.equal(a.swarm.have.has('z-local'), false);
   net.closeAll();
 });
