@@ -1,3 +1,5 @@
+import { DriveClient } from '/assets/js/drive.js';
+
 const $ = (id) => document.getElementById(id);
 
 function toast(text) {
@@ -20,6 +22,13 @@ async function api(method, path, body) {
   return data;
 }
 
+let googleApiKey = '';
+const driveNames = new Map(); // room name -> verified folder name (memory only)
+
+function driveLink(d) {
+  return `https://drive.google.com/drive/folders/${d.folderId}` + (d.resourceKey ? `?resourcekey=${encodeURIComponent(d.resourceKey)}` : '');
+}
+
 function roomUrl(name) {
   return `${location.origin}/${encodeURIComponent(name)}`;
 }
@@ -33,6 +42,7 @@ async function refresh() {
     toast(err.message);
     return;
   }
+  googleApiKey = data.googleApiKey || '';
   const tbody = $('rooms');
   tbody.replaceChildren(...data.rooms.map((r) => {
     const tr = document.createElement('tr');
@@ -45,6 +55,9 @@ async function refresh() {
     const tdPw = document.createElement('td');
     tdPw.textContent = r.hasPassword ? 'set' : 'none';
     tdPw.className = r.hasPassword ? '' : 'muted';
+    const tdDrive = document.createElement('td');
+    tdDrive.textContent = r.drive ? (driveNames.get(r.name + '|' + r.drive.folderId) || 'linked') : '—';
+    if (!r.drive) tdDrive.className = 'muted';
     const tdOnline = document.createElement('td');
     tdOnline.textContent = r.online.length ? r.online.join(', ') : '—';
     if (!r.online.length) tdOnline.className = 'muted';
@@ -58,6 +71,7 @@ async function refresh() {
       }
     });
     const pw = button('Password…', () => changePassword(r.name));
+    const drv = button('Drive…', () => changeDrive(r.name, r.drive));
     const del = button('Delete', async () => {
       if (!confirm(`Delete room “${r.name}”? Anyone inside will be disconnected.`)) return;
       try {
@@ -69,8 +83,8 @@ async function refresh() {
       refresh();
     });
     del.classList.add('danger');
-    tdAct.append(copy, ' ', pw, ' ', del);
-    tr.append(tdName, tdPw, tdOnline, tdAct);
+    tdAct.append(copy, ' ', pw, ' ', drv, ' ', del);
+    tr.append(tdName, tdPw, tdDrive, tdOnline, tdAct);
     return tr;
   }));
   $('empty').hidden = data.rooms.length > 0;
@@ -99,6 +113,42 @@ function changePassword(name) {
       toast('Password updated');
     } catch (err) {
       toast(err.message);
+    }
+    refresh();
+  }, { once: true });
+}
+
+function changeDrive(name, current) {
+  const d = $('drive-dialog');
+  $('drive-room').textContent = name;
+  $('drive-link').value = current ? driveLink(current) : '';
+  $('drive-nokey').hidden = !!googleApiKey;
+  $('drive-remove').hidden = !current;
+  d.returnValue = 'cancel';
+  d.showModal();
+  d.addEventListener('close', async () => {
+    if (d.returnValue !== 'save' && d.returnValue !== 'remove') return;
+    const link = d.returnValue === 'remove' ? '' : $('drive-link').value.trim();
+    let drive;
+    try {
+      ({ drive } = await api('PUT', '/rooms/' + encodeURIComponent(name) + '/drive', { link }));
+    } catch (err) {
+      toast(err.message);
+      return;
+    }
+    if (!drive) toast('Drive folder removed');
+    else if (!googleApiKey) toast('Folder saved');
+    else {
+      toast('Folder saved, checking it…');
+      try {
+        const c = new DriveClient({ apiKey: googleApiKey, folderId: drive.folderId, resourceKey: drive.resourceKey });
+        const f = await c.folderInfo();
+        const items = await c.list(drive.folderId);
+        driveNames.set(name + '|' + drive.folderId, f.name);
+        toast(`Folder “${f.name}” linked: ${items.length} items`);
+      } catch (err) {
+        toast(`Saved, but the folder could not be read: ${err.message}`);
+      }
     }
     refresh();
   }, { once: true });

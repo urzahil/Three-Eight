@@ -6,6 +6,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const WebSocket = require('ws');
+const { parseDriveFolder } = require('../server/store');
 
 const PORT = 45000 + Math.floor(Math.random() * 1000);
 const BASE = `http://127.0.0.1:${PORT}`;
@@ -14,7 +15,7 @@ let proc, dataDir, cookie = '';
 before(async () => {
   dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'three-eight-'));
   proc = spawn(process.execPath, [path.join(__dirname, '..', 'server', 'server.js')], {
-    env: { ...process.env, PORT: String(PORT), HOST: '127.0.0.1', ADMIN_PASSWORD: 'admin-pw', DATA_DIR: dataDir },
+    env: { ...process.env, PORT: String(PORT), HOST: '127.0.0.1', ADMIN_PASSWORD: 'admin-pw', DATA_DIR: dataDir, GOOGLE_API_KEY: 'test-key' },
     stdio: 'ignore',
   });
   for (let i = 0; i < 50; i++) {
@@ -72,7 +73,7 @@ test('create, list, validate rooms', async () => {
   assert.strictEqual((await json('POST', '/api/admin/rooms', { name: 'bad name!' })).status, 400, 'invalid chars');
   assert.strictEqual((await json('POST', '/api/admin/rooms', { name: 'open-room', password: '' })).status, 201);
   const { rooms } = await (await json('GET', '/api/admin/rooms')).json();
-  assert.deepStrictEqual(rooms.map((r) => [r.name, r.hasPassword]), [['MovieNight', true], ['open-room', false]]);
+  assert.deepStrictEqual(rooms.map((r) => [r.name, r.hasPassword, r.drive]), [['MovieNight', true, null], ['open-room', false, null]]);
   const stored = fs.readFileSync(path.join(dataDir, 'rooms.json'), 'utf8');
   assert(!stored.includes('pw1'), 'password must not be stored in clear text');
   assert.match(stored, /scrypt\$/);
@@ -139,4 +140,83 @@ test('password change', async () => {
   assert.strictEqual((await json('PUT', '/api/admin/rooms/open-room', { password: 'new' })).status, 200);
   const r = await (await fetch(BASE + '/api/rooms/open-room')).json();
   assert.strictEqual(r.passwordRequired, true);
+});
+
+const FID = '1AbCdEfGhIjKlMnOpQrStUvWxYz_-0123';
+
+test('parseDriveFolder accepts folder links and IDs', () => {
+  const ok = { folderId: FID, resourceKey: '' };
+  assert.deepStrictEqual(parseDriveFolder(`https://drive.google.com/drive/folders/${FID}`), ok);
+  assert.deepStrictEqual(parseDriveFolder(`  https://drive.google.com/drive/folders/${FID}?usp=sharing `), ok);
+  assert.deepStrictEqual(parseDriveFolder(`https://drive.google.com/drive/u/0/folders/${FID}`), ok);
+  assert.deepStrictEqual(parseDriveFolder(`https://drive.google.com/drive/folders/${FID}?usp=sharing&resourcekey=0-abc_DEF`), { folderId: FID, resourceKey: '0-abc_DEF' });
+  assert.deepStrictEqual(parseDriveFolder(`https://drive.google.com/open?id=${FID}`), ok);
+  assert.deepStrictEqual(parseDriveFolder(`https://drive.google.com/open?id=${FID}&resourcekey=0-k`), { folderId: FID, resourceKey: '0-k' });
+  assert.deepStrictEqual(parseDriveFolder(FID), ok);
+  assert.strictEqual(parseDriveFolder(''), null);
+  assert.strictEqual(parseDriveFolder('   '), null);
+});
+
+test('parseDriveFolder rejects everything else', () => {
+  for (const bad of [
+    `https://drive.google.com/file/d/${FID}/view`,
+    `https://example.com/drive/folders/${FID}`,
+    'https://drive.google.com/drive/my-drive',
+    'https://drive.google.com/drive/folders/short',
+    `https://drive.google.com/drive/folders/${FID}?resourcekey=bad key!`,
+    'short', 'has spaces in it 12345', `${FID}/extra`, 'x'.repeat(201),
+  ]) assert.throws(() => parseDriveFolder(bad), /./, bad);
+  assert.throws(() => parseDriveFolder(`https://drive.google.com/file/d/${FID}/view`), /file/);
+});
+
+test('drive folder admin API, welcome and live push', async () => {
+  const url = '/api/admin/rooms/open-room/drive';
+  assert.strictEqual((await json('PUT', url, { link: FID }, { cookie: '' })).status, 401);
+  assert.strictEqual((await json('PUT', '/api/admin/rooms/nope/drive', { link: FID })).status, 404);
+  assert.strictEqual((await json('PUT', url, { link: 'https://drive.google.com/file/d/' + FID })).status, 400);
+  assert.strictEqual((await json('PUT', url, { link: 'nonsense' })).status, 400);
+
+  // No folder yet: welcome has no drive field.
+  const a = await wsClient();
+  a.sendJson({ type: 'join', room: 'open-room', id: 'dddddddd1', name: 'Dana', password: 'new' });
+  const w1 = await a.next();
+  assert.strictEqual(w1.type, 'welcome');
+  assert(!('drive' in w1));
+
+  const res = await json('PUT', url, { link: `https://drive.google.com/drive/folders/${FID}?resourcekey=0-rk` });
+  assert.strictEqual(res.status, 200);
+  assert.deepStrictEqual(await res.json(), { ok: true, drive: { folderId: FID, resourceKey: '0-rk' } });
+  const expected = { apiKey: 'test-key', folderId: FID, resourceKey: '0-rk' };
+  assert.deepStrictEqual(await a.next(), { type: 'drive', drive: expected });
+
+  const { rooms, googleApiKey } = await (await json('GET', '/api/admin/rooms')).json();
+  assert.strictEqual(googleApiKey, 'test-key');
+  assert.deepStrictEqual(rooms.find((r) => r.name === 'open-room').drive, { folderId: FID, resourceKey: '0-rk' });
+
+  // Public info and config never expose the folder or key.
+  const pub = JSON.stringify(await (await fetch(BASE + '/api/rooms/open-room')).json());
+  assert(!pub.includes(FID) && !pub.includes('test-key') && !pub.includes('drive'));
+  const cfg = JSON.stringify(await (await fetch(BASE + '/api/config')).json());
+  assert(!cfg.includes('test-key') && !cfg.includes(FID));
+
+  // A new member gets it in the welcome, only after the password check.
+  const b = await wsClient();
+  b.sendJson({ type: 'join', room: 'open-room', id: 'dddddddd2', name: 'Eve', password: 'bad' });
+  const bad = await b.next();
+  assert.strictEqual(bad.code, 'bad-password');
+  assert(!JSON.stringify(bad).includes(FID));
+  b.sendJson({ type: 'join', room: 'open-room', id: 'dddddddd2', name: 'Eve', password: 'new' });
+  const w2 = await b.next();
+  assert.deepStrictEqual(w2.drive, expected);
+  assert.deepStrictEqual(await a.next(), { type: 'peer-joined', id: 'dddddddd2', name: 'Eve' });
+
+  // Removing with an empty link.
+  const rm = await json('PUT', url, { link: '  ' });
+  assert.deepStrictEqual(await rm.json(), { ok: true, drive: null });
+  assert.deepStrictEqual(await a.next(), { type: 'drive', drive: null });
+  assert.deepStrictEqual(await b.next(), { type: 'drive', drive: null });
+  const { rooms: after } = await (await json('GET', '/api/admin/rooms')).json();
+  assert.strictEqual(after.find((r) => r.name === 'open-room').drive, null);
+  a.close();
+  b.close();
 });
