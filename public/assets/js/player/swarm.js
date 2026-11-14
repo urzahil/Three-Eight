@@ -31,21 +31,24 @@
 //     CANCEL (4)  receiver -> holder: stop, I don't need it any more (or gave up).
 //     keyId is a 32-bit FNV-1a hash of the key; frames for another film are dropped or denied.
 //
-// WHO FETCHES WHAT (per piece p, for the receiver):
-//   (b) some connected peer advertises `local` for this film: ask one of them, `locals[p mod count]`
-//       (sorted by id); on failure the next one (Drive film: at most two, then the server).
-//   (c) Drive film, nobody local: if a peer that streams the same film already has p cached
-//       (advertised ranges), ask it. Otherwise the "fetcher" of p is `streamers[p mod N]`, where streamers
-//       are this viewer plus the connected peers streaming the same key, sorted by id. If that is me, I
-//       fetch p from our server; if not I ask the fetcher, which answers from its cache or fetches p from
-//       the server first. Everyone sorts the same list, so a region that everybody jumps to at the same
-//       time is fetched from the server about once.
-//   (d) a peer that doesn't start answering in `firstByteMs`, stalls, is too slow, denies us or leaves is
-//       skipped for a while (`badMs`). A Drive film then plans again without it (the next fetcher in the
-//       assignment, which is the one the other viewers pick too, so a lost fetcher still costs the server
-//       about one fetch of the piece) and after two failed friends falls back to our server for that piece.
-//       A film that only exists on friends' devices tries the next local holder and otherwise fails (and
-//       RemoteFile retries). Reads of a few blocks (embedded subtitles) go straight to the server.
+// WHO FETCHES WHAT (per piece p, for a viewer that does not have the film as a file)
+//   The film's ORIGIN is the set of peers that advertise `local` for it (their copy of the file), or, for a
+//   Drive film with none, our server. A Drive film with local holders uses the server only as the last fallback.
+//   Viewers that merely stream RELAY pieces to each other, so the origin sends about one copy in total:
+//   1. a streamer (non-local peer of this film) that advertises p as cached: ask `cached[p mod count]`.
+//   2. otherwise the "fetcher" of p is `streamers[p mod N]`: me plus the connected streamers of this film,
+//      sorted by id. If that is me, I fetch p from the origin: `locals[p mod count]` (spread over the holders),
+//      or the server. If not, I send `want` to the fetcher, which answers from its cache or fetches p from
+//      the origin first (sharing the fetch with its own reads). A fetcher never asks another streamer, only
+//      the origin, so chains are one hop and cannot loop. Everyone sorts the same list, so a region that
+//      everybody jumps to at the same time is fetched from the origin about once.
+//   3. a peer that doesn't start answering in `firstByteMs` (twice that for a relay, which fetches first),
+//      stalls, is too slow, denies us or leaves is skipped for a while (`badMs`) and the plan is made again
+//      without it (the next fetcher, the same one the other viewers pick). After two failed friends we go to
+//      the origin directly: the next local holder, or the server for a Drive film. A film that only exists
+//      on friends' devices fails with a message when no holder answers (RemoteFile retries). Streamers keep
+//      relaying what they have cached when the holders are gone.
+//   4. reads of a few blocks (embedded subtitles) go straight to the server (Drive films).
 
 import { RemoteFile, RemoteError } from './remotefile.js';
 
@@ -468,23 +471,34 @@ export class Swarm extends EventTarget {
   }
 
   // ---- choosing where to get a piece ---------------------------------------------------------------------------------
-  /** { peers: ids to try in order, server: whether the server is the last resort } for piece p. */
+  /** Peers that hold the whole film, usable now, sorted by id and rotated so that locals[0] is `p mod count`. */
+  _locals(film, p) {
+    const now = this.now();
+    const ids = [...this.have]
+      .filter(([id, h]) => h.local && film.keys.has(h.key) && this._usable(id) && !(this.bad.get(id) > now))
+      .map(([id]) => id)
+      .sort();
+    return ids.map((_, i) => ids[(p + i) % ids.length]);
+  }
+
+  /**
+   * { peers: friends to ask first, origin: whether the film's origin is reachable } for piece p.
+   * The origin is the local holders (their copy of the file), or our server for a Drive film.
+   * Viewers that only stream relay: a streamer that already has p cached is asked first; otherwise the
+   * assigned fetcher streamers[p mod N] (me plus the streamers of this film) is, and if that is me,
+   * I go to the origin myself (so `peers` is empty).
+   */
   _plan(film, p) {
     const now = this.now();
-    const ok = (id) => this._usable(id) && !(this.bad.get(id) > now);
-    const entries = [...this.have].filter(([id, h]) => ok(id) && film.keys.has(h.key));
-    const locals = entries.filter(([, h]) => h.local).map(([id]) => id).sort();
-    if (locals.length) {
-      const n = locals.length;
-      const order = locals.map((_, i) => locals[(p + i) % n]);
-      return { peers: film.server ? order.slice(0, 2) : order, server: !!film.server };
-    }
-    if (!film.server) return { peers: [], server: false };
-    const streamers = entries.filter(([, h]) => h.key === film.key).map(([id]) => id);
-    const cached = entries.filter(([, h]) => h.key === film.key && inRanges(h.ranges, p)).map(([id]) => id).sort();
-    if (cached.length) return { peers: [cached[p % cached.length]], server: true };
+    const streamers = [...this.have]
+      .filter(([id, h]) => !h.local && film.keys.has(h.key) && this._usable(id) && !(this.bad.get(id) > now))
+      .map(([id]) => id);
+    const origin = !!film.server || this._locals(film, p).length > 0;
+    const cached = streamers.filter((id) => inRanges(this.have.get(id).ranges, p)).sort();
+    if (cached.length) return { peers: [cached[p % cached.length]], origin };
+    if (!origin) return { peers: [], origin: false };
     const fetcher = assignFetcher(p, [this.selfId, ...streamers]);
-    return { peers: fetcher === this.selfId ? [] : [fetcher], server: true };
+    return { peers: fetcher === this.selfId ? [] : [fetcher], origin };
   }
 
   _bounds(film, p) {
@@ -532,14 +546,14 @@ export class Swarm extends EventTarget {
     const [a, b] = this._bounds(film, p);
     const cached = film.store?.peek?.(a, b);
     if (cached) return cached;
-    // Ask a friend; when it fails it is marked bad, so planning again (without it) picks the next one: for a Drive
-    // film the next fetcher in the assignment, which is the same one the other viewers pick, so a lost fetcher still
-    // costs the server about one fetch of the piece. Drive: at most two friends, then the server.
+    // Ask a friend (a streamer that has the piece, or the assigned fetcher); when it fails it is marked bad, so
+    // planning again (without it) picks the next one: the same one the other viewers pick, so a lost fetcher
+    // still costs the origin about one fetch of the piece. After two failed friends: the origin directly.
     const tried = new Set();
     let plan = this._plan(film, p);
     for (;;) {
       const id = plan.peers.find((x) => !tried.has(x));
-      if (!id || (film.server && tried.size >= 2)) break;
+      if (!id || tried.size >= 2) break;
       tried.add(id);
       const data = await this._fromPeer(film, id, p, sig);
       if (sig.aborted || film.closed) throw abortError();
@@ -550,9 +564,39 @@ export class Swarm extends EventTarget {
       }
       plan = this._plan(film, p);
     }
-    if (!film.server) throw new RemoteError(this.have.size ? 'Could not get this part of the movie from your friends.' : 'Nobody is sharing this movie right now.');
+    if (!plan.origin) throw this._noOrigin();
     if (tried.size) this.stats.fallbacks++;
-    return this._fromServer(film, p, sig);
+    return this._fromOrigin(film, p, sig);
+  }
+
+  _noOrigin() {
+    return new RemoteError(this.have.size ? 'Could not get this part of the movie from your friends.' : 'Nobody is sharing this movie right now.');
+  }
+
+  /**
+   * Piece p from the origin: a local holder (spread by `p mod count`, the next one when it fails; for a Drive
+   * film at most two, then the server), or our server. Shared between my own reads and friends' requests; it
+   * never asks a streamer, so a relay chain is one hop deep and cannot loop.
+   */
+  _fromOrigin(film, p, signal) {
+    return shared(film.serverInflight, p, signal, async (sig) => {
+      const tried = new Set();
+      for (;;) {
+        const id = this._locals(film, p).find((x) => !tried.has(x));
+        if (!id || (film.server && tried.size >= 2)) break;
+        tried.add(id);
+        const data = await this._fromPeer(film, id, p, sig);
+        if (sig.aborted || film.closed) throw abortError();
+        if (data) {
+          this._stored(film, p, data);
+          this.stats.peers += data.length;
+          return data;
+        }
+      }
+      if (!film.server) throw this._noOrigin();
+      if (tried.size) this.stats.fallbacks++;
+      return this._fetchServer(film, p, sig);
+    });
   }
 
   _stored(film, p, data) {
@@ -560,9 +604,9 @@ export class Swarm extends EventTarget {
     this._changed();
   }
 
-  /** Piece p from our server (shared between my own reads and friends' requests). */
-  _fromServer(film, p, signal) {
-    return shared(film.serverInflight, p, signal, async (sig) => {
+  /** Piece p from our server. */
+  _fetchServer(film, p, sig) {
+    return (async () => {
       const [a, b] = this._bounds(film, p);
       const res = await film.server(a, b - 1, sig);
       if (res.status !== 206 && !(res.status === 200 && a === 0 && b === film.size)) {
@@ -580,7 +624,7 @@ export class Swarm extends EventTarget {
       this.stats.server += data.length;
       this._stored(film, p, data);
       return data;
-    });
+    })();
   }
 
   async _slot(film, id, sig) {
@@ -633,8 +677,10 @@ export class Swarm extends EventTarget {
       const onAbort = () => acq.finish(null, true);
       sig.addEventListener('abort', onAbort, { once: true });
       film.acqs.set(req, acq);
-      acq.first = setTimeout(() => acq.finish(null), this.firstByteMs);
-      acq.total = setTimeout(() => acq.finish(null), this.firstByteMs + (len / this.minRate) * 1000);
+      // A streamer answers after fetching from the origin itself: allow the extra hop.
+      const hop = h.local ? 1 : 2;
+      acq.first = setTimeout(() => acq.finish(null), this.firstByteMs * hop);
+      acq.total = setTimeout(() => acq.finish(null), hop * (this.firstByteMs + (len / this.minRate) * 1000));
       if (!this.mesh.sendFilm(id, encodeFrame({ type: T.WANT, req, key: kid, piece: p }), `w${req}`)) acq.finish(null);
     });
   }
@@ -724,7 +770,7 @@ export class Swarm extends EventTarget {
     }
     const cached = film.store?.peek?.(a, b);
     if (cached) return cached;
-    if (film.server) return this._fromServer(film, p, sig);
+    if (film.server || this._locals(film, p).length) return this._fromOrigin(film, p, sig); // as the assigned fetcher or not, only ever from the origin
     return null;
   }
 

@@ -127,7 +127,7 @@ Tip: use headphones during the movie, so your microphone doesn't send the film's
 
 If someone opens a movie file from their device, everyone else in the room can **stream it from their copy**: the film goes browser to browser, nothing passes through the server (the room doesn't need a Google Drive folder). Keep in mind:
 
-- The person sharing needs enough upload bandwidth for each friend they feed directly (about the film's bitrate per friend); friends who already have parts of the film share them too, but a friend's copy is the only source. A slow connection or a closed laptop stops the stream.
+- The person sharing sends about one copy of the film in total, however many friends stream it: friends pass pieces on to each other, each uploading roughly its share (measured with three friends: the sharer uploaded about 1.0 × the part of the film they watched, instead of 3 ×). The sharer's connection still has to carry the film's bitrate once, and their copy is the only source: if they leave or close the laptop, friends can keep watching what they already downloaded, and the rest can't be loaded.
 - It works in browsers with Media Source Extensions (Chrome, Edge, Firefox, current Safari). Browsers without them can't stream from a copy and should open their own file.
 - Sharing is automatic while someone has the room's movie loaded from a file. Turn it off in **Settings → Share my movie file with the room**: friends are then not offered the copy, and the file is not served. (Viewers streaming from Drive still pass the pieces they have to their friends.)
 

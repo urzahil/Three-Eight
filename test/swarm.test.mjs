@@ -654,3 +654,164 @@ test('server errors are handed to RemoteFile unchanged (its explain() words them
   assert.equal(a.swarm.film, null);
   net.closeAll();
 });
+
+// ---- relaying: friends that stream pass pieces on, so the origin sends about one copy -------------------------------
+test('planner: a streamer with the piece cached, else the assigned fetcher, else the origin', async () => {
+  const net = new Net();
+  const data = makeData(6 * P);
+  const me = net.node('m');
+  for (const id of ['a', 'z', 's']) net.node(id);
+  net.connect('m', 'a', 'z', 's');
+  const rf = peerFile(me.swarm, data);
+  rf.swarm.activate();
+  const film = me.swarm.film;
+  const have = (id, o) => me.swarm.have.set(id, { key: `s:${data.length}`, local: false, ranges: [], via: 'peers', ...o });
+  me.swarm.have.set('s', { key: `s:${data.length}`, local: true, ranges: [[0, 5]], via: 'file' });
+  // streamers [a, m, z] (sorted, with me): piece p -> p mod 3; when it is me the plan has no friend (go to the origin)
+  have('a');
+  have('z');
+  assert.deepEqual([0, 1, 2, 3, 4, 5].map((p) => me.swarm._plan(film, p).peers), [['a'], [], ['z'], ['a'], [], ['z']]);
+  assert.equal(me.swarm._plan(film, 0).origin, true);
+  // a streamer that has the piece cached comes first, whoever the fetcher is; several: piece mod count
+  have('z', { ranges: [[2, 3]] });
+  assert.deepEqual(me.swarm._plan(film, 1).peers, [], 'not cached anywhere: the fetcher is me');
+  assert.deepEqual(me.swarm._plan(film, 3).peers, ['z']);
+  have('a', { ranges: [[3, 3]] });
+  assert.deepEqual(me.swarm._plan(film, 3).peers, ['z'], 'both have 3: sorted [a, z], 3 mod 2 = 1');
+  assert.deepEqual(me.swarm._plan(film, 2).peers, ['z']);
+  // the sharer is never a relay: a local holder is not among the streamers
+  assert(![0, 1, 2, 3, 4, 5].some((p) => me.swarm._plan(film, p).peers.includes('s')));
+  // no holders and nobody has it: no origin
+  me.swarm.have.delete('s');
+  assert.deepEqual(me.swarm._plan(film, 4), { peers: [], origin: false });
+  net.closeAll();
+});
+
+test('one sharer, three streamers: the sharer sends about one copy; everybody gets exact bytes', async () => {
+  const net = new Net();
+  const data = makeData(8 * P + 777);
+  const sharer = net.node('sharer');
+  const names = ['bob', 'carol', 'dave'];
+  const nodes = names.map((id) => net.node(id));
+  net.connect('sharer', ...names);
+  sharer.swarm.openLocal(new Blob([data]));
+  const files = nodes.map((n) => peerFile(n.swarm, data, { retries: 2 }));
+  files.forEach((f) => f.swarm.activate());
+  await sleep(40);
+  const all = await Promise.all(files.map((f) => read(f, 0, data.length)));
+  all.forEach((r) => assert(r.equals(data)));
+  const served = sharer.swarm.stats.served;
+  assert(served <= data.length * 1.4, `the sharer sent ${served} bytes for a film of ${data.length}`);
+  assert(nodes.reduce((n, x) => n + x.swarm.stats.peers, 0) >= 3 * data.length, 'every streamer received the whole film');
+  // streamers asked each other for some pieces (relaying), and the relays only ever asked the sharer
+  const wantsToStreamers = nodes.flatMap((n) => n.mesh.out(T.WANT)).filter((x) => names.includes(x.to));
+  assert(wantsToStreamers.length > 0, 'pieces were relayed between streamers');
+  net.closeAll();
+});
+
+test('a fetcher that is asked for a piece goes to the origin only, never to another streamer', async () => {
+  const net = new Net();
+  const data = makeData(3 * P);
+  const s = net.node('s');
+  const b = net.node('b');
+  const c = net.node('c');
+  net.connect('s', 'b', 'c');
+  s.swarm.openLocal(new Blob([data]));
+  const fb = peerFile(b.swarm, data);
+  fb.swarm.activate();
+  const fc = peerFile(c.swarm, data);
+  fc.swarm.activate();
+  await sleep(40);
+  // c asks b for piece 1 (b has nothing): b must fetch it from s, and ask nobody else
+  net.film('c', 'b', encodeFrame({ type: T.WANT, req: 7, key: keyId(`s:${data.length}`), piece: 1 }));
+  await sleep(60);
+  assert.deepEqual(b.mesh.out(T.WANT).map((x) => [x.to, x.f.piece]), [['s', 1]]);
+  assert.deepEqual(c.mesh.out(T.WANT).length, 0);
+  assert.equal(b.mesh.out(T.DATA).filter((x) => x.to === 'c').reduce((n, x) => n + x.f.payload.length, 0), P);
+  net.closeAll();
+});
+
+test('single streamer: the friend is the fetcher and asks the sharer directly', async () => {
+  const net = new Net();
+  const data = makeData(3 * P);
+  const s = net.node('s');
+  const b = net.node('b');
+  net.connect('s', 'b');
+  s.swarm.openLocal(new Blob([data]));
+  const fb = peerFile(b.swarm, data);
+  fb.swarm.activate();
+  await sleep(30);
+  assert((await read(fb, 0, data.length)).equals(data));
+  assert.deepEqual(b.mesh.out(T.WANT).map((x) => x.to), ['s', 's', 's']);
+  assert.equal(s.swarm.stats.served, data.length);
+  net.closeAll();
+});
+
+test('the fetcher dies: re-plan without it, the next fetcher gets the piece from the origin once', async () => {
+  const net = new Net();
+  const data = makeData(4 * P);
+  const s = net.node('s');
+  const b = net.node('b');
+  const c = net.node('c');
+  net.connect('s', 'b', 'c');
+  s.swarm.openLocal(new Blob([data]));
+  const fb = peerFile(b.swarm, data);
+  const fc = peerFile(c.swarm, data);
+  fb.swarm.activate();
+  fc.swarm.activate();
+  await sleep(40);
+  net.silent.add('b'); // b freezes
+  const t0 = Date.now();
+  // streamers [b, c]: piece 0 is b's. c waits for b, then plans again: c is the fetcher and asks the sharer.
+  assert((await read(fc, 0, P)).equals(data.subarray(0, P)));
+  assert(Date.now() - t0 < 1500);
+  assert.deepEqual(c.mesh.out(T.WANT).map((x) => x.to), ['b', 's']);
+  assert.equal(c.swarm.stats.fallbacks, 1);
+  // the sharer lost nothing by it: each piece was sent once
+  assert.equal(s.swarm.stats.served, P);
+  net.closeAll();
+});
+
+test('Drive film with a local holder: the holder is the origin; the server only when the holder fails', async () => {
+  const net = new Net();
+  const data = makeData(3 * P);
+  const server = makeServer(data);
+  const h = net.node('h');
+  const a = net.node('a');
+  net.connect('h', 'a');
+  h.swarm.openLocal(new Blob([data]));
+  const fa = driveFile(a.swarm, data, server);
+  fa.swarm.activate();
+  await sleep(40);
+  assert((await read(fa, 0, P)).equals(data.subarray(0, P)));
+  assert.equal(server.calls.length, 0, 'the holder was the origin');
+  assert.equal(a.mesh.out(T.WANT)[0].to, 'h');
+  net.silent.add('h');
+  assert((await read(fa, P, 2 * P)).equals(data.subarray(P, 2 * P)));
+  assert.deepEqual(server.calls.map((c) => c.start), [P], 'then the server');
+  assert.equal(a.swarm.stats.fallbacks, 1);
+  net.closeAll();
+});
+
+test('the sharer leaves: what streamers cached keeps flowing, the rest fails with the usual message', async () => {
+  const net = new Net();
+  const data = makeData(4 * P);
+  const s = net.node('s');
+  const b = net.node('b');
+  const c = net.node('c');
+  net.connect('s', 'b', 'c');
+  s.swarm.openLocal(new Blob([data]));
+  const fb = peerFile(b.swarm, data);
+  const fc = peerFile(c.swarm, data);
+  fb.swarm.activate();
+  fc.swarm.activate();
+  await sleep(40);
+  await read(fb, 0, 2 * P); // b has pieces 0 and 1
+  await sleep(40); // ... and has told c
+  for (const n of [b, c]) n.mesh.dispatchEvent(new CustomEvent('peer-removed', { detail: { peer: { id: 's' } } }));
+  b.mesh.peers.delete('s');
+  c.mesh.peers.delete('s');
+  assert((await read(fc, 0, 2 * P)).equals(data.subarray(0, 2 * P)), 'c gets the cached pieces from b');
+  await assert.rejects(read(fc, 3 * P, 4 * P), /Could not get this part|Nobody is sharing/);
+  net.closeAll();
+});
