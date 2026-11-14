@@ -142,6 +142,21 @@ async function startServer() {
     a = await state(alice); b = await state(bob);
     assert(!a.paused && !b.paused && Math.abs(a.time - b.time) < 0.4, `still in sync after the audio change: ${a.time} ${b.time}`);
 
+    // --- an external .srt that Alice loads (CC > Load subtitle file) shows for Bob, who streams from her copy
+    const SRT = path.join(os.tmpdir(), 'share-check-' + ROOM + '.srt');
+    fs.writeFileSync(SRT, '1\n00:00:19,000 --> 00:00:30,000\nZebra crossing\n');
+    {
+      await ctl(alice, '#m-time');
+      const sk0 = await alice.locator('#m-seek').boundingBox();
+      await alice.mouse.click(sk0.x + sk0.width * (21 / 40), sk0.y + sk0.height / 2);
+      await sleep(1500);
+      await alice.setInputFiles('#sub-file', SRT);
+      await waitFor(alice, () => /Zebra crossing/.test(document.getElementById('subs-layer').innerText));
+      await waitFor(bob, () => /Zebra crossing/.test(document.getElementById('subs-layer').innerText), undefined, 8000).catch(() => {});
+      const t = await bob.evaluate(() => ({ text: document.getElementById('subs-layer').innerText.trim(), sub: room.sync.state.sub, files: room.sync.state.subFiles, texts: [...room.sync.subTexts.keys()], tracks: room.player.info?.subtitleTracks.map((x) => x.id), time: room.player.time, mode: room.player.mode }));
+      assert.match(t.text, /Zebra crossing/, 'Bob sees the .srt Alice loaded: ' + JSON.stringify(t));
+    }
+
     const swarm = await Promise.all([alice, bob].map((p) => p.evaluate(() => ({ ...room.swarm.stats, cached: room.player.file.cachedPieces?.(1048576) || null }))));
     console.log(`swarm: alice served ${swarm[0].served} bytes; bob received ${swarm[1].peers} bytes from her; pieces bob holds: ${JSON.stringify(swarm[1].cached)}`);
     assert(swarm[0].served > 1000000 && swarm[1].peers > 1000000, 'the film travelled from Alice to Bob');
@@ -191,6 +206,20 @@ async function startServer() {
     await alice.keyboard.press('Escape');
     await waitFor(C.page, () => document.getElementById('movie-overlay').textContent.includes("Stream from Alice's copy"));
     console.log('opt-in again: the button is back');
+
+    // --- subtitles loaded BEFORE the friend starts streaming: a late joiner gets the .srt too
+    if ((await state(alice)).paused === false) await ctl(alice, '#m-play');
+    await ctl(alice, '#m-time');
+    const sk = await alice.locator('#m-seek').boundingBox();
+    await alice.mouse.click(sk.x + sk.width * (22 / 40), sk.y + sk.height / 2);
+    await sleep(1500);
+    await C.page.evaluate(() => room.swarm.bad.clear()); // Carol's forced request above got a DENY, which marks Alice bad for 30 s
+    await C.page.click('#movie-overlay button:has-text("Stream from Alice\'s copy")');
+    await waitFor(C.page, () => document.getElementById('movie').readyState >= 2 && room.player.file?.peerOnly);
+    await waitFor(C.page, () => /Zebra crossing/.test(document.getElementById('subs-layer').innerText), undefined, 15000).catch(() => {});
+    const late = await C.page.evaluate(() => ({ text: document.getElementById('subs-layer').innerText.trim(), sub: room.sync.state.sub, time: room.player.time, texts: [...room.sync.subTexts.keys()] }));
+    assert.match(late.text, /Zebra crossing/, 'a friend who starts streaming later gets the .srt loaded earlier: ' + JSON.stringify(late));
+    console.log('external .srt reaches streamers who joined before and after it was loaded');
 
     // --- Alice leaves: Bob, who has fetched what he plays, keeps the picture until he needs more; the room carries on
     await A.ctx.close();
