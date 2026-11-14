@@ -223,7 +223,7 @@ Notes:
 
 ### Do I need TURN?
 
-Usually not. STUN is enough for most home connections. Some friends may be behind very strict NAT, like certain mobile carriers or corporate networks. Their tile then shows "connection failed", and only they are affected. A TURN server ([coturn](https://github.com/coturn/coturn)) fixes this by relaying *their* media. That uses bandwidth on whatever host runs coturn, so it's opt-in. Configure coturn with `use-auth-secret` and `static-auth-secret=...`, then set `TURN_URLS` and `TURN_SECRET`.
+Usually not. STUN is enough for most home connections. Some friends may be behind very strict NAT, like certain mobile carriers or corporate networks. Their tile then shows "connection failed", and only they are affected. A TURN server ([coturn](https://github.com/coturn/coturn)) fixes this by relaying *their* media. That uses bandwidth on whatever host runs coturn, so it's opt-in. Configure coturn with `use-auth-secret` and `static-auth-secret=...`, then set `TURN_URLS` and `TURN_SECRET`. `docker-compose.yml` has a ready-made, commented-out `turn` service with the steps to enable it.
 
 ## Customizing the look
 
