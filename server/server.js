@@ -18,7 +18,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { WebSocketServer } = require('ws');
-const { RoomStore } = require('./store');
+const { RoomStore, parseDriveFolder } = require('./store');
 
 const PORT = parseInt(process.env.PORT || '4567', 10);
 const HOST = process.env.HOST || '0.0.0.0';
@@ -27,6 +27,7 @@ const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(__dirname, '..',
 const MAX_ROOM_SIZE = parseInt(process.env.MAX_ROOM_SIZE || '12', 10);
 const TRUST_PROXY = /^(1|true|yes)$/i.test(process.env.TRUST_PROXY || '');
 const MAX_MESSAGE_BYTES = 64 * 1024;
+const GOOGLE_API_KEY = (process.env.GOOGLE_API_KEY || '').trim();
 const ADMIN_SESSION_MS = 12 * 3600 * 1000;
 
 let ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
@@ -213,6 +214,12 @@ function roomMembers(name) {
   return live.get(RoomStore.key(name));
 }
 
+// What room members need to browse the room's Google Drive folder, or null.
+function driveInfo(r) {
+  if (!r || !r.drive || !GOOGLE_API_KEY) return null;
+  return { apiKey: GOOGLE_API_KEY, folderId: r.drive.folderId, resourceKey: r.drive.resourceKey || '' };
+}
+
 function kickRoom(name, code, message) {
   const members = roomMembers(name);
   if (!members) return;
@@ -277,7 +284,7 @@ async function handleApi(req, res, url) {
         const m = roomMembers(r.name);
         return { ...r, online: m ? [...m.values()].map((x) => x.name) : [] };
       });
-      return sendJson(res, 200, { rooms });
+      return sendJson(res, 200, { rooms, googleApiKey: GOOGLE_API_KEY });
     }
     if (!name && req.method === 'POST') {
       const body = await readJson(req);
@@ -288,7 +295,25 @@ async function handleApi(req, res, url) {
       }
       return sendJson(res, 201, { ok: true });
     }
-    if (name && req.method === 'PUT') {
+    if (name && parts[4] === 'drive' && parts.length === 5 && req.method === 'PUT') {
+      const body = await readJson(req);
+      let drive;
+      try {
+        drive = parseDriveFolder(typeof body.link === 'string' ? body.link : '');
+      } catch (err) {
+        return sendJson(res, 400, { error: err.message });
+      }
+      try {
+        store.setDrive(name, drive);
+      } catch (err) {
+        return sendJson(res, 404, { error: err.message });
+      }
+      const info = driveInfo(store.get(name));
+      const members = roomMembers(name);
+      if (members) for (const m of members.values()) send(m.ws, { type: 'drive', drive: info });
+      return sendJson(res, 200, { ok: true, drive });
+    }
+    if (name && parts.length === 4 && req.method === 'PUT') {
       const body = await readJson(req);
       try {
         await store.setPassword(name, String(body.password || ''));
@@ -453,7 +478,10 @@ async function handleJoin(ws, msg) {
   const name = cleanName(msg.name);
   const peers = [...members.entries()].filter(([pid]) => pid !== msg.id).map(([pid, m]) => ({ id: pid, name: m.name }));
   members.set(msg.id, { ws, name });
-  send(ws, { type: 'welcome', id: msg.id, room: r.name, peers });
+  const welcome = { type: 'welcome', id: msg.id, room: r.name, peers };
+  const drive = driveInfo(r);
+  if (drive) welcome.drive = drive;
+  send(ws, welcome);
   if (!existing) {
     for (const [pid, m] of members) if (pid !== msg.id) send(m.ws, { type: 'peer-joined', id: msg.id, name });
   }

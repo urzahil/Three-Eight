@@ -45,7 +45,7 @@
     <section class="card admin-card">
       <h2>Rooms</h2>
       <table class="rooms">
-        <thead><tr><th>Room</th><th>Password</th><th>Online now</th><th></th></tr></thead>
+        <thead><tr><th>Room</th><th>Password</th><th>Drive</th><th>Online now</th><th></th></tr></thead>
         <tbody id="rooms"></tbody>
       </table>
       <p id="empty" class="muted" hidden>No rooms yet.</p>
@@ -58,6 +58,18 @@
       <label>New password <input id="pw-new" type="text" autocomplete="off" placeholder="leave empty to remove the password"></label>
       <label class="check"><input id="pw-kick" type="checkbox"> Disconnect people currently in the room</label>
       <button class="btn primary" value="save">Save</button>
+      <button class="btn ghost" value="cancel">Cancel</button>
+    </form>
+  </dialog>
+
+  <dialog id="drive-dialog" class="dialog">
+    <form method="dialog" class="stack">
+      <h2>Google Drive folder for <span id="drive-room"></span></h2>
+      <label>Folder link <input id="drive-link" type="text" autocomplete="off" placeholder="https://drive.google.com/drive/folders/..."></label>
+      <p class="muted small">Paste the link of a folder shared as “Anyone with the link”. Leave empty to remove it.</p>
+      <p id="drive-nokey" class="muted small" hidden>GOOGLE_API_KEY is not set on the server, so room members won't see this folder yet.</p>
+      <button class="btn primary" value="save">Save</button>
+      <button id="drive-remove" class="btn danger" value="remove" hidden>Remove</button>
       <button class="btn ghost" value="cancel">Cancel</button>
     </form>
   </dialog>

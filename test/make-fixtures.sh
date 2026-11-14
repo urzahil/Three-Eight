@@ -41,6 +41,8 @@ $FF "${SRC[@]}" -i subs_en.srt -i subs_it.ass -map 0 -map 1 -map 2 -map 3 -map 4
 # MP4: H.264 + 2x AAC + mov_text
 $FF "${SRC[@]}" -i subs_en.srt -map 0 -map 1 -map 2 -map 3 -c:v libx264 -preset veryfast -bf 3 -g 48 -c:a aac -c:s mov_text \
   -metadata:s:a:0 language=eng -metadata:s:a:1 language=ita -metadata:s:s:0 language=eng multi.mp4
+# MP4 with one audio track and the index up front: plays natively (no remuxer)
+$FF -i multi.mp4 -map 0:v -map 0:a:0 -c copy -movflags +faststart single.mp4
 # MKV: VP9 + Opus + AC-3 (AC-3 is unplayable outside Safari)
 $FF "${SRC[@]}" -map 0 -map 1 -map 2 -c:v libvpx-vp9 -deadline realtime -cpu-used 8 -b:v 500k -c:a:0 libopus -c:a:1 ac3 multi.webm.mkv
 echo "fixtures ready in $(pwd)"

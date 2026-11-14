@@ -31,6 +31,39 @@ async function verifyPassword(password, stored) {
   return key.length === expected.length && crypto.timingSafeEqual(key, expected);
 }
 
+const DRIVE_ID_RE = /^[A-Za-z0-9_-]{10,200}$/;
+const DRIVE_KEY_RE = /^[A-Za-z0-9_-]{1,200}$/;
+const DRIVE_HELP = 'Paste a Google Drive folder link (https://drive.google.com/drive/folders/...) or a folder ID.';
+
+// Parses a Drive folder link or bare ID. Returns { folderId, resourceKey } or
+// null for empty input (meaning "remove"). Throws an Error with a readable message.
+function parseDriveFolder(input) {
+  const text = String(input ?? '').trim();
+  if (!text) return null;
+  let folderId = '';
+  let resourceKey = '';
+  if (/^https?:\/\//i.test(text)) {
+    let u;
+    try {
+      u = new URL(text);
+    } catch {
+      throw new Error('That does not look like a valid link. ' + DRIVE_HELP);
+    }
+    if (u.hostname.toLowerCase() !== 'drive.google.com') throw new Error('Only drive.google.com links are supported. ' + DRIVE_HELP);
+    const m = u.pathname.match(/^(?:\/u\/\d+)?\/drive(?:\/u\/\d+)?\/folders\/([^/]+)\/?$/);
+    if (m) folderId = m[1];
+    else if (u.pathname === '/open' || u.pathname === '/open/') folderId = u.searchParams.get('id') || '';
+    else if (/\/file\/d\//.test(u.pathname)) throw new Error('That is a link to a file, not a folder. ' + DRIVE_HELP);
+    else throw new Error('That is not a folder link. ' + DRIVE_HELP);
+    resourceKey = u.searchParams.get('resourcekey') || '';
+  } else {
+    folderId = text;
+  }
+  if (!DRIVE_ID_RE.test(folderId)) throw new Error('The folder ID is not valid. ' + DRIVE_HELP);
+  if (resourceKey && !DRIVE_KEY_RE.test(resourceKey)) throw new Error('The resource key in the link is not valid.');
+  return { folderId, resourceKey };
+}
+
 class RoomStore {
   constructor(dataDir) {
     this.file = path.join(dataDir, 'rooms.json');
@@ -67,7 +100,7 @@ class RoomStore {
 
   list() {
     return Object.entries(this.rooms)
-      .map(([key, r]) => ({ name: r.name || key, createdAt: r.createdAt, updatedAt: r.updatedAt, hasPassword: !!r.passwordHash }))
+      .map(([key, r]) => ({ name: r.name || key, createdAt: r.createdAt, updatedAt: r.updatedAt, hasPassword: !!r.passwordHash, drive: r.drive ? { folderId: r.drive.folderId, resourceKey: r.drive.resourceKey || '' } : null }))
       .sort((a, b) => a.name.localeCompare(b.name));
   }
 
@@ -92,6 +125,15 @@ class RoomStore {
     this._save();
   }
 
+  setDrive(name, drive) {
+    const r = this.get(name);
+    if (!r) throw new Error('No such room.');
+    if (drive) r.drive = { folderId: drive.folderId, resourceKey: drive.resourceKey || '' };
+    else delete r.drive;
+    r.updatedAt = Date.now();
+    this._save();
+  }
+
   delete(name) {
     if (!this.get(name)) throw new Error('No such room.');
     delete this.rooms[RoomStore.key(name)];
@@ -106,4 +148,4 @@ class RoomStore {
   }
 }
 
-module.exports = { RoomStore, hashPassword, verifyPassword };
+module.exports = { RoomStore, parseDriveFolder, hashPassword, verifyPassword };

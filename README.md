@@ -19,7 +19,7 @@ Video meetups and movie nights with friends, entirely in the browser (Chrome, Fi
 - **Server** (`server/`): Node.js with one dependency (`ws`). It serves the static app, stores rooms and their scrypt-hashed passwords in `/data/rooms.json`, checks the password when someone joins, relays WebRTC offers, answers and ICE candidates between members of the same room, and answers clock-sync pings.
 - **Calls** (`public/assets/js/mesh.js`): a full mesh with one `RTCPeerConnection` per pair of people. Each person uploads one stream per friend, and video bitrate goes down automatically as the room grows. This works best with up to about 6–8 people.
 - **Movie sync** (`public/assets/js/sync.js`): everyone shares a small playback state: playing or paused, position, timestamp on the shared server clock, audio track and subtitle track. Any change is broadcast over WebRTC data channels and the newest change wins. Each browser works out where the movie should be right now and corrects drift. It speeds up or slows down by a few percent for small offsets and seeks for large ones. In testing, browsers stayed within about 10 ms of each other.
-- **Movie files are never uploaded.** Each person picks their local file. The page compares file size and name to warn when someone has a different file.
+- **Movie files are never uploaded.** Each person picks their local file, or streams the room's Google Drive folder directly from Google (the server never fetches or relays it). The page compares file size and name to warn when someone has a different file.
 
 ### Audio tracks and subtitles in every browser
 
@@ -116,12 +116,34 @@ For local testing, `http://localhost:4567` counts as a secure context, so camera
 
 ## Using it
 
-1. Open `https://three-eight.example.com/admin`, log in with `ADMIN_PASSWORD`, and create a room, for example `movienight`, with a password. The admin page also shows who is online in each room. From there you can change passwords (and optionally kick everyone) or delete rooms.
+1. Open `https://three-eight.example.com/admin`, log in with `ADMIN_PASSWORD`, and create a room, for example `movienight`, with a password. The admin page also shows who is online in each room. From there you can change passwords (and optionally kick everyone) or delete rooms. Optionally attach a Google Drive folder to a room (see below).
 2. Send friends `https://three-eight.example.com/movienight` and the password.
 3. Each person enters a display name, which is remembered in the browser's local storage, plus the room password. They can also choose to remember the password on that device.
 4. To watch together, one person clicks **Movie** and picks a file. Everyone else is asked to pick their own copy. Use the player controls, the audio (🎧) and subtitle (CC) menus, or keyboard shortcuts: `space` play/pause, `←`/`→` ±10 s (adjustable in Settings), `f` full screen, `p` picture-in-picture, `m` mic, `v` camera, `c` chat.
 
 Tip: use headphones during the movie, so your microphone doesn't send the film's sound to your friends. Movie volume is per person.
+
+### Google Drive folders
+
+An admin can attach one Google Drive folder to a room. Room members can then browse it (including subfolders) and stream a movie straight from Google Drive into the player, or still pick a local copy. Everything happens in the browsers, talking to Google directly: nothing goes through the Three-Eight server. Rooms without a folder look the same as before.
+
+Setup:
+
+1. In the [Google Cloud console](https://console.cloud.google.com/), create a dedicated project. Do **not** attach a billing account.
+2. Enable the **Google Drive API** for that project.
+3. Create an **API key** and restrict it: under *API restrictions* choose *Restrict key* and select only the Google Drive API. Don't use *HTTP referrers (websites)* restriction, because the app sends no `Referer` header (`Referrer-Policy: no-referrer`) and every request would be rejected.
+4. Set `GOOGLE_API_KEY` (see below) and restart the server.
+5. In Google Drive, share the folder as **Anyone with the link**.
+6. On the admin page, click **Drive…** next to the room and paste the folder link. The page checks that the folder can be read.
+
+Notes:
+
+- The key is sent to room members' browsers. It can only read files that are already public or link-shared. The worst case is someone using up the project's request quota. To rotate it, create a new key, update `GOOGLE_API_KEY` and restart.
+- Each viewer streams the file themselves, so their connection must handle the movie's bitrate.
+- Google may temporarily block a heavily downloaded file ("download quota exceeded"). Use a local copy until it clears.
+- Embedded subtitles in a streamed film are read only when you select them, one small download at a time, so they load slowly; a separate `.srt`, `.vtt` or `.ass` file next to the movie is much faster. MKV files without a subtitle index can't be read while streaming at all.
+- If Google shows "your computer or network may be sending automated queries", it is blocking downloads from that internet connection (the app then says so). Wait a few hours, switch network or VPN, or use a local copy of the film.
+- A subtitle file next to the movie with the same name (`Arrival.srt`, `Arrival.en.srt`, ...) loads automatically for everyone when someone starts the movie from Drive. Without an exact match, the file in the browser's language is preferred. Names like `Film.en.srt` or `Film ENG.srt` are recognised. Other subtitle files for the film in its folder are listed under **From Google Drive** in the CC menu.
 
 ## Configuration
 
@@ -136,6 +158,7 @@ Tip: use headphones during the movie, so your microphone doesn't send the film's
 | `TURN_URLS` | — | Comma-separated TURN URLs (optional) |
 | `TURN_SECRET` | — | coturn `static-auth-secret` (ephemeral credentials) |
 | `TURN_USERNAME` / `TURN_PASSWORD` | — | Static TURN credentials (alternative to the secret) |
+| `GOOGLE_API_KEY` | — | Google Drive API key for room Drive folders (optional, see above) |
 | `TLS_CERT` / `TLS_KEY` | — | Serve HTTPS directly instead of using a proxy |
 
 ### Do I need TURN?
@@ -197,7 +220,11 @@ node test/e2e.js
 node test/pip-check.js
 ```
 
-`player-check.js` tests the in-browser player on its own: native or remux mode, audio track switching, seeking and subtitles. `e2e.js` tests the whole flow: the admin creates a room, a wrong password is rejected, two people join with fake cameras, video flows peer to peer, mute and camera state and chat arrive on the other side, and the movie syncs. The movie part covers play, pause, seeking, audio and subtitle changes, a shared subtitle file, and a late joiner. Finally the admin deletes the room and everyone is disconnected. `pip-check.js` tests picture-in-picture: the Document PiP window (the movie box moves there, subtitles still render, controls inside it drive the other person, and closing it brings the player back), the native-PiP fallback (the subtitles are mirrored into a caption track, and a pause made directly on the `<video>` reaches the room), and the compact style (chosen in Settings: the canvas stream is in native PiP, the subtitles and video are drawn on the canvas, a pause on the PiP element reaches the room, and leaving PiP cleans up).
+```bash
+node test/drive-check.js
+```
+
+`drive-check.js` starts its own server and replaces Google Drive with a local mock: browsing a folder and its subfolders, streaming a movie through the remuxer and natively, room sync while streaming, sharing a subtitle file from the folder, a blocked download, and live changes to the room's folder. `player-check.js` tests the in-browser player on its own: native or remux mode, audio track switching, seeking and subtitles. `e2e.js` tests the whole flow: the admin creates a room, a wrong password is rejected, two people join with fake cameras, video flows peer to peer, mute and camera state and chat arrive on the other side, and the movie syncs. The movie part covers play, pause, seeking, audio and subtitle changes, a shared subtitle file, and a late joiner. Finally the admin deletes the room and everyone is disconnected. `pip-check.js` tests picture-in-picture: the Document PiP window (the movie box moves there, subtitles still render, controls inside it drive the other person, and closing it brings the player back), the native-PiP fallback (the subtitles are mirrored into a caption track, and a pause made directly on the `<video>` reaches the room), and the compact style (chosen in Settings: the canvas stream is in native PiP, the subtitles and video are drawn on the canvas, a pause on the PiP element reaches the room, and leaving PiP cleans up).
 
 ## License
 

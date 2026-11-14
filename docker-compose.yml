@@ -19,6 +19,8 @@ services:
       TURN_SECRET: ${TURN_SECRET:-}
       TURN_USERNAME: ${TURN_USERNAME:-}
       TURN_PASSWORD: ${TURN_PASSWORD:-}
+      # Optional API key for Google Drive folders in rooms (see README).
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
     volumes:
       - three-eight-data:/data
 
