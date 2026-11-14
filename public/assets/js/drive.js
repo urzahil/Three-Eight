@@ -54,6 +54,38 @@ export async function driveErrorFromResponse(res) {
   return friendly(message ? `Google Drive said: ${message}` : `Google Drive returned an error (${status}).`, res, reason);
 }
 
+const KEY_RE = /^[A-Za-z0-9_-]{0,200}$/;
+
+// ISO 639-2 codes that subtitle files use next to the 2-letter ones.
+const LANG3 = { en: ['eng'], it: ['ita'], fr: ['fre', 'fra'], de: ['ger', 'deu'], es: ['spa'], pt: ['por'], nl: ['dut', 'nld'], ru: ['rus'], ja: ['jpn'], zh: ['chi', 'zho'], ko: ['kor'], pl: ['pol'], sv: ['swe'], tr: ['tur'], cs: ['cze', 'ces'], da: ['dan'], fi: ['fin'], no: ['nor'], hu: ['hun'], el: ['gre', 'ell'], he: ['heb'], ar: ['ara'], uk: ['ukr'], ro: ['rum', 'ron'] };
+const baseName = (name) => String(name).replace(/\.[^./]+$/, '').toLowerCase();
+
+/**
+ * Which subtitle file next to a movie should load automatically? Candidates have the movie's
+ * base name, optionally followed by a dotted suffix (Arrival.srt, Arrival.en.srt, Arrival.eng.forced.srt).
+ * Preference: no suffix, then the browser's language, then not "forced", then by name. Returns a file or null.
+ */
+export function pickSubtitle(movieName, files, lang = '') {
+  const mb = baseName(movieName);
+  const l = String(lang).toLowerCase().split(/[-_]/)[0];
+  const codes = new Set([l, ...(LANG3[l] || [])].filter(Boolean));
+  const cands = [];
+  for (const f of files) {
+    if (f.kind !== 'subtitle') continue;
+    const b = baseName(f.name);
+    if (b !== mb && !b.startsWith(mb + '.')) continue;
+    const parts = b.slice(mb.length + 1).split(/[._\- ]+/).filter(Boolean);
+    cands.push({ f, exact: b === mb, lang: parts.some((p) => codes.has(p)), forced: parts.includes('forced') });
+  }
+  const rank = (c) => [c.exact ? 0 : 1, c.lang ? 0 : 1, c.forced ? 1 : 0];
+  cands.sort((a, b) => {
+    const ra = rank(a), rb = rank(b);
+    for (let i = 0; i < 3; i++) if (ra[i] !== rb[i]) return ra[i] - rb[i];
+    return a.f.name.localeCompare(b.f.name, undefined, { numeric: true, sensitivity: 'base' });
+  });
+  return cands.length ? cands[0].f : null;
+}
+
 export const driveNetworkError = (cause) => Object.assign(new Error('Could not reach Google Drive.'), { remote: true, cause });
 
 export class DriveClient {
@@ -72,6 +104,11 @@ export class DriveClient {
   _headers(id) {
     const ids = [...new Set([id, this.folderId])].filter((x) => this.keys.has(x));
     return ids.length ? { 'X-Goog-Drive-Resource-Keys': ids.map((x) => `${x}/${this.keys.get(x)}`).join(',') } : {};
+  }
+
+  /** Remember the resource key of a folder we did not browse ourselves (it came from another participant). */
+  addKey(id, key) {
+    if (ID_RE.test(String(id)) && key && KEY_RE.test(String(key)) && !this.keys.has(id)) this.keys.set(id, key);
   }
 
   _url(id, params) {
@@ -168,7 +205,7 @@ export class DriveClient {
       explain: driveErrorFromResponse,
       networkError: driveNetworkError,
     });
-    rf.drive = { id: file.id, resourceKey: file.resourceKey || '' };
+    rf.drive = { id: file.id, resourceKey: file.resourceKey || '', folder: file.folder || '', folderKey: file.folderKey || '' };
     return rf;
   }
 

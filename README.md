@@ -142,6 +142,7 @@ Notes:
 - Each viewer streams the file themselves, so their connection must handle the movie's bitrate.
 - Google may temporarily block a heavily downloaded file ("download quota exceeded"). Use a local copy until it clears.
 - Embedded subtitles in MKV files without a subtitle index can't be extracted while streaming. Put an `.srt`, `.vtt` or `.ass` file next to the movie in the folder instead.
+- A subtitle file next to the movie with the same name (`Arrival.srt`, `Arrival.en.srt`, ...) loads automatically for everyone when someone starts the movie from Drive. Without an exact match, the file in the browser's language is preferred. Any other subtitle files in the movie's folder are listed under **From Google Drive** in the CC menu.
 
 ## Configuration
 

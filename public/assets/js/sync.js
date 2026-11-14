@@ -30,6 +30,11 @@ function cleanMovie(movie) {
   const { drive, ...rest } = movie;
   if (d && typeof d === 'object' && typeof d.id === 'string' && DRIVE_ID.test(d.id) && typeof d.resourceKey === 'string' && DRIVE_KEY.test(d.resourceKey)) {
     rest.drive = { id: d.id, resourceKey: d.resourceKey };
+    // The folder the video was listed in (where its subtitle files live); optional.
+    if (typeof d.folder === 'string' && DRIVE_ID.test(d.folder)) {
+      rest.drive.folder = d.folder;
+      rest.drive.folderKey = typeof d.folderKey === 'string' && DRIVE_KEY.test(d.folderKey) ? d.folderKey : '';
+    }
   }
   return rest;
 }

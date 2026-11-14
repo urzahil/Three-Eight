@@ -4,7 +4,7 @@ import { MovieSync, sameMovie } from './sync.js';
 import { MoviePlayer } from './player/player.js';
 import { CompactPip } from './player/compactpip.js';
 import { LocalMedia, watchLevel, audioContext } from './media.js';
-import { DriveClient } from './drive.js';
+import { DriveClient, pickSubtitle } from './drive.js';
 
 // While the movie is in a Document Picture-in-Picture window, its controls live in that document.
 let pipWindow = null;
@@ -766,7 +766,7 @@ class Room {
   }
 
   /** Decode subtitle bytes and share them with the room (from a local file or Google Drive). */
-  async _shareSubtitle(name, bytes) {
+  async _shareSubtitle(name, bytes, message) {
     let text = new TextDecoder().decode(bytes);
     if (text.includes('�')) {
       // Not UTF-8: most older subtitle files are Windows-1252 / Latin-1.
@@ -778,7 +778,7 @@ class Room {
     }
     const id = 'x' + (await hashText(text));
     this.sync.addSubtitleFile({ id, name, text });
-    toast(`Subtitles “${name}” shared with everyone.`);
+    toast(message || `Subtitles “${name}” shared with everyone.`);
   }
 
   openMovieDialog() {
@@ -817,6 +817,7 @@ class Room {
     this.driveTrail = null;
     this.driveRootName = '';
     this._driveShown = null;
+    this._driveSubs = null;
     if (!this.initialized) return;
     if ($('movie-dialog').open) {
       this._renderMovieDialog();
@@ -961,7 +962,8 @@ class Room {
   _streamDriveFile(f) {
     let file;
     try {
-      file = this.drive.remoteFile(f);
+      const folder = this.driveTrail[this.driveTrail.length - 1].id;
+      file = this.drive.remoteFile({ ...f, folder, folderKey: this.drive.keys.get(folder) || '' });
     } catch (err) {
       toast(err.message, 'warn');
       return;
@@ -971,13 +973,54 @@ class Room {
   }
 
   async _shareDriveSubtitle(f, button) {
-    button.disabled = true;
+    if (button) button.disabled = true;
     try {
       await this._shareSubtitle(f.name, await this.drive.downloadText(f));
-      $('movie-dialog').close('subtitles');
+      if ($('movie-dialog').open) $('movie-dialog').close('subtitles');
     } catch (err) {
       toast(err.message || 'Could not download the subtitles.', 'warn');
-      button.disabled = false;
+      if (button) button.disabled = false;
+    }
+  }
+
+  /** Subtitle files in the folder of the room's Drive movie, for the CC menu. Listed lazily (the listing is cached). */
+  _driveSubtitles() {
+    const m = this.sync.state.movie;
+    const folder = this.drive && m?.drive?.folder;
+    if (!folder) return null;
+    let st = this._driveSubs;
+    if (!st || st.folder !== folder) {
+      const drive = this.drive;
+      st = this._driveSubs = { folder, status: 'loading', items: [] };
+      drive.addKey(folder, m.drive.folderKey);
+      drive.list(folder).then((items) => {
+        st.status = 'ok';
+        st.items = items.filter((f) => f.kind === 'subtitle');
+      }, (err) => {
+        st.status = 'error';
+        st.error = err.message;
+      }).then(() => {
+        if (this._driveSubs === st) this._renderMenus();
+      });
+    }
+    return st;
+  }
+
+  /** Started a movie from Drive for the room: share the subtitle file next to it, if there is a clear match. */
+  async _autoDriveSubtitle(file) {
+    const drive = this.drive;
+    const m = file.drive;
+    if (!drive || !m?.folder) return;
+    let pick = null;
+    try {
+      drive.addKey(m.folder, m.folderKey);
+      pick = pickSubtitle(file.name, await drive.list(m.folder), navigator.language);
+      const st = this.sync.state;
+      if (!pick || drive !== this.drive || st.sub || st.subFiles.length || st.movie?.name !== file.name) return;
+      await this._shareSubtitle(pick.name, await drive.downloadText(pick), `Subtitles “${pick.name}” loaded from Google Drive. Turn them off in the CC menu.`);
+    } catch (err) {
+      console.warn('Automatic subtitles failed', err);
+      toast(`Could not load subtitles${pick ? ` “${pick.name}”` : ''} from Google Drive.`, 'warn');
     }
   }
 
@@ -986,7 +1029,7 @@ class Room {
     const m = this.sync.state.movie;
     if (!this.drive || !m?.drive) return;
     try {
-      this.chooseMovieFile(this.drive.remoteFile({ id: m.drive.id, name: String(m.name || 'Movie'), size: Number(m.size), resourceKey: m.drive.resourceKey }));
+      this.chooseMovieFile(this.drive.remoteFile({ id: m.drive.id, name: String(m.name || 'Movie'), size: Number(m.size), resourceKey: m.drive.resourceKey, folder: m.drive.folder, folderKey: m.drive.folderKey }));
     } catch (err) {
       toast(err.message, 'warn');
     }
@@ -1036,8 +1079,9 @@ class Room {
       }).catch(() => { v.muted = wasMuted; });
     }
     const info = { name: file.name, size: file.size, duration: Math.round(this.player.duration * 10) / 10 };
-    if (file.drive) info.drive = { id: file.drive.id, resourceKey: file.drive.resourceKey || '' };
+    if (file.drive) info.drive = { ...file.drive };
     this.sync.setLocalFile(info, asRoom);
+    if (asRoom && file.drive?.folder) this._autoDriveSubtitle(file); // in the background: never holds up playback
     if (asRoom) this.mesh.broadcast({ type: 'chat', msg: { id: randomId(), from: this.id, name: this.name, text: `🎬 Started a movie: ${file.name}`, ts: this.signaling.now() } });
     this._renderStage();
     this._renderMenus();
@@ -1268,6 +1312,25 @@ class Room {
     // Shared subtitle files we haven't received yet.
     for (const f of s.subFiles) {
       if (!info?.subtitleTracks.some((t) => t.id === f.id)) items.push(this._menuItem(f.name, s.sub === f.id, () => this.sync.setSubtitle(f.id), 'receiving…', true));
+    }
+    // Subtitle files next to the movie on Drive (ones already shared show up above as normal entries).
+    const dsubs = this._driveSubtitles();
+    if (dsubs) {
+      const shared = new Set(s.subFiles.map((f) => f.name));
+      const files = dsubs.items.filter((f) => !shared.has(f.name));
+      const dh = document.createElement('h4');
+      dh.textContent = 'From Google Drive';
+      if (dsubs.status === 'loading') items.push(dh, this._menuItem('Loading…', false, () => {}, '', true));
+      else if (dsubs.status === 'error') items.push(dh, this._menuItem('Could not list the folder', false, () => { this._driveSubs = null; this._renderMenus(); }, 'retry'));
+      else if (files.length) {
+        items.push(dh);
+        for (const f of files) items.push(this._menuItem(f.name, false, () => this._shareDriveSubtitle(f), fmtSize(f.size)));
+      }
+      if (dsubs.status === 'ok' && files.length) {
+        const lh = document.createElement('h4');
+        lh.textContent = 'From your device';
+        items.push(lh);
+      }
     }
     const load = document.createElement('button');
     load.type = 'button';

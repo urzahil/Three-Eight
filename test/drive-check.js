@@ -20,18 +20,21 @@ const PLAIN = 'plain-' + stamp;
 
 // ---- the fake Drive --------------------------------------------------------------------
 const FOLDER = 'application/vnd.google-apps.folder';
-const ID = { root: 'ROOTFOLDER_0001', sub: 'SUBFOLDER_00002', mkv: 'MKVFILE_0000003', mp4: 'MP4FILE_0000004', srt: 'SRTFILE_0000005', txt: 'TXTFILE_0000006' };
+const ID = { root: 'ROOTFOLDER_0001', sub: 'SUBFOLDER_00002', mkv: 'MKVFILE_0000003', mp4: 'MP4FILE_0000004', srt: 'SRTFILE_0000005', txt: 'TXTFILE_0000006', srtIt: 'SRTIT_00000007', other: 'SRTOTHER_00008' };
 const read = (f) => fs.readFileSync(path.join(FIX, f));
-const DATA = { [ID.mkv]: read('multi.mkv'), [ID.mp4]: read('single.mp4'), [ID.srt]: read('subs_en.srt'), [ID.txt]: Buffer.from('hi') };
+const DATA = { [ID.mkv]: read('multi.mkv'), [ID.mp4]: read('single.mp4'), [ID.srt]: read('subs_en.srt'), [ID.txt]: Buffer.from('hi'),
+  [ID.srtIt]: Buffer.from('1\n00:00:20,000 --> 00:00:25,000\nVentesimo secondo\n'), [ID.other]: Buffer.from('1\n00:00:01,000 --> 00:00:02,000\nUnrelated\n') };
 const META = {
   [ID.root]: { id: ID.root, name: 'Movie Night Folder', mimeType: FOLDER, resourceKey: 'ROOTKEY-1' },
   [ID.sub]: { id: ID.sub, name: 'Season 1', mimeType: FOLDER, resourceKey: 'SUBKEY-1' },
   [ID.mkv]: { id: ID.mkv, name: 'multi.mkv', mimeType: 'video/x-matroska', size: String(DATA[ID.mkv].length), resourceKey: 'MKVKEY-1', videoMediaMetadata: { durationMillis: '40000' } },
   [ID.mp4]: { id: ID.mp4, name: 'single.mp4', mimeType: 'video/mp4', size: String(DATA[ID.mp4].length), videoMediaMetadata: { durationMillis: '40000' } },
-  [ID.srt]: { id: ID.srt, name: 'subs_en.srt', mimeType: 'application/x-subrip', size: String(DATA[ID.srt].length) },
+  [ID.srt]: { id: ID.srt, name: 'multi.srt', mimeType: 'application/x-subrip', size: String(DATA[ID.srt].length) },
+  [ID.srtIt]: { id: ID.srtIt, name: 'multi.it.srt', mimeType: 'application/x-subrip', size: String(DATA[ID.srtIt].length) },
+  [ID.other]: { id: ID.other, name: 'subs_en.srt', mimeType: 'application/x-subrip', size: String(DATA[ID.other].length) },
   [ID.txt]: { id: ID.txt, name: 'notes.txt', mimeType: 'text/plain', size: '2' },
 };
-const CHILDREN = { [ID.root]: [[ID.sub, ID.txt], [ID.srt]], [ID.sub]: [[ID.mp4, ID.mkv]] }; // pages of a listing
+const CHILDREN = { [ID.root]: [[ID.sub], [ID.txt]], [ID.sub]: [[ID.mp4, ID.mkv, ID.srt, ID.srtIt, ID.other]] }; // pages of a listing
 
 function fakeGoogle(stats, quota) {
   const cors = {
@@ -204,28 +207,33 @@ async function adminApi(base) {
     // --- Alice browses: root -> Season 1 -> picks the MKV (remuxer path, needs a resource key)
     await openDialog(alice);
     await alice.waitForSelector('#drive-section:not([hidden])');
-    await waitFor(alice, () => document.querySelectorAll('#drive-list .drive-item').length === 2);
+    await waitFor(alice, () => document.querySelectorAll('#drive-list .drive-item').length === 1);
     let names = await alice.$$eval('#drive-list .drive-item .name', (els) => els.map((e) => e.textContent));
-    assert.deepStrictEqual(names, ['Season 1', 'subs_en.srt'], 'folders first, other files hidden, second page merged');
+    assert.deepStrictEqual(names, ['Season 1'], 'folders only here: other files hidden, second page merged');
     assert.match(await alice.textContent('#drive-crumbs'), /Movie Night Folder/);
-    assert(await item(alice, 'subs_en.srt').isDisabled(), 'subtitles need a movie first');
     await item(alice, 'Season 1').click();
-    await waitFor(alice, () => document.querySelectorAll('#drive-list .drive-item').length === 2);
+    await waitFor(alice, () => document.querySelectorAll('#drive-list .drive-item').length === 5);
     names = await alice.$$eval('#drive-list .drive-item .name', (els) => els.map((e) => e.textContent));
-    assert.deepStrictEqual(names, ['multi.mkv', 'single.mp4']);
+    assert.deepStrictEqual(names, ['multi.it.srt', 'multi.mkv', 'multi.srt', 'single.mp4', 'subs_en.srt']);
+    assert(await item(alice, 'subs_en.srt').isDisabled(), 'subtitles need a movie first');
     console.log('browsing works:', names);
     await item(alice, 'multi.mkv').click();
     await waitFor(alice, () => !document.getElementById('stage').hidden && document.getElementById('movie').readyState >= 2);
     assert.strictEqual(await alice.evaluate(() => room.player.mode), 'mse');
     const movie = await alice.evaluate(() => room.sync.state.movie);
-    assert.deepStrictEqual(movie.drive, { id: ID.mkv, resourceKey: 'MKVKEY-1' });
+    assert.deepStrictEqual(movie.drive, { id: ID.mkv, resourceKey: 'MKVKEY-1', folder: ID.sub, folderKey: 'SUBKEY-1' });
     console.log('alice streams the MKV from Drive:', JSON.stringify(movie));
+    // the matching subtitle file next to it (exact base name beats multi.it.srt) is shared automatically
+    await waitFor(alice, () => room.sync.state.sub && room.sync.state.subFiles.length === 1);
+    assert.deepStrictEqual(await alice.evaluate(() => room.sync.state.subFiles.map((f) => f.name)), ['multi.srt']);
 
     // --- Bob: one-click streaming
     await waitFor(bob, () => document.getElementById('movie-overlay').textContent.includes('Stream from Google Drive'));
     assert((await bob.textContent('#movie-overlay')).includes('Use my own copy'));
     await bob.click('#movie-overlay button:has-text("Stream from Google Drive")');
     await waitFor(bob, () => document.getElementById('movie').readyState >= 2);
+    await waitFor(bob, () => [...document.querySelectorAll('#m-subs-menu button.on span')].some((s) => /^multi$/.test(s.textContent)));
+    assert.strictEqual(await bob.evaluate(() => room.drive.keys.size > 0), true);
     await waitFor(alice, () => /Everyone ready/.test(document.getElementById('m-ready').textContent));
     console.log('both ready');
 
@@ -266,24 +274,35 @@ async function adminApi(base) {
     }
     console.log(`media bytes: alice ${A.stats.media[ID.mkv]}, bob ${B.stats.media[ID.mkv]} of ${DATA[ID.mkv].length}`);
 
-    // --- Alice shares the .srt from Drive; Bob gets it
-    await openDialog(alice);
-    await waitFor(alice, () => document.querySelectorAll('#drive-list .drive-item').length === 2);
-    assert.match(await alice.textContent('#drive-crumbs'), /Season 1/, 'the folder is remembered');
-    assert(await item(alice, 'multi.mkv').evaluate((e) => e.classList.contains('current')), 'current movie highlighted');
-    await alice.click('#drive-crumbs button');
-    await waitFor(alice, () => [...document.querySelectorAll('#drive-list .name')].some((n) => n.textContent === 'subs_en.srt'));
-    assert(!(await item(alice, 'subs_en.srt').isDisabled()), 'subtitles enabled with a movie');
-    await item(alice, 'subs_en.srt').click();
-    await alice.waitForSelector('#movie-dialog:not([open])', { state: 'attached' });
-    await waitFor(bob, () => [...document.querySelectorAll('#m-subs-menu button.on span')].some((s) => /subs_en/.test(s.textContent)));
-    await ctl(bob, '#m-time');
-    const box2 = await bob.locator('#m-seek').boundingBox();
-    await bob.mouse.click(box2.x + box2.width * (21 / 40), box2.y + box2.height / 2);
-    await sleep(1500);
+    // --- the auto-loaded subtitles show for both without anyone clicking
+    const seekBob = async (sec) => {
+      await ctl(bob, '#m-time');
+      const bx = await bob.locator('#m-seek').boundingBox();
+      await bob.mouse.click(bx.x + bx.width * (sec / 40), bx.y + bx.height / 2);
+      await sleep(1500);
+    };
+    await seekBob(21);
     a = await state(alice); b = await state(bob);
-    assert(/Twenty seconds/.test(a.subs) && /Twenty seconds/.test(b.subs), `subtitles from Drive shown: ${JSON.stringify([a.subs, b.subs])}`);
-    console.log('subtitle file from Drive shared');
+    assert(/Twenty seconds/.test(a.subs) && /Twenty seconds/.test(b.subs), `auto subtitles shown: ${JSON.stringify([a.subs, b.subs])}`);
+    // Bob never browsed the folder, yet his CC menu lists the subtitle files next to the movie
+    await ctl(bob, '#m-subs');
+    await waitFor(bob, () => [...document.querySelectorAll('#m-subs-menu button span')].some((s) => s.textContent === 'multi.it.srt'));
+    const menu = await bob.$$eval('#m-subs-menu button span', (els) => els.map((e) => e.textContent));
+    assert(menu.includes('subs_en.srt') && !menu.includes('multi.srt'), 'drive group: other files only, the shared one is a normal entry: ' + menu);
+    assert.match(await bob.textContent('#m-subs-menu'), /From Google Drive[\s\S]*Load subtitle file/, 'local file option kept below the Drive group');
+    assert.match(await bob.textContent('#m-subs-menu'), /From Google Drive/);
+    await bob.click('#m-subs-menu button:has-text("multi.it.srt")');
+    await seekBob(21);
+    await sleep(500);
+    a = await state(alice); b = await state(bob);
+    assert(/Ventesimo/.test(a.subs) && /Ventesimo/.test(b.subs), `chosen Drive subtitles switch for both: ${JSON.stringify([a.subs, b.subs])}`);
+    assert.strictEqual(await alice.evaluate(() => room.sync.state.subFiles.length), 2);
+    // the highlighted current movie in the dialog
+    await openDialog(alice);
+    await waitFor(alice, () => document.querySelectorAll('#drive-list .drive-item').length === 5);
+    assert(await item(alice, 'multi.mkv').evaluate((e) => e.classList.contains('current')), 'current movie highlighted');
+    await alice.keyboard.press('Escape');
+    console.log('subtitles from Drive: auto-loaded, listed in the CC menu, switchable');
 
     // --- Carol (phone-sized, late joiner): Drive errors surface, then streaming works
     const quota = { on: true };
