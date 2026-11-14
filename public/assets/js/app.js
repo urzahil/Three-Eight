@@ -887,6 +887,8 @@ class Room {
   _renderReady() {
     const s = this.sync.state;
     if (!s.movie) return;
+    if (!s.paused) this._startedMovie = s.movie;
+    const started = this._startedMovie && sameMovie(this._startedMovie, s.movie);
     let ready = this.sync.fileMatches ? 1 : 0;
     let total = 1;
     const waiting = [];
@@ -896,7 +898,7 @@ class Room {
       if (st && st.matches) ready++;
       else waiting.push(this.profileOf(id).name);
     }
-    $('m-ready').textContent = total === 1 ? '' : ready === total ? `Everyone ready (${total})` : `${ready}/${total} ready${waiting.length ? ' · waiting for ' + waiting.slice(0, 2).join(', ') : ''}`;
+    $('m-ready').textContent = total === 1 || (started && ready === total) ? '' : ready === total ? `Everyone ready (${total})` : `${ready}/${total} ready${waiting.length ? ' · waiting for ' + waiting.slice(0, 2).join(', ') : ''}`;
   }
 
   _refreshPlayButton() {
