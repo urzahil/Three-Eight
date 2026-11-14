@@ -29,7 +29,7 @@ services:
       - three-eight-data:/data
       # The service account key file downloaded from Google Cloud, mounted read-only. Keep it private:
       # it can read whatever is shared with that service account.
-      # - ./google-service-account.json:/run/secrets/google-service-account.json:ro
+      - ./google-service-account.json:/run/secrets/google-service-account.json:ro
 
   # Optional TURN relay (coturn) for friends whose network blocks direct connections, typically mobile
   # data (4G/5G) and some corporate networks. To use it:
