@@ -92,6 +92,33 @@ function randomId() {
   return [...a].map((b) => b.toString(36).padStart(2, '0')).join('').slice(0, 20);
 }
 
+/** This tab's participant id (kept across reloads so a rejoin replaces our old connection). */
+function sessionId() {
+  try {
+    const id = sessionStorage.getItem('te.id') || randomId();
+    sessionStorage.setItem('te.id', id);
+    return id;
+  } catch {
+    return randomId(); // storage blocked
+  }
+}
+
+/** ICE servers etc.; a stalled request must not leave the lobby on "Joining…" forever. */
+async function fetchConfig() {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 15000);
+  try {
+    const res = await fetch('/api/config', { signal: ctrl.signal, cache: 'no-store' });
+    if (!res.ok) throw new Error(`The server answered with an error (${res.status}).`);
+    return await res.json();
+  } catch (err) {
+    if (err.name === 'AbortError' || err instanceof TypeError) throw new Error('Could not reach the server. Check your connection and try again.');
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function hashText(text) {
   try {
     const d = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
@@ -217,12 +244,15 @@ async function startLobby(room) {
     $('lobby-join').textContent = 'Joining…';
     audioContext(); // unlock audio during the click
     const password = $('lobby-password').value;
+    let signaling = null;
     try {
-      const cfg = await (await fetch('/api/config')).json();
-      const id = sessionStorage.getItem('te.id') || randomId();
-      sessionStorage.setItem('te.id', id);
+      const cfg = await fetchConfig();
+      const id = sessionId();
       const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const signaling = new Signaling(`${proto}//${location.host}/ws`);
+      signaling = new Signaling(`${proto}//${location.host}/ws`);
+      signaling.addEventListener('retrying', (ev) => {
+        $('lobby-join').textContent = `Can’t reach the server, retrying (${ev.detail.attempt})…`;
+      });
       const welcome = await signaling.join({ room: info.name, id, name, password });
       store.set(pwKey, $('lobby-remember').checked && password ? password : null);
       store.set('media', { mic: media.micOn, cam: media.camOn, audioDevice: media.deviceIds.audio, videoDevice: media.deviceIds.video });
@@ -231,6 +261,8 @@ async function startLobby(room) {
       preview.srcObject = null;
       new Room({ signaling, welcome, media, name, id, iceServers: cfg.iceServers, roomName: welcome.room || info.name });
     } catch (err) {
+      console.error('join failed', err);
+      signaling?.close(); // stop any reconnect attempts
       $('lobby-error').textContent = err.message || 'Could not join the room.';
       $('lobby-error').hidden = false;
       $('lobby-join').disabled = false;
