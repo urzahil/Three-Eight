@@ -692,8 +692,8 @@ class Room {
 
     // Controls
     $('m-play').onclick = () => this._userAction(() => sync.toggle());
-    $('m-back').onclick = () => this._userAction(() => sync.seek(Math.max(0, this._pos() - 10)));
-    $('m-fwd').onclick = () => this._userAction(() => sync.seek(this._pos() + 10));
+    $('m-back').onclick = () => this._userAction(() => sync.seek(Math.max(0, this._pos() - this.seekStep)));
+    $('m-fwd').onclick = () => this._userAction(() => sync.seek(this._pos() + this.seekStep));
     box.querySelector('video').addEventListener('click', () => this._userAction(() => sync.toggle()));
     box.querySelector('video').addEventListener('dblclick', () => this.toggleFullscreen());
     $('m-volume').value = p.video.volume;
@@ -1086,6 +1086,11 @@ class Room {
   }
 
   // ---- settings ------------------------------------------------------------------
+  _updateSeekTitles() {
+    $('m-back').title = `Back ${this.seekStep} s (←)`;
+    $('m-fwd').title = `Forward ${this.seekStep} s (→)`;
+  }
+
   _initSettings() {
     const onFs = () => {
       const fs = !!(document.fullscreenElement || document.webkitFullscreenElement);
@@ -1098,6 +1103,10 @@ class Room {
     const subScale = store.get('subScale', 1);
     $('subs-layer').style.setProperty('--sub-scale', subScale);
     $('set-subsize').value = String(subScale);
+    const seekStep = Number(store.get('seekStep', 10));
+    this.seekStep = [5, 10, 15, 30, 60].includes(seekStep) ? seekStep : 10;
+    $('set-seekstep').value = String(this.seekStep);
+    this._updateSeekTitles();
     $('set-lowband').checked = store.get('lowBandwidth', false);
     this.mesh.setLowPower($('set-lowband').checked);
     $('set-noise').checked = this.media.processing;
@@ -1116,6 +1125,11 @@ class Room {
       $('subs-layer').style.setProperty('--sub-scale', e.target.value);
       store.set('subScale', Number(e.target.value));
       this.compactPip?.setSubScale(e.target.value);
+    };
+    $('set-seekstep').onchange = (e) => {
+      this.seekStep = Number(e.target.value);
+      store.set('seekStep', this.seekStep);
+      this._updateSeekTitles();
     };
     // Only browsers with Document PiP have a choice of style.
     $('set-pipstyle-label').hidden = this.pipMode !== 'document';
@@ -1170,11 +1184,11 @@ class Room {
           break;
         case 'ArrowLeft':
           if (!movie) return;
-          this.sync.seek(Math.max(0, this._pos() - 10));
+          this.sync.seek(Math.max(0, this._pos() - this.seekStep));
           break;
         case 'ArrowRight':
           if (!movie) return;
-          this.sync.seek(this._pos() + 10);
+          this.sync.seek(this._pos() + this.seekStep);
           break;
         case 'f':
           this.toggleFullscreen();
@@ -1375,7 +1389,7 @@ class Room {
     if (on === this._mediaSession) return;
     this._mediaSession = on;
     const sync = this.sync;
-    const seekBy = (d, dir) => this._userAction(() => sync.seek(Math.max(0, this._pos() + dir * (d?.seekOffset || 10))));
+    const seekBy = (d, dir) => this._userAction(() => sync.seek(Math.max(0, this._pos() + dir * (d?.seekOffset || this.seekStep))));
     const handlers = on ? {
       play: () => { if (sync.state.paused) this._userAction(() => sync.play()); },
       pause: () => { if (!sync.state.paused) this._userAction(() => sync.pause()); },

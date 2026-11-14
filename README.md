@@ -119,7 +119,7 @@ For local testing, `http://localhost:4567` counts as a secure context, so camera
 1. Open `https://threeeight.urzahil.rocks/admin`, log in with `ADMIN_PASSWORD`, and create a room, for example `movienight`, with a password. The admin page also shows who is online in each room. From there you can change passwords (and optionally kick everyone) or delete rooms.
 2. Send friends `https://threeeight.urzahil.rocks/movienight` and the password.
 3. Each person enters a display name, which is remembered in the browser's local storage, plus the room password. They can also choose to remember the password on that device.
-4. To watch together, one person clicks **Movie** and picks a file. Everyone else is asked to pick their own copy. Use the player controls, the audio (🎧) and subtitle (CC) menus, or keyboard shortcuts: `space` play/pause, `←`/`→` ±10 s, `f` full screen, `p` picture-in-picture, `m` mic, `v` camera, `c` chat.
+4. To watch together, one person clicks **Movie** and picks a file. Everyone else is asked to pick their own copy. Use the player controls, the audio (🎧) and subtitle (CC) menus, or keyboard shortcuts: `space` play/pause, `←`/`→` ±10 s (adjustable in Settings), `f` full screen, `p` picture-in-picture, `m` mic, `v` camera, `c` chat.
 
 Tip: use headphones during the movie, so your microphone doesn't send the film's sound to your friends. Movie volume is per person.
 
