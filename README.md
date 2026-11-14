@@ -5,7 +5,7 @@ Video meetups and movie nights with friends, entirely in the browser (Chrome, Fi
 - **Video call**: camera, microphone, mute and camera-off, device selection, speaking indicators, and chat.
 - **Watch a movie together**: everyone opens their own copy of the file and the room keeps playback in sync. If anyone plays, pauses or seeks, it happens for everybody. Choosing an **audio track** or **subtitles** also changes it for everybody.
 - **Picture-in-picture**: pop the movie out into a small floating window and keep chatting or browsing. Our subtitles and controls come with it, and play, pause and seek in the floating window still affect the whole room.
-- **Rooms with passwords**: rooms are created on an admin page. Each one lives at `https://threeeight.urzahil.rocks/ROOM_NAME`.
+- **Rooms with passwords**: rooms are created on an admin page. Each one lives at `https://three-eight.example.com/ROOM_NAME`.
 - **Peer to peer**: audio, video, chat and sync messages go directly between browsers over WebRTC. The server only serves the page and relays the short connection handshake, so its CPU and bandwidth use are tiny.
 
 ## How it works
@@ -77,7 +77,7 @@ Browsers only allow camera and microphone access on HTTPS pages (or `localhost`)
 **Caddy** (gets certificates automatically):
 
 ```
-threeeight.urzahil.rocks {
+three-eight.example.com {
     reverse_proxy 127.0.0.1:4567
 }
 ```
@@ -87,7 +87,7 @@ threeeight.urzahil.rocks {
 ```nginx
 server {
     listen 443 ssl http2;
-    server_name threeeight.urzahil.rocks;
+    server_name three-eight.example.com;
     # ssl_certificate ...; ssl_certificate_key ...;
 
     location / {
@@ -116,8 +116,8 @@ For local testing, `http://localhost:4567` counts as a secure context, so camera
 
 ## Using it
 
-1. Open `https://threeeight.urzahil.rocks/admin`, log in with `ADMIN_PASSWORD`, and create a room, for example `movienight`, with a password. The admin page also shows who is online in each room. From there you can change passwords (and optionally kick everyone) or delete rooms.
-2. Send friends `https://threeeight.urzahil.rocks/movienight` and the password.
+1. Open `https://three-eight.example.com/admin`, log in with `ADMIN_PASSWORD`, and create a room, for example `movienight`, with a password. The admin page also shows who is online in each room. From there you can change passwords (and optionally kick everyone) or delete rooms.
+2. Send friends `https://three-eight.example.com/movienight` and the password.
 3. Each person enters a display name, which is remembered in the browser's local storage, plus the room password. They can also choose to remember the password on that device.
 4. To watch together, one person clicks **Movie** and picks a file. Everyone else is asked to pick their own copy. Use the player controls, the audio (🎧) and subtitle (CC) menus, or keyboard shortcuts: `space` play/pause, `←`/`→` ±10 s (adjustable in Settings), `f` full screen, `p` picture-in-picture, `m` mic, `v` camera, `c` chat.
 
