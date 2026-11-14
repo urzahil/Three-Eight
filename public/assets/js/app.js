@@ -269,7 +269,20 @@ class Room {
     // Film pieces are shared between the viewers (and a local copy can feed friends who have none).
     this.swarm = new Swarm(this.mesh, { selfId: id, share: store.get('shareFile', true) !== false });
     this._holderSig = '';
+    // Embedded subtitles that someone has extracted are passed on, so streaming viewers need not extract them.
+    this._cueFail = new Map();
+    this.swarm.setSubSource({
+      list: () => this.player.completeSubtitles(),
+      get: (id) => this.player.subtitleCues(id),
+      accepts: (id) => this.player.isEmbeddedTrack(id),
+    });
+    this.player.cueGate = (id) => this._askCues(id);
+    this.player.addEventListener('tracks', () => {
+      this.swarm.subsChanged();
+      this._wantCues();
+    });
     this.swarm.addEventListener('change', () => {
+      this._wantCues();
       this._renderPeople();
       // The overlay offers copies by name: redraw it only when that list changes (not on every cache update).
       const m = this.sync.state.movie;
@@ -603,6 +616,31 @@ class Room {
     }));
   }
 
+  /** Ask the room for the cues of a streamed film's embedded subtitle track; true if they were installed. */
+  async _askCues(id) {
+    const p = this.player;
+    const file = p.file;
+    if (!file?.remote || !p.needsCues(id)) return false;
+    const cues = await this.swarm.fetchCues(id);
+    if (!cues || p.file !== file || !p.needsCues(id)) {
+      if (!cues) this._cueFail.set(id, { at: Date.now(), who: this.swarm._cueHolders(id).map((h) => h.id).join() });
+      return false;
+    }
+    this._cueFail.delete(id);
+    return p.installCues(id, cues);
+  }
+
+  /** The room's selected subtitle is an embedded track we lack, and someone has it: get it from them. */
+  _wantCues() {
+    const id = this.sync.state.sub;
+    const p = this.player;
+    if (!id || !/^e\d+$/.test(id) || !p.file?.remote || !p.needsCues(id) || !this.swarm.hasCueHolder(id)) return;
+    const failed = this._cueFail.get(id);
+    // Don't ask again right after a failure, unless different people have it now.
+    if (failed && Date.now() - failed.at < 15000 && failed.who === this.swarm._cueHolders(id).map((h) => h.id).join()) return;
+    this._askCues(id);
+  }
+
   /** "own copy", "streaming (Drive)" or "streaming (from Alice)" for someone whose movie file is loaded and matches. */
   _sourceText(id, src) {
     if (id === this.id) src = !this.player.file?.remote ? 'file' : this.player.file.peerOnly ? 'peers' : 'drive';
@@ -774,6 +812,7 @@ class Room {
       this._renderStage();
       this._renderMenus();
       this._renderPeople();
+      this._wantCues();
     });
     sync.addEventListener('status', () => {
       this._renderReady();

@@ -142,6 +142,45 @@ async function startServer() {
     a = await state(alice); b = await state(bob);
     assert(!a.paused && !b.paused && Math.abs(a.time - b.time) < 0.4, `still in sync after the audio change: ${a.time} ${b.time}`);
 
+    // --- embedded subtitles turned on by Alice (who has the file) must show for Bob too, who streams from her copy
+    {
+      const subText = (p) => p.evaluate(() => document.getElementById('subs-layer').innerText.trim());
+      // Real films often have no Cues index for their subtitle blocks: then a streaming viewer cannot extract the
+      // track by itself (this fixture has the index, so take it away on Bob's side).
+      const noIndex = () => { const d = room.player.demux; d.cues = d.cues.filter((c) => !d.tracks.some((t) => t.type === 'subtitle' && t.number === c.track)); };
+      await bob.evaluate(noIndex);
+      await ctl(alice, '#m-play'); // pause
+      await sleep(600);
+      await ctl(alice, '#m-time');
+      const sb = await alice.locator('#m-seek').boundingBox();
+      await alice.mouse.click(sb.x + sb.width * (21 / 40), sb.y + sb.height / 2);
+      await sleep(1500);
+      await ctl(alice, '#m-subs');
+      await alice.click('#m-subs-menu button:has-text("English")');
+      await waitFor(alice, () => /Twenty seconds/.test(document.getElementById('subs-layer').innerText));
+      await waitFor(bob, () => /Twenty seconds/.test(document.getElementById('subs-layer').innerText), undefined, 15000).catch(() => {});
+      const bobSub = await subText(bob);
+      assert.match(bobSub, /Twenty seconds/, 'Bob sees the embedded subtitles Alice turned on, got: ' + JSON.stringify(bobSub) + ' menu: ' + (await bob.innerText('#m-subs-menu')));
+      assert.strictEqual(await bob.evaluate(() => { const t = room.player.subtitles.get(room.sync.state.sub); return t.source === 'embedded' && t.complete && !t.unsupported; }), true, 'the cues came from Alice, not from extraction');
+
+      // Nobody who has the track can give it: a message instead of silence, and the entry says so ...
+      const aliceId = await alice.evaluate(() => room.id);
+      await alice.evaluate(() => { window.__src = room.swarm.subSrc; room.swarm.setSubSource({ list: () => [], get: () => null, accepts: () => true }); });
+      await waitFor(bob, (id) => room.swarm.have.get(id)?.subs.length === 0, aliceId);
+      await ctl(alice, '#m-time');
+      await alice.mouse.click(sb.x + sb.width * (3 / 40), sb.y + sb.height / 2);
+      await sleep(1500);
+      await ctl(alice, '#m-subs');
+      await alice.click('#m-subs-menu button:has-text("Italian")');
+      await waitFor(bob, () => [...document.querySelectorAll('.toast')].some((x) => /aren.t available for you yet/.test(x.textContent)));
+      await ctl(bob, '#m-subs');
+      assert.match(await bob.innerText('#m-subs-menu'), /not available when streaming/);
+      // ... until somebody has it: then it arrives by itself.
+      await alice.evaluate(() => room.swarm.setSubSource(window.__src));
+      await waitFor(bob, () => /Ciao/.test(document.getElementById('subs-layer').innerText), undefined, 15000);
+      console.log('embedded subtitles: shown for a streaming friend from Alice\'s extracted cues; a message while nobody had them, then they arrived');
+    }
+
     // --- an external .srt that Alice loads (CC > Load subtitle file) shows for Bob, who streams from her copy
     const SRT = path.join(os.tmpdir(), 'share-check-' + ROOM + '.srt');
     fs.writeFileSync(SRT, '1\n00:00:19,000 --> 00:00:30,000\nZebra crossing\n');
@@ -220,6 +259,11 @@ async function startServer() {
     const late = await C.page.evaluate(() => ({ text: document.getElementById('subs-layer').innerText.trim(), sub: room.sync.state.sub, time: room.player.time, texts: [...room.sync.subTexts.keys()] }));
     assert.match(late.text, /Zebra crossing/, 'a friend who starts streaming later gets the .srt loaded earlier: ' + JSON.stringify(late));
     console.log('external .srt reaches streamers who joined before and after it was loaded');
+    // ... and an embedded track turned on before she starts streaming
+    await C.page.evaluate(() => { const d = room.player.demux; d.cues = d.cues.filter((c) => !d.tracks.some((t) => t.type === 'subtitle' && t.number === c.track)); });
+    await ctl(alice, '#m-subs');
+    await alice.click('#m-subs-menu button:has-text("English")');
+    await waitFor(C.page, () => /Twenty seconds/.test(document.getElementById('subs-layer').innerText), undefined, 15000);
 
     // --- Alice leaves: Bob, who has fetched what he plays, keeps the picture until he needs more; the room carries on
     await A.ctx.close();

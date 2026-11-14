@@ -438,6 +438,7 @@ export class MoviePlayer extends EventTarget {
     for (const s of pending) {
       s.progress = 1;
       closeGaps(s);
+      s.complete = !s.unsupported;
     }
     if (this.subtitleId && byId.has(Number(this.subtitleId.slice(1)))) this._showCues(true);
     this._emit('tracks');
@@ -457,6 +458,18 @@ export class MoviePlayer extends EventTarget {
   async _extractTrack(id) {
     const s = this.subtitles.get(id);
     if (!s || s.source !== 'embedded' || !s.idle || !this.demux) return;
+    if (this.cueGate && !s.gated) {
+      // Ask the room first (cues from a friend who has the track), and read it ourselves only if nobody has it.
+      s.gated = true;
+      const token = this._loadToken;
+      try {
+        await this.cueGate(id);
+      } catch {
+        /* extract it ourselves */
+      }
+      s.gated = false;
+      if (token !== this._loadToken || this.subtitleId !== id || !s.idle) return; // installed meanwhile, or no longer wanted
+    }
     this._cancelExtract();
     s.idle = false;
     s.progress = 0;
@@ -509,13 +522,53 @@ export class MoviePlayer extends EventTarget {
     } else if (skipped.length) {
       s.progress = 1;
       s.unsupported = 'not available when streaming';
-      this._emit('notice', { text: 'These embedded subtitles can\u2019t be read while streaming. Add an .srt next to the movie and load it from the subtitle menu.' });
+      this._emit('notice', { text: `Subtitles \u201c${s.label}\u201d aren\u2019t available for you yet, they appear once someone in the room has loaded them. Or add an .srt and load it from the subtitle menu.` });
     } else {
       s.progress = 1;
       closeGaps(s);
+      s.complete = true;
     }
     if (this.subtitleId === id) this._showCues(true);
     this._emit('tracks');
+  }
+
+  /** Embedded subtitle tracks that are completely extracted here (ids like 'e3'): what we can give friends. */
+  completeSubtitles() {
+    return [...this.subtitles.values()].filter((s) => s.source === 'embedded' && s.complete && !s.unsupported).map((s) => s.id);
+  }
+
+  /** The cues of a complete embedded track, in the player's own format. */
+  subtitleCues(id) {
+    const s = this.subtitles.get(id);
+    return s && s.source === 'embedded' && s.complete && !s.unsupported ? s.cues.map((c) => (c.top ? { start: c.start, end: c.end, text: c.text, top: true } : { start: c.start, end: c.end, text: c.text })) : null;
+  }
+
+  isEmbeddedTrack(id) {
+    return this.subtitles.get(id)?.source === 'embedded';
+  }
+
+  /** Is this embedded track one that a friend's cues could fill in (selectable but not loaded here)? */
+  needsCues(id) {
+    const s = this.subtitles.get(id);
+    return !!s && s.source === 'embedded' && !s.complete && !!s.format;
+  }
+
+  /**
+   * Cues for an embedded track that a friend extracted: the track becomes complete, selectable, and shown if
+   * selected. A running on-demand extraction of it is stopped.
+   */
+  installCues(id, cues) {
+    const s = this.subtitles.get(id);
+    if (!s || s.source !== 'embedded' || !this.file) return false;
+    if (this.extracting?.id === id) this._cancelExtract();
+    s.cues = sortCues(cues.map((c) => ({ ...c })));
+    s.progress = 1;
+    s.idle = false;
+    s.unsupported = null;
+    s.complete = true;
+    if (this.subtitleId === id) this._showCues(true);
+    this._emit('tracks');
+    return true;
   }
 
   async _onVideoError() {

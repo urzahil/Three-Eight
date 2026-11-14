@@ -322,6 +322,22 @@ async function adminApi(base) {
     await seekBob(21);
     a = await state(alice); b = await state(bob);
     assert(/Twenty seconds/.test(a.subs) && /Twenty seconds/.test(b.subs), `embedded subtitles read on demand: ${JSON.stringify([a.subs, b.subs])}`);
+    // --- a third viewer joins while an embedded subtitle track is selected: the cues come from Alice and Bob, it extracts nothing
+    {
+      const small = (S) => S.requests.filter((r) => r.path.endsWith('/files/' + ID.mkv) && r.range && /bytes=(\d+)-(\d+)/.test(r.range) && (() => { const m = /bytes=(\d+)-(\d+)/.exec(r.range); return Number(m[2]) - Number(m[1]) + 1 <= 262144; })()).length;
+      const E = await join(ROOM, 'Erin');
+      const erin = E.page;
+      await waitFor(erin, () => document.getElementById('movie-overlay').textContent.includes('Stream from Google Drive'));
+      await erin.click('#movie-overlay button:has-text("Stream from Google Drive")');
+      await waitFor(erin, () => document.getElementById('movie').readyState >= 2 && room.player.file?.name === 'multi.mkv');
+      await waitFor(erin, () => { const t = room.player.subtitles.get(room.sync.state.sub); return !!t && t.source === 'embedded' && t.complete; });
+      await waitFor(erin, () => /Twenty seconds/.test(document.getElementById('subs-layer').innerText));
+      console.log('MEASURE subtitle reads of the MKV (small ranges): Alice', small(A.stats), 'Bob', small(B.stats), 'Erin', small(E.stats));
+      assert(small(A.stats) + small(B.stats) > 0, 'somebody extracted the track');
+      assert.strictEqual(small(E.stats), 0, 'Erin made no subtitle reads: the cues came from the others');
+      await E.ctx.close();
+    }
+
     // the highlighted current movie in the dialog
     await openDialog(alice);
     await waitFor(alice, () => document.querySelectorAll('#drive-list .drive-item').length === 5);

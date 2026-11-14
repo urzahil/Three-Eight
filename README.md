@@ -160,6 +160,7 @@ Notes:
 - If `GOOGLE_SERVICE_ACCOUNT` is set but the file cannot be read, the server logs why and runs with Drive disabled. The admin dialog then says that the variable is not set.
 - Google may temporarily block a heavily downloaded file ("download quota exceeded"). People then see that message; use a local copy until it clears.
 - Embedded subtitles in a streamed film are read only when you select them, one small download at a time, so they load slowly; a separate `.srt`, `.vtt` or `.ass` file next to the movie is much faster. MKV files without a subtitle index can't be read while streaming at all.
+- Embedded subtitles turned on by someone who has the file reach everyone: viewers who are streaming (from Drive or from a friend's copy) receive the extracted subtitle text from that person instead of reading it themselves, and until anyone has it they see a message that it will appear once someone in the room has loaded it.
 - A subtitle file next to the movie with the same name (`Arrival.srt`, `Arrival.en.srt`, ...) loads automatically for everyone when someone starts the movie from Drive. Without an exact match, the file in the browser's language is preferred. Names like `Film.en.srt` or `Film ENG.srt` are recognised. Other subtitle files for the film in its folder are listed under **From Google Drive** in the CC menu.
 
 ## Configuration
