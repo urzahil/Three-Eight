@@ -11,6 +11,10 @@ import { initSegment, fragment } from './fmp4.js';
 export const SHIFT = 10;
 const AHEAD = 40; // seconds buffered ahead of the playhead
 const BEHIND = 20; // seconds kept behind the playhead
+// How far before the start of a buffered range the playhead may be and still count as inside it. A seek that
+// lands in a larger gap (the start of what is left after old data was evicted) never gets data by waiting,
+// so the feeder must reposition there; a browser only plays over gaps of about a frame.
+const GAP = 0.05;
 
 const MS = window.ManagedMediaSource || window.MediaSource;
 
@@ -91,7 +95,7 @@ class Feeder {
   bufferedAhead(t) {
     const b = this.sb.buffered;
     for (let i = 0; i < b.length; i++) {
-      if (b.start(i) - 0.3 <= t && b.end(i) >= t) return b.end(i) - t;
+      if (b.start(i) - GAP <= t && b.end(i) >= t) return b.end(i) - t;
     }
     return 0;
   }
@@ -100,7 +104,7 @@ class Feeder {
   continuousAt(t) {
     const b = this.sb.buffered;
     for (let i = 0; i < b.length; i++) {
-      if (b.start(i) - 0.3 <= t && b.end(i) >= t) return Math.abs(b.end(i) - this.lastEnd) < 1.5 || this.eos;
+      if (b.start(i) - GAP <= t && b.end(i) >= t) return Math.abs(b.end(i) - this.lastEnd) < 1.5 || this.eos;
     }
     return false;
   }

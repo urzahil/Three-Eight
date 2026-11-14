@@ -775,7 +775,9 @@ export class Swarm extends EventTarget {
     const [a, b] = this._bounds(film, p);
     const len = b - a;
     const h = this.have.get(id);
-    if (!h || !this._usable(id)) {
+    // Waiting for a slot can take a while: the peer may have failed other pieces (or left) meanwhile, and then
+    // every piece queued behind it must not pay the timeout again.
+    if (!h || !this._usable(id) || this.bad.get(id) > this.now() || film.closed) {
       this._unslot(film, id);
       return null;
     }

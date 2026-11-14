@@ -50,7 +50,26 @@ const BASE = process.env.BASE || 'http://localhost:4567';
       p.seek(2);
       await new Promise((r) => setTimeout(r, 1500));
       const t4 = p.time;
+      // MSE: a seek that lands just before the start of a buffered range (what eviction of old data leaves behind) must
+      // refill the gap, not wait for data that is never coming.
+      let gap = null;
+      if (p.mode === 'mse') {
+        await p.play();
+        p.seek(9);
+        await new Promise((r) => setTimeout(r, 1500));
+        for (const f of p.engine.feeders) {
+          while (f.sb.updating) await new Promise((r) => setTimeout(r, 20));
+          f.sb.remove(0, 10 + 4.5); // element time = movie time + SHIFT (10)
+          while (f.sb.updating) await new Promise((r) => setTimeout(r, 20));
+        }
+        const start = p.buffered[0][0];
+        const target = start - 0.1;
+        p.seek(target);
+        await new Promise((r) => setTimeout(r, 3000));
+        gap = { start, target, after: p.time, ready: v.readyState, playing: !v.paused };
+      }
       return {
+        gap,
         mode: info.mode, duration: info.duration,
         audio: info.audioTracks.map((a) => `${a.label} [${a.supported ? 'ok' : 'unsupported'}]`),
         subs: p.info.subtitleTracks.map((s) => `${s.id} ${s.label} cues=${p.subtitles.get(s.id).cues.length} ${s.unsupported || ''}`),
@@ -60,6 +79,7 @@ const BASE = process.env.BASE || 'http://localhost:4567';
       };
     }, BASE);
     console.log(f, JSON.stringify(res, null, 1));
+    if (res.gap && !(res.gap.after > res.gap.target + 1 && res.gap.ready >= 3)) { failed = true; console.log('  -> FAILED: a seek just before a buffered range stalls', JSON.stringify(res.gap)); }
     if (!(res.t1 > 1.5 && res.t2 > res.t1 && res.t3 > 25 && res.t4 > 2 && res.t4 < 5)) { failed = true; console.log('  -> FAILED timing checks'); }
     await page.close();
   }

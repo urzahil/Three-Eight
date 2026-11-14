@@ -480,8 +480,8 @@ async function adminApi(base) {
         await sleep(3500);
       };
       // (after a jump the slower viewer catches up by playing a little faster, so allow it a few seconds)
-      const settle = async (pages, min, tol = 0.5) => {
-        for (let i = 0; i < 60; i++) {
+      const settle = async (pages, min, tol = 0.5, tries = 60) => {
+        for (let i = 0; i < tries; i++) {
           const ts = await Promise.all(pages.map(state));
           const spread = Math.max(...ts.map((x) => x.time)) - Math.min(...ts.map((x) => x.time));
           if (ts.every((x) => !x.paused && x.time > min) && spread < tol) return ts;
@@ -523,7 +523,7 @@ async function adminApi(base) {
       await vc.evaluate(() => { room.swarm._onFilm = () => {}; });
       await seekAll(66); // the film between the part the viewers read from the start and the part they read after the jump: nobody has it
       t = await settle([va, vb], 68);
-      const fb = await Promise.all([va, vb].map((p) => p.evaluate(() => room.swarm.stats.fallbacks)));
+      const fb = await Promise.all([va, vb].map((p) => p.evaluate(() => room.swarm.stats.fallbacks + room.swarm.bad.size))); // a fallback, or the frozen friend marked as failing (its pieces were then relayed by the other)
       console.log('MEASURE after one viewer froze: times', JSON.stringify(t.map((x) => x.time)), '| fallbacks', fb.join(','), '| server bytes for the rest of the film:', ((bytes.total - before) / 1048576).toFixed(2), 'MiB');
       assert(t.every((x) => !x.paused) && Math.abs(t[0].time - t[1].time) < 0.5, 'the others keep playing in sync: ' + JSON.stringify(t.map((x) => x.time)));
       assert(fb[0] + fb[1] >= 1, 'the frozen friend was skipped (fallback)');
@@ -531,7 +531,7 @@ async function adminApi(base) {
       // Carol leaves in the middle of the stream
       await viewers[2].ctx.close();
       await seekAll(20);
-      t = await settle([va, vb], 20.5);
+      t = await settle([va, vb], 20.5, 0.5, 20); // within 10 s: a gap in the buffer once left a viewer stuck for good
       assert(t.every((x) => !x.paused && x.time > 20.5 && x.time < 40) && Math.abs(t[0].time - t[1].time) < 0.5, 'still playing after she left: ' + JSON.stringify(t.map((x) => x.time)));
       for (const v of viewers.slice(0, 2)) await v.ctx.close();
       console.log('three viewers share the film; a frozen and a departed viewer did not stop the others');
