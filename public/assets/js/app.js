@@ -266,7 +266,7 @@ class Room {
     this.player.video.volume = store.get('movieVolume', 1);
     this.sync = new MovieSync({ mesh: this.mesh, signaling, player: this.player, selfId: id });
     this.drive = null; // DriveClient when the admin attached a Google Drive folder to this room
-    this.driveKey = '';
+    this.driveFolder = '';
     this._driveToken = 0;
     this._setDrive(welcome.drive);
 
@@ -725,7 +725,7 @@ class Room {
 
     // Player events
     p.addEventListener('tracks', () => this._renderMenus());
-    // `long` messages (Google blocking downloads) explain something people need time to read.
+    // `long` messages (a serious, lasting problem such as a used-up quota) need time to be read.
     p.addEventListener('notice', (e) => toast(e.detail.text, 'warn', e.detail.long ? 25000 : 0));
     p.addEventListener('fatal', (e) => {
       toast(e.detail.text, 'warn', e.detail.long ? 25000 : 0);
@@ -808,13 +808,21 @@ class Room {
   }
 
   // ---- Google Drive folder -------------------------------------------------------------
-  /** Apply the room's Drive settings (from the welcome message or an admin change). null removes them. */
+  /**
+   * Apply the room's Drive settings, { token, folder } (from the welcome message, a reconnect or an admin
+   * change). null removes them. The same folder with a new token (after a reconnect) keeps the client,
+   * its cached listings and the files being streamed: they read the token again for every request.
+   */
   _setDrive(cfg) {
-    const ok = cfg && typeof cfg === 'object' && typeof cfg.apiKey === 'string' && typeof cfg.folderId === 'string';
-    const key = ok ? JSON.stringify([cfg.apiKey, cfg.folderId, cfg.resourceKey || '']) : '';
-    if (key === this.driveKey) return;
-    this.driveKey = key;
-    this.drive = ok ? new DriveClient({ apiKey: cfg.apiKey, folderId: cfg.folderId, resourceKey: cfg.resourceKey || '' }) : null;
+    const ok = cfg && typeof cfg === 'object' && typeof cfg.token === 'string' && typeof cfg.folder === 'string';
+    const folder = ok ? cfg.folder : '';
+    if (ok && this.drive && folder === this.driveFolder) {
+      this.drive.setToken(cfg.token);
+      return;
+    }
+    if (!ok && !this.drive) return;
+    this.driveFolder = folder;
+    this.drive = ok ? new DriveClient({ room: this.roomName, token: cfg.token, folder }) : null;
     this.driveTrail = null;
     this.driveRootName = '';
     this._driveShown = null;
@@ -833,7 +841,7 @@ class Room {
     $('movie-dialog').classList.toggle('has-drive', on);
     if (!on) return;
     if (!this.driveTrail) {
-      this.driveTrail = [{ id: this.drive.folderId, name: this.driveRootName || 'Drive folder' }];
+      this.driveTrail = [{ id: this.drive.folder, name: this.driveRootName || 'Drive folder' }];
       const drive = this.drive;
       drive.folderInfo().then((info) => {
         if (drive !== this.drive || !this.driveTrail) return;
@@ -964,7 +972,7 @@ class Room {
     let file;
     try {
       const folder = this.driveTrail[this.driveTrail.length - 1].id;
-      file = this.drive.remoteFile({ ...f, folder, folderKey: this.drive.keys.get(folder) || '' });
+      file = this.drive.remoteFile({ ...f, folder });
     } catch (err) {
       toast(err.message, 'warn');
       return;
@@ -979,7 +987,7 @@ class Room {
       await this._shareSubtitle(f.name, await this.drive.downloadText(f));
       if ($('movie-dialog').open) $('movie-dialog').close('subtitles');
     } catch (err) {
-      toast(err.message || 'Could not download the subtitles.', 'warn', err.blocked ? 25000 : 0);
+      toast(err.message || 'Could not download the subtitles.', 'warn', err.permanent ? 25000 : 0);
       if (button) button.disabled = false;
     }
   }
@@ -993,7 +1001,6 @@ class Room {
     if (!st || st.folder !== folder) {
       const drive = this.drive;
       st = this._driveSubs = { folder, status: 'loading', items: [] };
-      drive.addKey(folder, m.drive.folderKey);
       drive.list(folder).then((items) => {
         st.status = 'ok';
         st.items = items.filter((f) => f.kind === 'subtitle');
@@ -1014,7 +1021,6 @@ class Room {
     if (!drive || !m?.folder) return;
     let pick = null;
     try {
-      drive.addKey(m.folder, m.folderKey);
       pick = pickSubtitle(file.name, await drive.list(m.folder), navigator.language);
       const st = this.sync.state;
       if (!pick || drive !== this.drive || st.sub || st.subFiles.length || st.movie?.name !== file.name) return;
@@ -1030,7 +1036,7 @@ class Room {
     const m = this.sync.state.movie;
     if (!this.drive || !m?.drive) return;
     try {
-      this.chooseMovieFile(this.drive.remoteFile({ id: m.drive.id, name: String(m.name || 'Movie'), size: Number(m.size), resourceKey: m.drive.resourceKey, folder: m.drive.folder, folderKey: m.drive.folderKey }));
+      this.chooseMovieFile(this.drive.remoteFile({ id: m.drive.id, name: String(m.name || 'Movie'), size: Number(m.size), folder: m.drive.folder }));
     } catch (err) {
       toast(err.message, 'warn');
     }
@@ -1058,7 +1064,7 @@ class Room {
       await this.player.load(file, { audioIndex: asRoom ? 0 : s.audio });
     } catch (err) {
       console.error(err);
-      toast(file.remote && err.remote ? err.message : 'Could not open this file: ' + (err.message || err), 'warn', err.blocked ? 25000 : 0);
+      toast(file.remote && err.remote ? err.message : 'Could not open this file: ' + (err.message || err), 'warn', err.permanent ? 25000 : 0);
       this.player.unload();
       this.loadingMovie = false;
       this._renderStage();

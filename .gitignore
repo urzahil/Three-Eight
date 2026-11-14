@@ -3,3 +3,4 @@ test/fixtures/
 *.log
 .env
 data/
+google-service-account.json

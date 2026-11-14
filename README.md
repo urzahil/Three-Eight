@@ -16,10 +16,10 @@ Video meetups and movie nights with friends, entirely in the browser (Chrome, Fi
              └───── audio · video · chat · movie sync (WebRTC, direct P2P) ─────┘
 ```
 
-- **Server** (`server/`): Node.js with one dependency (`ws`). It serves the static app, stores rooms and their scrypt-hashed passwords in `/data/rooms.json`, checks the password when someone joins, relays WebRTC offers, answers and ICE candidates between members of the same room, and answers clock-sync pings.
+- **Server** (`server/`): Node.js with one dependency (`ws`). It serves the static app, stores rooms and their scrypt-hashed passwords in `/data/rooms.json`, checks the password when someone joins, relays WebRTC offers, answers and ICE candidates between members of the same room, and answers clock-sync pings. If a room has a Google Drive folder, it also reads that folder as a Google service account and streams the movies to the room's members (`server/drive.js`).
 - **Calls** (`public/assets/js/mesh.js`): a full mesh with one `RTCPeerConnection` per pair of people. Each person uploads one stream per friend, and video bitrate goes down automatically as the room grows. This works best with up to about 6–8 people.
 - **Movie sync** (`public/assets/js/sync.js`): everyone shares a small playback state: playing or paused, position, timestamp on the shared server clock, audio track and subtitle track. Any change is broadcast over WebRTC data channels and the newest change wins. Each browser works out where the movie should be right now and corrects drift. It speeds up or slows down by a few percent for small offsets and seeks for large ones. In testing, browsers stayed within about 10 ms of each other.
-- **Movie files are never uploaded.** Each person picks their local file, or streams the room's Google Drive folder directly from Google (the server never fetches or relays it). The page compares file size and name to warn when someone has a different file.
+- **Movie files are never uploaded.** Each person picks their local file, or streams the room's Google Drive folder through the server, which reads it from Google (nothing is stored on the server's disk). The page compares file size and name to warn when someone has a different file.
 
 ### Audio tracks and subtitles in every browser
 
@@ -125,24 +125,33 @@ Tip: use headphones during the movie, so your microphone doesn't send the film's
 
 ### Google Drive folders
 
-An admin can attach one Google Drive folder to a room. Room members can then browse it (including subfolders) and stream a movie straight from Google Drive into the player, or still pick a local copy. Everything happens in the browsers, talking to Google directly: nothing goes through the Three-Eight server. Rooms without a folder look the same as before.
+An admin can attach one Google Drive folder to a room. Room members can then browse it (including subfolders) and stream a movie straight into the player, or still pick a local copy. Rooms without a folder look the same as before.
+
+How it works: the Three-Eight server signs in to Google as a **service account** and reads the folder. Members never contact Google: their browsers fetch folder listings and movie data from the Three-Eight server, which only answers requests that carry a token it handed out when they joined the room (the token is tied to the room, its password and its folder, and expires after 12 hours). Movies are not stored on disk. The server keeps a short-lived cache in memory (`DRIVE_CACHE_MB`) and fetches each part of a film from Google about once, even when several people watch it at the same time.
 
 Setup:
 
 1. In the [Google Cloud console](https://console.cloud.google.com/), create a dedicated project. Do **not** attach a billing account.
 2. Enable the **Google Drive API** for that project.
-3. Create an **API key** and restrict it: under *API restrictions* choose *Restrict key* and select only the Google Drive API. Don't use *HTTP referrers (websites)* restriction, because the app sends no `Referer` header (`Referrer-Policy: no-referrer`) and every request would be rejected.
-4. Set `GOOGLE_API_KEY` (see below) and restart the server.
-5. In Google Drive, share the folder as **Anyone with the link**.
-6. On the admin page, click **Drive…** next to the room and paste the folder link. The page checks that the folder can be read.
+3. Create a **service account** (*IAM & Admin → Service accounts*). It needs no roles.
+4. Open the service account, go to *Keys → Add key → Create new key → JSON*, and put the downloaded file on the server. Set `GOOGLE_SERVICE_ACCOUNT` to its path and restart. With Docker Compose, save the file next to `docker-compose.yml` as `google-service-account.json`, uncomment the `volumes` line that mounts it (read-only), and add `GOOGLE_SERVICE_ACCOUNT=/run/secrets/google-service-account.json` to `.env`:
+
+   ```yaml
+   volumes:
+     - ./google-service-account.json:/run/secrets/google-service-account.json:ro
+   ```
+
+5. In Google Drive, share the folder with the service account's email address (it looks like `name@project.iam.gserviceaccount.com`) as **Viewer**. The folder doesn't need to be public.
+6. On the admin page, click **Drive…** next to the room and paste the folder link. The dialog shows the email to share with. After saving, the server checks that it can read the folder and tells you.
 
 Notes:
 
-- The key is sent to room members' browsers. It can only read files that are already public or link-shared. The worst case is someone using up the project's request quota. To rotate it, create a new key, update `GOOGLE_API_KEY` and restart.
-- Each viewer streams the file themselves, so their connection must handle the movie's bitrate.
-- Google may temporarily block a heavily downloaded file ("download quota exceeded"). Use a local copy until it clears.
+- **Bandwidth:** the server uploads the film to every viewer, so a movie night uses roughly the film's size × the number of people watching. The server's upload speed must carry the film's bitrate for all of them at once. Google is read about once per film, however many people watch.
+- **Security:** keep the key file private (don't commit it; it is in `.gitignore`). It can read whatever is shared with that service account, so share only what you want available. The server only serves files inside a room's folder, to people who joined that room. To revoke access, delete the key in Google Cloud (*Service accounts → Keys*), or stop sharing the folder with the service account.
+- In Docker the server runs as the `node` user, so the mounted key file must be readable by it (for example `chmod 644 google-service-account.json` on a single-user host).
+- If `GOOGLE_SERVICE_ACCOUNT` is set but the file cannot be read, the server logs why and runs with Drive disabled. The admin dialog then says that the variable is not set.
+- Google may temporarily block a heavily downloaded file ("download quota exceeded"). People then see that message; use a local copy until it clears.
 - Embedded subtitles in a streamed film are read only when you select them, one small download at a time, so they load slowly; a separate `.srt`, `.vtt` or `.ass` file next to the movie is much faster. MKV files without a subtitle index can't be read while streaming at all.
-- If Google shows "your computer or network may be sending automated queries", it is blocking downloads from that internet connection (the app then says so). Wait a few hours, switch network or VPN, or use a local copy of the film.
 - A subtitle file next to the movie with the same name (`Arrival.srt`, `Arrival.en.srt`, ...) loads automatically for everyone when someone starts the movie from Drive. Without an exact match, the file in the browser's language is preferred. Names like `Film.en.srt` or `Film ENG.srt` are recognised. Other subtitle files for the film in its folder are listed under **From Google Drive** in the CC menu.
 
 ## Configuration
@@ -158,7 +167,8 @@ Notes:
 | `TURN_URLS` | — | Comma-separated TURN URLs (optional) |
 | `TURN_SECRET` | — | coturn `static-auth-secret` (ephemeral credentials) |
 | `TURN_USERNAME` / `TURN_PASSWORD` | — | Static TURN credentials (alternative to the secret) |
-| `GOOGLE_API_KEY` | — | Google Drive API key for room Drive folders (optional, see above) |
+| `GOOGLE_SERVICE_ACCOUNT` | — | Path to a Google service account JSON key, for room Drive folders (optional, see above) |
+| `DRIVE_CACHE_MB` | `256` | Memory for the movie cache while streaming from Drive |
 | `TLS_CERT` / `TLS_KEY` | — | Serve HTTPS directly instead of using a proxy |
 
 ### Do I need TURN?
@@ -224,7 +234,7 @@ node test/pip-check.js
 node test/drive-check.js
 ```
 
-`drive-check.js` starts its own server and replaces Google Drive with a local mock: browsing a folder and its subfolders, streaming a movie through the remuxer and natively, room sync while streaming, sharing a subtitle file from the folder, a blocked download, and live changes to the room's folder. `player-check.js` tests the in-browser player on its own: native or remux mode, audio track switching, seeking and subtitles. `e2e.js` tests the whole flow: the admin creates a room, a wrong password is rejected, two people join with fake cameras, video flows peer to peer, mute and camera state and chat arrive on the other side, and the movie syncs. The movie part covers play, pause, seeking, audio and subtitle changes, a shared subtitle file, and a late joiner. Finally the admin deletes the room and everyone is disconnected. `pip-check.js` tests picture-in-picture: the Document PiP window (the movie box moves there, subtitles still render, controls inside it drive the other person, and closing it brings the player back), the native-PiP fallback (the subtitles are mirrored into a caption track, and a pause made directly on the `<video>` reaches the room), and the compact style (chosen in Settings: the canvas stream is in native PiP, the subtitles and video are drawn on the canvas, a pause on the PiP element reaches the room, and leaving PiP cleans up).
+`drive-check.js` starts its own server as a service account against a fake Google (`test/fake-google.js`): browsing a folder and its subfolders, streaming a movie through the remuxer and natively, room sync while streaming, subtitles from the folder, a download quota error, two viewers sharing one fetch from Google, a token refresh on reconnect, live changes to the room's folder, and a check that the browser never contacts Google. `player-check.js` tests the in-browser player on its own: native or remux mode, audio track switching, seeking and subtitles. `e2e.js` tests the whole flow: the admin creates a room, a wrong password is rejected, two people join with fake cameras, video flows peer to peer, mute and camera state and chat arrive on the other side, and the movie syncs. The movie part covers play, pause, seeking, audio and subtitle changes, a shared subtitle file, and a late joiner. Finally the admin deletes the room and everyone is disconnected. `pip-check.js` tests picture-in-picture: the Document PiP window (the movie box moves there, subtitles still render, controls inside it drive the other person, and closing it brings the player back), the native-PiP fallback (the subtitles are mirrored into a caption track, and a pause made directly on the `<video>` reaches the room), and the compact style (chosen in Settings: the canvas stream is in native PiP, the subtitles and video are drawn on the canvas, a pause on the PiP element reaches the room, and leaving PiP cleans up).
 
 ## License
 

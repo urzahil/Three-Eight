@@ -5,10 +5,13 @@
 //   2. keeps the list of rooms and their (hashed) passwords,
 //   3. relays WebRTC signaling messages (SDP offers/answers, ICE candidates)
 //      between authenticated participants of the same room,
-//   4. answers clock-sync pings so every browser agrees on a common clock.
+//   4. answers clock-sync pings so every browser agrees on a common clock,
+//   5. optionally reads a Google Drive folder per room as a service account and
+//      streams its movies and subtitles to the members of that room.
 //
 // Audio, video, chat and movie-sync messages flow directly between browsers
-// (WebRTC peer connections + data channels). No media ever touches the server.
+// (WebRTC peer connections + data channels). Only Drive movies pass through
+// the server (streamed, with a short-lived memory cache; nothing is stored).
 
 'use strict';
 
@@ -19,6 +22,7 @@ const path = require('path');
 const crypto = require('crypto');
 const { WebSocketServer } = require('ws');
 const { RoomStore, parseDriveFolder } = require('./store');
+const { GoogleDrive, DriveError, ID_RE: DRIVE_ID_RE, FOLDER, kindOf, loadServiceAccount, parseRange, MiB } = require('./drive');
 
 const PORT = parseInt(process.env.PORT || '4567', 10);
 const HOST = process.env.HOST || '0.0.0.0';
@@ -27,7 +31,6 @@ const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(__dirname, '..',
 const MAX_ROOM_SIZE = parseInt(process.env.MAX_ROOM_SIZE || '12', 10);
 const TRUST_PROXY = /^(1|true|yes)$/i.test(process.env.TRUST_PROXY || '');
 const MAX_MESSAGE_BYTES = 64 * 1024;
-const GOOGLE_API_KEY = (process.env.GOOGLE_API_KEY || '').trim();
 const ADMIN_SESSION_MS = 12 * 3600 * 1000;
 
 let ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
@@ -37,6 +40,74 @@ if (!ADMIN_PASSWORD) {
 }
 
 const store = new RoomStore(DATA_DIR);
+
+// ---- Google Drive (service account) ----------------------------------------
+// GOOGLE_SERVICE_ACCOUNT: path to the service account's JSON key. If it is set but unusable,
+// the server runs with Drive disabled (and says why, without printing anything secret).
+/** @type {GoogleDrive|null} */
+let driveApi = null;
+{
+  const keyFile = (process.env.GOOGLE_SERVICE_ACCOUNT || '').trim();
+  if (keyFile) {
+    try {
+      const account = loadServiceAccount(keyFile);
+      const mbSetting = (process.env.DRIVE_CACHE_MB || '').trim();
+      const mb = mbSetting === '' ? 256 : Number(mbSetting);
+      driveApi = new GoogleDrive({
+        account,
+        apiBase: (process.env.GOOGLE_API_BASE || 'https://www.googleapis.com').trim(),
+        cacheBytes: (Number.isFinite(mb) && mb >= 0 ? mb : 256) * MiB,
+      });
+      console.log(`Google Drive enabled (service account ${account.email})`);
+    } catch (err) {
+      console.error(`GOOGLE_SERVICE_ACCOUNT is set but cannot be used: ${err.message}. Google Drive folders are disabled.`);
+    }
+  }
+}
+
+// ---- Room tokens for the Drive endpoints -----------------------------------------
+// A token proves that its holder joined a room (it is only sent in the welcome message, after the
+// password check). Format: base64url(JSON {r: room key, e: expiry ms, v: room version}) + '.' +
+// base64url(HMAC-SHA256 of the first part). The secret is random per process, so tokens do not
+// survive a restart (clients get a fresh one when they reconnect). The version is a hash of the
+// room's creation time, password hash and Drive folder: changing the password or the folder
+// invalidates every token issued before.
+const TOKEN_SECRET = crypto.randomBytes(32);
+const TOKEN_TTL_MS = 12 * 3600 * 1000;
+
+function roomVersion(r) {
+  return crypto.createHash('sha256').update(`${r.createdAt}\0${r.passwordHash || ''}\0${r.drive?.folderId || ''}`).digest('base64url').slice(0, 16);
+}
+
+function tokenSignature(body) {
+  return crypto.createHmac('sha256', TOKEN_SECRET).update(body).digest('base64url');
+}
+
+function issueToken(r) {
+  const body = Buffer.from(JSON.stringify({ r: RoomStore.key(r.name), e: Date.now() + TOKEN_TTL_MS, v: roomVersion(r) })).toString('base64url');
+  return `${body}.${tokenSignature(body)}`;
+}
+
+/** The room a valid token belongs to, or null. */
+function verifyToken(token) {
+  if (typeof token !== 'string' || token.length > 600) return null;
+  const dot = token.indexOf('.');
+  if (dot <= 0) return null;
+  const body = token.slice(0, dot);
+  const given = Buffer.from(token.slice(dot + 1));
+  const want = Buffer.from(tokenSignature(body));
+  if (given.length !== want.length || !crypto.timingSafeEqual(given, want)) return null;
+  let claim;
+  try {
+    claim = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'));
+  } catch {
+    return null;
+  }
+  if (!claim || typeof claim.r !== 'string' || typeof claim.e !== 'number' || claim.e < Date.now()) return null;
+  const room = store.get(claim.r);
+  if (!room || !room.drive || claim.v !== roomVersion(room)) return null;
+  return room;
+}
 
 // ---- ICE (STUN/TURN) configuration ---------------------------------------
 // STUN lets browsers discover their public address so they can connect
@@ -214,10 +285,18 @@ function roomMembers(name) {
   return live.get(RoomStore.key(name));
 }
 
-// What room members need to browse the room's Google Drive folder, or null.
+// What room members need to browse the room's Google Drive folder: a token for our endpoints and the
+// folder's ID. null when the room has no folder or the server has no service account.
 function driveInfo(r) {
-  if (!r || !r.drive || !GOOGLE_API_KEY) return null;
-  return { apiKey: GOOGLE_API_KEY, folderId: r.drive.folderId, resourceKey: r.drive.resourceKey || '' };
+  if (!r || !r.drive || !driveApi) return null;
+  return { token: issueToken(r), folder: r.drive.folderId };
+}
+
+function pushDrive(name) {
+  const members = roomMembers(name);
+  if (!members) return;
+  const info = driveInfo(store.get(name));
+  for (const m of members.values()) send(m.ws, { type: 'drive', drive: info });
 }
 
 function kickRoom(name, code, message) {
@@ -231,9 +310,130 @@ function kickRoom(name, code, message) {
   live.delete(RoomStore.key(name));
 }
 
+// ---- Google Drive endpoints --------------------------------------------------------
+const DRIVE_HEADERS = { 'Cache-Control': 'private, no-store' };
+
+/** After the admin attaches a folder: can the service account read it? */
+async function checkFolder(folderId) {
+  try {
+    driveApi.forget(folderId);
+    const info = await driveApi.folderInfo(folderId);
+    if (info.mimeType !== FOLDER) return { error: 'That link points to a file, not a folder.' };
+    const items = await driveApi.list(folderId);
+    return { name: info.name, items: items.length };
+  } catch (err) {
+    return { error: err instanceof DriveError ? err.message : 'The folder could not be read.' };
+  }
+}
+
+function driveFail(res, err) {
+  if (err instanceof DriveError) {
+    if (err.aborted) return res.destroy();
+    if (res.headersSent) return res.destroy();
+    const body = { error: err.message };
+    if (err.permanent) body.permanent = true;
+    return sendJson(res, err.status, body, DRIVE_HEADERS);
+  }
+  console.error('drive request failed:', err && err.message);
+  if (res.headersSent) return res.destroy();
+  return sendJson(res, 500, { error: 'Something went wrong on the server.' }, DRIVE_HEADERS);
+}
+
+const waitDrain = (res) => new Promise((resolve) => {
+  const done = () => { res.off('drain', done); res.off('close', done); resolve(); };
+  res.once('drain', done);
+  res.once('close', done);
+});
+
+// GET /api/rooms/:room/drive/folders/:id      (id may be "root": the room's folder)
+// GET|HEAD /api/rooms/:room/drive/files/:id
+// Authorization: Bearer <room token>, or ?t=<room token> (a <video> element cannot send headers).
+async function handleDrive(req, res, url, parts) {
+  const what = parts[4];
+  const isFiles = what === 'files';
+  if (parts.length !== 6 || (what !== 'folders' && !isFiles)) return sendJson(res, 404, { error: 'Not found' }, DRIVE_HEADERS);
+  if (req.method !== 'GET' && !(req.method === 'HEAD' && isFiles)) return sendJson(res, 405, { error: 'Method not allowed' }, { ...DRIVE_HEADERS, Allow: isFiles ? 'GET, HEAD' : 'GET' });
+  if (!driveApi) return sendJson(res, 503, { error: 'Google Drive is not set up on this server.' }, DRIVE_HEADERS);
+
+  const bearer = /^Bearer\s+(\S+)$/i.exec(String(req.headers.authorization || ''));
+  const room = verifyToken(bearer ? bearer[1] : url.searchParams.get('t') || '');
+  if (!room || RoomStore.key(parts[2]) !== RoomStore.key(room.name)) {
+    return sendJson(res, 401, { error: 'Your Drive session is missing or has expired. Rejoin the room.' }, DRIVE_HEADERS);
+  }
+  const root = room.drive.folderId;
+  let id = parts[5];
+  if (id === 'root' && !isFiles) id = root;
+  if (!DRIVE_ID_RE.test(id)) return sendJson(res, 404, { error: 'Not found' }, DRIVE_HEADERS);
+
+  try {
+    // Only the room's folder and what is below it: the service account may be able to read much more.
+    if (!(await driveApi.inTree(root, id))) return sendJson(res, 404, { error: 'Not found in this room\'s folder.' }, DRIVE_HEADERS);
+    if (!isFiles) {
+      const [info, items] = await Promise.all([driveApi.folderInfo(id), driveApi.list(id)]);
+      if (info.mimeType !== FOLDER) return sendJson(res, 404, { error: 'That is not a folder.' }, DRIVE_HEADERS);
+      driveApi.markInTree(root, items.map((f) => f.id));
+      return sendJson(res, 200, { id, name: info.name, items }, DRIVE_HEADERS);
+    }
+    await serveFile(req, res, id);
+  } catch (err) {
+    driveFail(res, err);
+  }
+}
+
+async function serveFile(req, res, id) {
+  const meta = await driveApi.fileMeta(id);
+  const kind = kindOf(meta);
+  if (meta.trashed || (kind !== 'video' && kind !== 'subtitle') || !Number.isSafeInteger(meta.size) || meta.size < 0) {
+    return sendJson(res, 404, { error: 'Not found' }, DRIVE_HEADERS);
+  }
+  const size = meta.size;
+  const range = parseRange(req.headers.range, size);
+  if (range === 'invalid') return sendJson(res, 416, { error: 'Invalid byte range.' }, { ...DRIVE_HEADERS, 'Content-Range': `bytes */${size}` });
+  const start = range ? range.start : 0;
+  const end = range ? range.end : size - 1;
+  const length = size ? end - start + 1 : 0;
+  const headers = {
+    ...SECURITY_HEADERS,
+    ...DRIVE_HEADERS,
+    // Never let a browser treat a file from the folder as a page of ours.
+    'Content-Type': /^video\/[A-Za-z0-9.+-]+$/.test(meta.mimeType) ? meta.mimeType : 'application/octet-stream',
+    'Content-Security-Policy': 'sandbox',
+    'Accept-Ranges': 'bytes',
+    'Content-Length': length,
+  };
+  if (range) headers['Content-Range'] = `bytes ${start}-${end}/${size}`;
+  const status = range ? 206 : 200;
+  if (req.method === 'HEAD' || length === 0) {
+    res.writeHead(status, headers);
+    return res.end();
+  }
+
+  // Stop upstream work when the client goes away.
+  const ctrl = new AbortController();
+  res.on('close', () => ctrl.abort());
+  const gen = driveApi.read(id, size, start, end, ctrl.signal);
+  try {
+    // The first block is fetched before any header is sent, so a Google error still becomes a proper error response.
+    let next = await gen.next();
+    if (ctrl.signal.aborted) return;
+    res.writeHead(status, headers);
+    while (!next.done) {
+      if (!res.write(next.value)) await waitDrain(res);
+      if (ctrl.signal.aborted) return;
+      next = await gen.next();
+    }
+    res.end();
+  } finally {
+    await gen.return().catch(() => {});
+  }
+}
+
 // ---- HTTP routing -----------------------------------------------------------------
 async function handleApi(req, res, url) {
   const parts = url.pathname.split('/').filter(Boolean); // ['api', ...]
+
+  // Room members: browse and stream the room's Google Drive folder (authorized by a room token).
+  if (parts[1] === 'rooms' && parts[3] === 'drive') return handleDrive(req, res, url, parts);
 
   // Public: does a room exist / need a password?
   if (parts[1] === 'rooms' && parts.length === 3 && req.method === 'GET') {
@@ -284,7 +484,7 @@ async function handleApi(req, res, url) {
         const m = roomMembers(r.name);
         return { ...r, online: m ? [...m.values()].map((x) => x.name) : [] };
       });
-      return sendJson(res, 200, { rooms, googleApiKey: GOOGLE_API_KEY });
+      return sendJson(res, 200, { rooms, serviceAccount: driveApi ? driveApi.account.email : '' });
     }
     if (!name && req.method === 'POST') {
       const body = await readJson(req);
@@ -308,10 +508,10 @@ async function handleApi(req, res, url) {
       } catch (err) {
         return sendJson(res, 404, { error: err.message });
       }
-      const info = driveInfo(store.get(name));
-      const members = roomMembers(name);
-      if (members) for (const m of members.values()) send(m.ws, { type: 'drive', drive: info });
-      return sendJson(res, 200, { ok: true, drive });
+      pushDrive(name);
+      const out = { ok: true, drive };
+      if (drive && driveApi) out.check = await checkFolder(drive.folderId);
+      return sendJson(res, 200, out);
     }
     if (name && parts.length === 4 && req.method === 'PUT') {
       const body = await readJson(req);
@@ -321,6 +521,7 @@ async function handleApi(req, res, url) {
         return sendJson(res, 400, { error: err.message });
       }
       if (body.kick) kickRoom(name, 'kicked', 'The room password was changed. Please rejoin.');
+      else pushDrive(name); // everyone's old Drive token just stopped working: hand out the new one
       return sendJson(res, 200, { ok: true });
     }
     if (name && req.method === 'DELETE') {

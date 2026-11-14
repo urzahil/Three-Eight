@@ -66,8 +66,9 @@
     <form method="dialog" class="stack">
       <h2>Google Drive folder for <span id="drive-room"></span></h2>
       <label>Folder link <input id="drive-link" type="text" autocomplete="off" placeholder="https://drive.google.com/drive/folders/..."></label>
-      <p class="muted small">Paste the link of a folder shared as “Anyone with the link”. Leave empty to remove it.</p>
-      <p id="drive-nokey" class="muted small" hidden>GOOGLE_API_KEY is not set on the server, so room members won't see this folder yet.</p>
+      <p class="muted small">Paste the link of the folder. Leave empty to remove it.</p>
+      <p id="drive-share" class="muted small" hidden>Share the folder with <strong id="drive-sa"></strong> (Viewer). It doesn't need to be public. <button type="button" id="drive-copy" class="btn ghost">Copy email</button></p>
+      <p id="drive-nosa" class="muted small" hidden>GOOGLE_SERVICE_ACCOUNT is not set on the server, so room members won't see this folder.</p>
       <button class="btn primary" value="save">Save</button>
       <button id="drive-remove" class="btn danger" value="remove" hidden>Remove</button>
       <button class="btn ghost" value="cancel">Cancel</button>

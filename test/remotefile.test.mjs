@@ -267,30 +267,12 @@ test('a request without any answer is retried exactly once, after the delay', as
   assert.ok(Date.now() - t0 >= 70, 'waited before retrying');
 });
 
-test('the diagnose hook explains repeated network failures; a permanent answer stops all downloads', async () => {
+test('an explanation can mark an error permanent, so it is not retried', async () => {
   const data = makeData(8 * BS);
-  const calls = serve(data, { behave: () => { throw new TypeError('Failed to fetch'); } });
-  let asked = 0;
-  const blocked = Object.assign(new Error('blocked by the server'), { permanent: true });
-  const f = file(data, { diagnose: async () => { asked++; return blocked; } });
-  await assert.rejects(read(f, 0, BS), (e) => e === blocked && e.permanent && e.remote);
-  assert.equal(calls.length, 2);
-  assert.equal(asked, 1);
-  await assert.rejects(read(f, 4 * BS, 5 * BS), (e) => e === blocked);
-  assert.equal(await f.diagnoseFailure(), blocked);
-  assert.equal(calls.length, 2, 'no further fetches');
-  assert.equal(asked, 1);
-});
-
-test('a diagnosis that finds nothing keeps the network error and does not stop later reads', async () => {
-  const data = makeData(8 * BS);
-  let fail = true;
-  const calls = serve(data, { behave: () => { if (fail) throw new TypeError('Failed to fetch'); return null; } });
-  const f = file(data, { diagnose: async () => null });
-  await assert.rejects(read(f, 0, BS), (e) => e.network);
-  fail = false;
-  assert.deepEqual(await read(f, 0, BS), data.subarray(0, BS));
-  assert.equal(calls.length, 3);
+  const calls = serve(data, { behave: () => new Response('{"error":"quota"}', { status: 503 }) });
+  const f = file(data, { explain: async () => Object.assign(new Error('quota used up'), { permanent: true }) });
+  await assert.rejects(read(f, 0, BS), (e) => e.message === 'quota used up' && e.permanent && e.status === 503);
+  assert.equal(calls.length, 1, 'no retries');
 });
 
 test('diagnoseFailure reads one uncached piece: null if it works, the explanation if not', async () => {

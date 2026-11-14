@@ -1,13 +1,11 @@
-import { DriveClient } from '/assets/js/drive.js';
-
 const $ = (id) => document.getElementById(id);
 
-function toast(text) {
+function toast(text, ms = 3000) {
   const el = document.createElement('div');
   el.className = 'toast';
   el.textContent = text;
   $('toasts').appendChild(el);
-  setTimeout(() => el.remove(), 3000);
+  setTimeout(() => el.remove(), ms);
 }
 
 async function api(method, path, body) {
@@ -22,11 +20,11 @@ async function api(method, path, body) {
   return data;
 }
 
-let googleApiKey = '';
+let serviceAccount = ''; // email of the Google service account the server uses, '' if Drive is not set up
 const driveNames = new Map(); // room name -> verified folder name (memory only)
 
 function driveLink(d) {
-  return `https://drive.google.com/drive/folders/${d.folderId}` + (d.resourceKey ? `?resourcekey=${encodeURIComponent(d.resourceKey)}` : '');
+  return `https://drive.google.com/drive/folders/${d.folderId}`;
 }
 
 function roomUrl(name) {
@@ -42,7 +40,7 @@ async function refresh() {
     toast(err.message);
     return;
   }
-  googleApiKey = data.googleApiKey || '';
+  serviceAccount = data.serviceAccount || '';
   const tbody = $('rooms');
   tbody.replaceChildren(...data.rooms.map((r) => {
     const tr = document.createElement('tr');
@@ -122,37 +120,47 @@ function changeDrive(name, current) {
   const d = $('drive-dialog');
   $('drive-room').textContent = name;
   $('drive-link').value = current ? driveLink(current) : '';
-  $('drive-nokey').hidden = !!googleApiKey;
+  $('drive-share').hidden = !serviceAccount;
+  $('drive-sa').textContent = serviceAccount;
+  $('drive-nosa').hidden = !!serviceAccount;
   $('drive-remove').hidden = !current;
   d.returnValue = 'cancel';
   d.showModal();
   d.addEventListener('close', async () => {
     if (d.returnValue !== 'save' && d.returnValue !== 'remove') return;
     const link = d.returnValue === 'remove' ? '' : $('drive-link').value.trim();
-    let drive;
+    let result;
     try {
-      ({ drive } = await api('PUT', '/rooms/' + encodeURIComponent(name) + '/drive', { link }));
+      result = await api('PUT', '/rooms/' + encodeURIComponent(name) + '/drive', { link });
     } catch (err) {
       toast(err.message);
       return;
     }
+    const { drive, check } = result;
     if (!drive) toast('Drive folder removed');
-    else if (!googleApiKey) toast('Folder saved');
+    else if (!check) toast('Folder saved');
+    else if (check.error) toast(`Saved, but the folder could not be read: ${check.error}`, 10000);
     else {
-      toast('Folder saved, checking it…');
-      try {
-        const c = new DriveClient({ apiKey: googleApiKey, folderId: drive.folderId, resourceKey: drive.resourceKey });
-        const f = await c.folderInfo();
-        const items = await c.list(drive.folderId);
-        driveNames.set(name + '|' + drive.folderId, f.name);
-        toast(`Folder “${f.name}” linked: ${items.length} items`);
-      } catch (err) {
-        toast(`Saved, but the folder could not be read: ${err.message}`);
-      }
+      driveNames.set(name + '|' + drive.folderId, check.name);
+      toast(`Folder “${check.name}” linked: ${check.items} items`);
     }
     refresh();
   }, { once: true });
 }
+
+$('drive-copy').onclick = async () => {
+  try {
+    await navigator.clipboard.writeText(serviceAccount);
+    toast('Email copied');
+  } catch {
+    const el = $('drive-sa');
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    getSelection().removeAllRanges();
+    getSelection().addRange(range);
+    toast('Copy the selected email');
+  }
+};
 
 function showLogin() {
   $('panel').hidden = true;

@@ -37,14 +37,63 @@ test('ignores non-subtitle entries and handles empty input', () => {
 });
 function pickSubtitleOf(files) { return pickSubtitle('A.mkv', files, 'en'); }
 
-test('addKey validates ids and keys and never overwrites a known key', () => {
-  const d = new DriveClient({ apiKey: 'k', folderId: 'ROOTFOLDER_0001', resourceKey: 'R-1' });
-  d.addKey('SUBFOLDER_00002', 'S-1');
-  d.addKey('SUBFOLDER_00002', 'OTHER');
-  d.addKey('bad id!', 'X');
-  d.addKey('THIRDFOLDER_0003', 'bad key,/');
-  d.addKey('FOURTHFOLDER_004', '');
-  assert.deepEqual([...d.keys], [['ROOTFOLDER_0001', 'R-1'], ['SUBFOLDER_00002', 'S-1']]);
+test('DriveClient: list and folderInfo share one cached request per folder, with the token', async () => {
+  const calls = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url, auth: init.headers.Authorization });
+    return new Response(JSON.stringify({ id: 'ROOTFOLDER_0001', name: 'Movies', items: [{ id: 'FILEID_00000001', name: 'a.mkv', kind: 'video', size: 5, durationMs: 0 }] }), { status: 200 });
+  };
+  try {
+    const d = new DriveClient({ room: 'My Room', token: 'tok1', folder: 'ROOTFOLDER_0001' });
+    assert.deepEqual((await d.list()).map((f) => f.name), ['a.mkv']);
+    assert.deepEqual(await d.folderInfo(), { id: 'ROOTFOLDER_0001', name: 'Movies' });
+    assert.equal((await d.list('ROOTFOLDER_0001')).length, 1, 'the root folder\'s own ID is the same listing');
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].url, '/api/rooms/My%20Room/drive/folders/root');
+    assert.equal(calls[0].auth, 'Bearer tok1');
+    await assert.rejects(d.list('bad id!'), /not a valid/);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('DriveClient: remoteFile reads through the server, re-reading the token for every request', () => {
+  const d = new DriveClient({ room: 'r', token: 'tok1', folder: 'ROOTFOLDER_0001' });
+  const f = d.remoteFile({ id: 'FILEID_00000001', name: 'a.mkv', size: 10, folder: 'SUBFOLDER_00002' });
+  assert.equal(f.nativeUrl, '/api/rooms/r/drive/files/FILEID_00000001?t=tok1');
+  assert.deepEqual(f.drive, { id: 'FILEID_00000001', folder: 'SUBFOLDER_00002' });
+  assert.throws(() => d.remoteFile({ id: 'FILEID_00000001', name: 'x', size: 0 }), /size/);
+  const seen = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    seen.push([url, init.headers.Authorization, init.headers.Range]);
+    return new Response(new Uint8Array(10), { status: 206 });
+  };
+  return (async () => {
+    try {
+      await f.slice(0, 4).arrayBuffer();
+      d.setToken('tok2');
+      await f.slice(4, 10).arrayBuffer().catch(() => {});
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+    assert.equal(seen[0][0], '/api/rooms/r/drive/files/FILEID_00000001');
+    assert.equal(seen[0][1], 'Bearer tok1');
+  })();
+});
+
+test('DriveClient: server errors show their message; a dead network says so', async () => {
+  const realFetch = globalThis.fetch;
+  const d = new DriveClient({ room: 'r', token: 't', folder: 'ROOTFOLDER_0001' });
+  try {
+    globalThis.fetch = async () => new Response(JSON.stringify({ error: 'Google Drive is rate limiting requests, try again in a minute.' }), { status: 503 });
+    await assert.rejects(d.list(), /rate limiting/);
+    globalThis.fetch = async () => { throw new TypeError('Failed to fetch'); };
+    await assert.rejects(d.list(), (e) => e.message === 'Could not reach the server.' && e.remote);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
 });
 
 test('subtitleMatches: this film\'s files, not other films\'', () => {

@@ -515,14 +515,14 @@ export class MoviePlayer extends EventTarget {
     console.warn('Video error', err);
     const time = this.time;
     if (this.mode === 'native' && this.file.remote && !this.diagnosed && (err?.code === 2 || err?.code === 4)) {
-      // The element downloads by itself and only says "network error". Find out whether Google is
-      // blocking us (or we are offline) before trying anything else.
+      // The element downloads by itself and only says "network error". Find out whether the server is
+      // refusing us (or we are offline) before trying anything else.
       this.diagnosed = true;
       const file = this.file;
       const why = await file.diagnoseFailure?.();
       if (this.file !== file) return;
       if (why) {
-        this._emit('fatal', { text: why.message, long: !!why.blocked });
+        this._emit('fatal', { text: why.message, long: !!why.permanent });
         return;
       }
     }

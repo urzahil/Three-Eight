@@ -4,8 +4,8 @@
 //
 // Everything goes through one block cache (fixed-size blocks, LRU), so the
 // video and audio cursors, which scan the same bytes of an interleaved file,
-// never download anything twice. Nothing here knows about Google Drive: the
-// caller can inject how errors are worded (`explain`, `networkError`).
+// never download anything twice. Nothing here knows where the bytes come from:
+// the caller can inject how errors are worded (`explain`, `networkError`).
 
 const MiB = 1024 * 1024;
 const noop = () => {};
@@ -32,8 +32,6 @@ export class RemoteFile {
    * @param {(start, endInclusive, signal) => Promise<Response>} [o.request]  replaces the default fetch
    * @param {(res: Response) => Promise<Error>} [o.explain]  turns an error response into an Error
    * @param {(err: Error) => Error} [o.networkError]  rewords a failed fetch
-   * @param {(err: Error) => Promise<Error|null>} [o.diagnose]  called after repeated network-level failures
-   *   (fetch rejected, e.g. a CORS-less block page): may return a better explanation. A permanent one stops all further downloads.
    */
   constructor(o) {
     this.name = o.name;
@@ -51,8 +49,6 @@ export class RemoteFile {
     this.readAhead = o.readAhead !== false;
     this.explain = o.explain || null;
     this.networkError = o.networkError || null;
-    this.diagnose = o.diagnose || null;
-    this.fatal = null; // a permanent explanation (e.g. "blocked"): nothing more is downloaded
     this.prefetching = false;
     this.request = o.request || ((start, end, signal) => fetch(o.url, { headers: { ...(o.headers ? o.headers() : {}), Range: `bytes=${start}-${end}` }, signal }));
     this.blocks = new Map(); // index -> Uint8Array; Map order = LRU order (oldest first)
@@ -93,11 +89,10 @@ export class RemoteFile {
 
   /**
    * Native playback downloads by itself and only reports "network error". To learn whether the
-   * server really is unreachable (or blocking us), read one small uncached piece ourselves:
+   * server really is unreachable (or refusing us), read one small uncached piece ourselves:
    * returns the explaining Error, or null when the file can be read (so the failure is something else).
    */
   async diagnoseFailure() {
-    if (this.fatal) return this.fatal;
     const at = Math.floor(this.size / 2 / this.blockSize) * this.blockSize;
     try {
       await this.lite().slice(at, at + 1).arrayBuffer();
@@ -259,7 +254,6 @@ export class RemoteFile {
       let netFails = 0;
       for (let attempt = 0; attempt <= this.retries; attempt++) {
         if (this.closed) throw new RemoteError('The movie was closed.', { permanent: true });
-        if (this.fatal) throw this.fatal;
         if (attempt) {
           // HTTP errors back off exponentially; a request that never got an answer is retried once, slowly.
           const wait = lastErr.network ? this.networkRetryDelay : this.backoff * 2 ** (attempt - 1) * (0.75 + Math.random() * 0.5);
@@ -272,7 +266,7 @@ export class RemoteFile {
           lastErr = err;
           if (this.closed) throw new RemoteError('The movie was closed.', { permanent: true });
           if (err.permanent) throw err;
-          if (err.network && ++netFails >= 2) throw await this._explainNetworkFailure(err);
+          if (err.network && ++netFails >= 2) throw err;
         }
       }
       throw lastErr;
@@ -313,7 +307,8 @@ export class RemoteFile {
           /* fall back to a generic message */
         }
         if (!err) err = new Error(`The server answered with an error (${res.status}).`);
-        throw Object.assign(err, { remote: true, status: res.status, permanent: !retry });
+        // `explain` may already know that retrying is pointless (e.g. a quota that is used up).
+        throw Object.assign(err, { remote: true, status: res.status, permanent: err.permanent ?? !retry });
       }
       let data;
       try {
@@ -330,22 +325,6 @@ export class RemoteFile {
       clearTimeout(timer);
       this.abort.signal.removeEventListener('abort', onClose);
     }
-  }
-
-  /** Two network-level failures in a row: ask whether it is something specific (a block, being offline). */
-  async _explainNetworkFailure(err) {
-    let better = null;
-    if (this.diagnose) {
-      try {
-        better = await this.diagnose(err);
-      } catch {
-        /* keep the plain error */
-      }
-    }
-    if (this.closed || !better) return err;
-    Object.assign(better, { remote: true, network: false });
-    if (better.permanent) this.fatal = better;
-    return better;
   }
 
   _netError(err, timedOut) {

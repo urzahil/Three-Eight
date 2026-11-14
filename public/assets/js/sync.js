@@ -20,21 +20,17 @@ function newer(a, b) {
 }
 
 const DRIVE_ID = /^[A-Za-z0-9_-]{10,200}$/;
-const DRIVE_KEY = /^[A-Za-z0-9_-]{0,200}$/;
 
-/** A peer's movie info with its Google Drive reference validated (it ends up in request URLs and headers). */
+/** A peer's movie info with its Google Drive reference validated (it ends up in request URLs). */
 function cleanMovie(movie) {
   if (!movie || typeof movie !== 'object') return movie;
   const d = movie.drive;
   if (d === undefined) return movie;
   const { drive, ...rest } = movie;
-  if (d && typeof d === 'object' && typeof d.id === 'string' && DRIVE_ID.test(d.id) && typeof d.resourceKey === 'string' && DRIVE_KEY.test(d.resourceKey)) {
-    rest.drive = { id: d.id, resourceKey: d.resourceKey };
+  if (d && typeof d === 'object' && typeof d.id === 'string' && DRIVE_ID.test(d.id)) {
+    rest.drive = { id: d.id };
     // The folder the video was listed in (where its subtitle files live); optional.
-    if (typeof d.folder === 'string' && DRIVE_ID.test(d.folder)) {
-      rest.drive.folder = d.folder;
-      rest.drive.folderKey = typeof d.folderKey === 'string' && DRIVE_KEY.test(d.folderKey) ? d.folderKey : '';
-    }
+    if (typeof d.folder === 'string' && DRIVE_ID.test(d.folder)) rest.drive.folder = d.folder;
   }
   return rest;
 }

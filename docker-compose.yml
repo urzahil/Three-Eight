@@ -19,10 +19,17 @@ services:
       TURN_SECRET: ${TURN_SECRET:-}
       TURN_USERNAME: ${TURN_USERNAME:-}
       TURN_PASSWORD: ${TURN_PASSWORD:-}
-      # Optional API key for Google Drive folders in rooms (see README).
-      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+      # Optional Google Drive folders for rooms (see README): path of the service account's JSON key
+      # inside the container. Uncomment the volume below and set
+      # GOOGLE_SERVICE_ACCOUNT=/run/secrets/google-service-account.json in .env.
+      GOOGLE_SERVICE_ACCOUNT: ${GOOGLE_SERVICE_ACCOUNT:-}
+      # Memory for the server's movie cache while streaming from Drive, in MB.
+      DRIVE_CACHE_MB: ${DRIVE_CACHE_MB:-256}
     volumes:
       - three-eight-data:/data
+      # The service account key file downloaded from Google Cloud, mounted read-only. Keep it private:
+      # it can read whatever is shared with that service account.
+      # - ./google-service-account.json:/run/secrets/google-service-account.json:ro
 
 volumes:
   three-eight-data:
