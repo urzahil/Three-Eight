@@ -25,11 +25,11 @@ Video meetups and movie nights with friends, entirely in the browser (Chrome, Fi
 
 Browsers don't let a page switch the audio track of a video file, except Safari. To work around this, Three-Eight includes a small **in-browser remuxer** (`public/assets/js/player/`):
 
-1. It reads the container directly from the local file, in pieces. It supports **MKV/WebM** and **MP4/MOV/M4V**.
+1. It reads the container directly from the file, in pieces: from your device, from a friend's copy, or from the server. It supports **MKV/WebM** and **MP4/MOV/M4V**.
 2. It repackages the video track plus the *selected* audio track into fragmented MP4 on the fly. It then feeds that to the `<video>` element through Media Source Extensions. No re-encoding happens, so CPU use is low.
 3. It extracts embedded text subtitles (SRT, ASS/SSA, WebVTT, MP4 timed text) and draws them over the video. It can also load external `.srt`, `.vtt` and `.ass` files. A loaded subtitle file is sent to everyone in the room automatically.
 
-Simple files with a single audio track play natively.
+Simple files with a single audio track that you open from your device play natively. Films you stream (from a friend or from Google Drive) always go through the remuxer, because their pieces arrive from other browsers.
 
 ### Picture-in-picture
 
@@ -119,49 +119,87 @@ For local testing, `http://localhost:4567` counts as a secure context, so camera
 1. Open `https://three-eight.example.com/admin`, log in with `ADMIN_PASSWORD`, and create a room, for example `movienight`, with a password. The admin page also shows who is online in each room. From there you can change passwords (and optionally kick everyone) or delete rooms. Optionally attach a Google Drive folder to a room (see below).
 2. Send friends `https://three-eight.example.com/movienight` and the password.
 3. Each person enters a display name, which is remembered in the browser's local storage, plus the room password. They can also choose to remember the password on that device.
-4. To watch together, one person clicks **Movie** and picks a file. Everyone else is offered **Stream from <name>'s copy** (and **Stream from Google Drive** when the room has a folder), or can pick their own copy. Use the player controls, the audio (🎧) and subtitle (CC) menus, or keyboard shortcuts: `space` play/pause, `←`/`→` ±10 s (adjustable in Settings), `f` full screen, `p` picture-in-picture, `m` mic, `v` camera, `c` chat.
+4. To watch together, one person clicks **Movie** and picks a film: a file from their device, or one from the room's Google Drive folder. Everyone else gets a button to join in; see [Watching a movie](#watching-a-movie) for the options. Use the player controls, the audio (🎧) and subtitle (CC) menus, or keyboard shortcuts: `space` play/pause, `←`/`→` ±10 s (adjustable in Settings), `f` full screen, `p` picture-in-picture, `m` mic, `v` camera, `c` chat.
 
 Tip: use headphones during the movie, so your microphone doesn't send the film's sound to your friends. Movie volume is per person.
 
-### Watching from a friend's copy
+## Watching a movie
 
-If someone opens a movie file from their device, everyone else in the room can **stream it from their copy**: the film goes browser to browser, nothing passes through the server (the room doesn't need a Google Drive folder). Keep in mind:
+Whatever the source, playback is the same: everyone sees the same moment of the film, and play, pause, seek, audio track and subtitles are shared by the room. There are three ways to have the film in your browser, and people in the same room can use different ones.
 
-- The person sharing sends about one copy of the film in total, however many friends stream it: friends pass pieces on to each other, each uploading roughly its share (measured with three friends: the sharer uploaded about 1.0 × the part of the film they watched, instead of 3 ×). The sharer's connection still has to carry the film's bitrate once, and their copy is the only source: if they leave or close the laptop, friends can keep watching what they already downloaded, and the rest can't be loaded.
-- It works in browsers with Media Source Extensions (Chrome, Edge, Firefox, current Safari). Browsers without them can't stream from a copy and should open their own file.
-- Sharing is automatic while someone has the room's movie loaded from a file. Turn it off in **Settings → Share my movie file with the room**: friends are then not offered the copy, and the file is not served. (Viewers streaming from Drive still pass the pieces they have to their friends.)
+| | Your own copy | A friend's copy | The room's Google Drive folder |
+|---|---|---|---|
+| **You need** | the same file on your device | nothing | nothing (the admin attaches the folder) |
+| **How to start** | **Movie → Choose movie file…**, or **Use my own copy…** when a film is already playing | **Stream from <name>'s copy** | **Movie → From Google Drive**, or **Stream from Google Drive** when a film is already playing |
+| **Where the film comes from** | your disk | the friend's browser, and other friends who already have the pieces | the Three-Eight server (which reads Google Drive), and other friends who already have the pieces |
+| **Upload it costs** | nothing (others may stream from you, see below) | each viewer passes on roughly its share | each viewer passes on roughly its share; the server sends about one copy |
+| **Browsers** | all | with Media Source Extensions (Chrome, Edge, Firefox, current Safari) | all (without Media Source Extensions it plays straight from the server) |
+| **People list shows** | own copy | streaming (from <name>) | streaming (Drive) |
 
-### Google Drive folders
+### Your own copy
 
-An admin can attach one Google Drive folder to a room. Room members can then browse it (including subfolders) and stream a movie straight into the player, or still pick a local copy. Rooms without a folder look the same as before.
+Everyone opens their own copy of the same file, and only play/pause/seek and track choices travel between browsers. This is the original Three-Eight way and the lightest one: nothing is uploaded or downloaded. The page compares file size and name, and warns when someone picks a different file (you can then use it just for yourself, or switch everyone to it). Opening your own copy is always possible, even when friends are streaming, and saves your connection if you have the file anyway.
 
-How it works: the Three-Eight server signs in to Google as a **service account** and reads the folder. Members never contact Google: their browsers fetch folder listings and movie data from the Three-Eight server, which only answers requests that carry a token it handed out when they joined the room (the token is tied to the room, its password and its folder, and expires after 12 hours). Movies are not stored on disk. The server keeps a short-lived cache in memory (`DRIVE_CACHE_MB`) and fetches each part of a film from Google about once, even when several people watch it at the same time.
+### Streaming from a friend's copy
+
+When someone has the room's film open from their device, everyone else is offered **Stream from <name>'s copy** (with several people sharing: **Stream from a friend's copy**). The film goes browser to browser over WebRTC; nothing passes through the server, and the room doesn't need a Google Drive folder.
+
+- **Upload:** the person sharing sends about one copy of the film in total, however many friends stream it. Each piece of the film is fetched from them once by one friend, who passes it on to the others, so every friend uploads roughly its share. (Measured with three friends: the sharer uploaded about 1.0–1.2 × the part of the film they watched, instead of 3 × when everyone downloaded from the sharer.) The sharer's connection still has to carry the film's bitrate about once: 2 Mbps is plenty for a typical 1080p file, a 4K remux needs much more.
+- **When the sharer leaves:** friends keep watching what they already have, and parts nobody has loaded can't be played. They see a message instead of a frozen player.
+- **Opting out:** sharing is automatic while someone has the room's film open from a file. Turn it off in **Settings → Share my movie file with the room**; friends are then not offered your copy, and your file is not read for them.
+- **Browsers:** streaming from a copy needs Media Source Extensions. A browser without them (old iOS) has to open its own file.
+
+### From the room's Google Drive folder
+
+If the admin attached a Google Drive folder to the room ([setup below](#google-drive-folders)), the **Movie** dialog lists it under **From Google Drive**, with its subfolders. Picking a film streams it for you and makes it the room's film; everyone else gets **Stream from Google Drive** (or can still use their own copy).
+
+- The Three-Eight server reads the folder from Google; browsers never contact Google.
+- Viewers share pieces with each other just like with a friend's copy, so the server sends each part of a film about once, however many people watch. If a friend stops answering or leaves, the others fetch the missing pieces from the server instead.
+- A browser without Media Source Extensions (old iOS) plays the film straight from the server and doesn't take part in sharing; that costs the server a full copy for that viewer.
+- If Google temporarily blocks a heavily downloaded file ("download quota exceeded"), people see that message; use a local copy until it clears.
+
+### Mixing sources
+
+People in one room can mix the three: some open their own copy, some stream. Anyone who has the film open from their device is also a source for the others, including for Drive films (when the file sizes match), which takes load off the server. A viewer can switch at any time: open the **Movie** dialog to use their own copy, or **Stop using my file** to go back to streaming.
+
+There are no checksums: files are matched by size (and name), so sharing relies on the same trust as picking a matching file. It's meant for friends.
+
+### Subtitles
+
+Subtitles are shared by the room like the audio track: turning them on or off changes it for everybody (each person can still adjust the subtitle delay in Settings).
+
+- **Subtitle files** (`.srt`, `.vtt`, `.ass`): load one with **CC → Load subtitle file…**. It is sent to everyone in the room, including people who join later, whatever way they watch.
+- **From the Drive folder:** a subtitle file next to the film with a matching name loads automatically for everyone when someone starts the film from Drive. Names like `Arrival.srt`, `Arrival.en.srt` or `Arrival ENG.srt` count; with several matches, the one without a language suffix wins, then the one in the browser's language. The other matching files are listed under **From Google Drive** in the CC menu. Subtitle files of other films in the same folder are not listed there, but you can still pick any file from the **Movie** dialog.
+- **Embedded subtitles** (inside the film file): someone who has the file reads the track from it. People who are streaming receive the extracted subtitle text from them, so it appears for everyone at about the same time. If nobody has loaded the track yet, a streaming viewer reads it from the stream itself (slowly, a little at a time), or, for MKV files that don't index their subtitles, sees a message that it will appear once someone in the room has loaded it. A separate `.srt` next to the film is always the fastest option.
+- **Image-based subtitles** (PGS/VobSub from Blu-ray/DVD rips) aren't supported; use an `.srt` instead.
+
+## Google Drive folders
+
+An admin can attach one Google Drive folder to a room. Rooms without a folder look the same as before.
+
+How it works: the Three-Eight server signs in to Google as a **service account** and reads the folder. Members never contact Google: their browsers fetch folder listings and movie data from the Three-Eight server, which only answers requests that carry a token it handed out when they joined the room (the token is tied to the room, its password and its folder, and expires after 12 hours). It only serves files inside the room's folder (and its subfolders), even though the service account may be able to read more. Movies are not stored on disk. The server keeps a short-lived cache in memory (`DRIVE_CACHE_MB`) and fetches each part of a film from Google about once.
 
 Setup:
 
 1. In the [Google Cloud console](https://console.cloud.google.com/), create a dedicated project. Do **not** attach a billing account.
 2. Enable the **Google Drive API** for that project.
 3. Create a **service account** (*IAM & Admin → Service accounts*). It needs no roles.
-4. Open the service account, go to *Keys → Add key → Create new key → JSON*, and put the downloaded file on the server. Set `GOOGLE_SERVICE_ACCOUNT` to its path and restart. With Docker Compose, save the file next to `docker-compose.yml` as `google-service-account.json`, uncomment the `volumes` line that mounts it (read-only), and add `GOOGLE_SERVICE_ACCOUNT=/run/secrets/google-service-account.json` to `.env`:
+4. Open the service account, go to *Keys → Add key → Create new key → JSON*, and put the downloaded file on the server. Set `GOOGLE_SERVICE_ACCOUNT` to its path (the path of the file, not the service account's email) and restart. With Docker Compose, save the file next to `docker-compose.yml` as `google-service-account.json`, uncomment the `volumes` line that mounts it (read-only), and add `GOOGLE_SERVICE_ACCOUNT=/run/secrets/google-service-account.json` to `.env`:
 
    ```yaml
    volumes:
      - ./google-service-account.json:/run/secrets/google-service-account.json:ro
    ```
 
-5. In Google Drive, share the folder with the service account's email address (it looks like `name@project.iam.gserviceaccount.com`) as **Viewer**. The folder doesn't need to be public.
+5. In Google Drive, share each room's folder with the service account's email address (it looks like `name@project.iam.gserviceaccount.com`) as **Viewer**. One service account serves all rooms; each room only sees its own folder. The folders don't need to be public ("Anyone with the link" can be turned off).
 6. On the admin page, click **Drive…** next to the room and paste the folder link. The dialog shows the email to share with. After saving, the server checks that it can read the folder and tells you.
 
 Notes:
 
-- **Bandwidth:** viewers share film pieces with each other over WebRTC, so the server sends each part of a film about once, however many people watch, and each viewer uploads roughly its share to the others. (Without sharing, for example while only one person is watching, the server sends one copy per viewer.) Google is read about once per film too. The server's upload speed only needs to carry the film's bitrate about once, plus a second when someone seeks to a part nobody has yet. If a friend stops answering, others fetch their pieces from the server instead. A browser without Media Source Extensions (old iOS) plays a Drive film directly from the server and does not take part in sharing, which costs the server a full copy for that viewer.
-- **Security:** keep the key file private (don't commit it; it is in `.gitignore`). It can read whatever is shared with that service account, so share only what you want available. The server only serves files inside a room's folder, to people who joined that room. To revoke access, delete the key in Google Cloud (*Service accounts → Keys*), or stop sharing the folder with the service account.
+- **Bandwidth:** thanks to sharing between viewers, the server's upload only needs to carry the film's bitrate about once, plus a little more when someone seeks to a part nobody has yet. Without sharing (only one person watching, or a browser without Media Source Extensions) it sends one copy per viewer.
+- **Security:** keep the key file private (don't commit it; it is in `.gitignore`). It can read whatever is shared with that service account, so share only what you want available. To revoke access, delete the key in Google Cloud (*Service accounts → Keys*), or stop sharing the folder with the service account.
 - In Docker the server runs as the `node` user, so the mounted key file must be readable by it (for example `chmod 644 google-service-account.json` on a single-user host).
 - If `GOOGLE_SERVICE_ACCOUNT` is set but the file cannot be read, the server logs why and runs with Drive disabled. The admin dialog then says that the variable is not set.
-- Google may temporarily block a heavily downloaded file ("download quota exceeded"). People then see that message; use a local copy until it clears.
-- Embedded subtitles in a streamed film are read only when you select them, one small download at a time, so they load slowly; a separate `.srt`, `.vtt` or `.ass` file next to the movie is much faster. MKV files without a subtitle index can't be read while streaming at all.
-- Embedded subtitles turned on by someone who has the file reach everyone: viewers who are streaming (from Drive or from a friend's copy) receive the extracted subtitle text from that person instead of reading it themselves, and until anyone has it they see a message that it will appear once someone in the room has loaded it.
-- A subtitle file next to the movie with the same name (`Arrival.srt`, `Arrival.en.srt`, ...) loads automatically for everyone when someone starts the movie from Drive. Without an exact match, the file in the browser's language is preferred. Names like `Film.en.srt` or `Film ENG.srt` are recognised. Other subtitle files for the film in its folder are listed under **From Google Drive** in the CC menu.
 
 ## Configuration
 
