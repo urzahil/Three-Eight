@@ -712,7 +712,11 @@ wss.on('connection', (ws, req) => {
         break;
 
       case 'join':
-        handleJoin(ws, msg).catch((err) => console.error('join failed', err));
+        handleJoin(ws, msg).catch((err) => {
+          // Always answer: a client waiting for its welcome would otherwise wait forever.
+          console.error('join failed', err);
+          send(ws, { type: 'error', code: 'server-error', message: 'The server could not add you to the room. Please try again.' });
+        });
         break;
 
       case 'signal': {

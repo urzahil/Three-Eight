@@ -3,6 +3,12 @@
 
 const localNow = () => performance.timeOrigin + performance.now();
 
+// A join attempt that has not been welcomed by then is abandoned and tried again: on mobile networks a
+// socket can die without ever firing 'close', and nothing else would ever end the wait.
+const ATTEMPT_MS = 10000;
+// The first join gives up (and tells the user) after this long without a welcome.
+const JOIN_GIVE_UP_MS = 45000;
+
 export class Signaling extends EventTarget {
   constructor(url) {
     super();
@@ -26,21 +32,49 @@ export class Signaling extends EventTarget {
     this.dispatchEvent(new CustomEvent(type, { detail }));
   }
 
-  /** Connect and join. Resolves with the welcome message, rejects on auth errors. */
+  /**
+   * Connect and join. Resolves with the welcome message; rejects on auth errors, or when the server
+   * could not be reached for JOIN_GIVE_UP_MS. Emits 'retrying' ({attempt}) before each new attempt.
+   */
   join(info) {
     this.joinInfo = info;
     return new Promise((resolve, reject) => {
-      this._pending = { resolve, reject };
+      const giveUp = setTimeout(() => {
+        this._failPending(Object.assign(new Error('Could not connect to the server. Check your connection and try again.'), { code: 'unreachable' }));
+      }, JOIN_GIVE_UP_MS);
+      this._pending = {
+        resolve: (msg) => { clearTimeout(giveUp); resolve(msg); },
+        reject: (err) => { clearTimeout(giveUp); reject(err); },
+      };
       this._open();
     });
   }
 
+  /** The first join failed for good: stop reconnecting and report it. */
+  _failPending(err) {
+    if (!this._pending) return;
+    const { reject } = this._pending;
+    this._pending = null;
+    this.close();
+    reject(err);
+  }
+
   _open() {
     if (this.closed) return;
-    const ws = new WebSocket(this.url);
+    let ws;
+    try {
+      ws = new WebSocket(this.url);
+    } catch (err) {
+      this._failPending(err);
+      return;
+    }
     this.ws = ws;
+    clearTimeout(this._attemptTimer);
+    this._attemptTimer = setTimeout(() => {
+      // No welcome in time (stalled connect, or a socket that died silently): drop it and reconnect.
+      if (this.ws === ws && !this.joined) this._lost(ws);
+    }, ATTEMPT_MS);
     ws.onopen = () => {
-      this.retry = 0;
       this._syncClock(6);
       ws.send(JSON.stringify({ type: 'join', ...this.joinInfo }));
     };
@@ -55,15 +89,37 @@ export class Signaling extends EventTarget {
     };
     ws.onclose = (ev) => {
       if (this.ws !== ws) return;
-      const wasJoined = this.joined;
-      this.joined = false;
-      clearInterval(this._timeTimer);
-      if (this.closed || this._fatal) return;
-      if (ev.code === 4000) return; // replaced by a newer connection of ours
-      if (wasJoined) this._emit('disconnected');
-      const delay = Math.min(15000, 500 * 2 ** this.retry++);
-      setTimeout(() => this._open(), delay);
+      // Replaced by a newer connection of ours (another tab with our id). Only a joined socket can be
+      // replaced; while our first join is still waiting, keep trying rather than wait forever.
+      if (ev.code === 4000 && !this._pending) {
+        this.joined = false;
+        clearInterval(this._timeTimer);
+        clearTimeout(this._attemptTimer);
+        return;
+      }
+      this._lost(ws);
     };
+  }
+
+  /** The connection ws is gone (or given up on): reconnect after a backoff. */
+  _lost(ws) {
+    if (this.ws !== ws || ws._lost) return;
+    ws._lost = true;
+    ws.onopen = ws.onmessage = ws.onclose = null;
+    try {
+      ws.close();
+    } catch {
+      /* ignore */
+    }
+    const wasJoined = this.joined;
+    this.joined = false;
+    clearInterval(this._timeTimer);
+    clearTimeout(this._attemptTimer);
+    if (this.closed || this._fatal) return;
+    if (wasJoined) this._emit('disconnected');
+    const delay = Math.min(15000, 500 * 2 ** this.retry++);
+    this._emit('retrying', { attempt: this.retry, delay });
+    setTimeout(() => this._open(), delay);
   }
 
   _handle(msg) {
@@ -79,6 +135,8 @@ export class Signaling extends EventTarget {
       }
       case 'welcome':
         this.joined = true;
+        this.retry = 0;
+        clearTimeout(this._attemptTimer);
         this.id = msg.id;
         clearInterval(this._timeTimer);
         this._timeTimer = setInterval(() => this._syncClock(1), 20000);
@@ -88,7 +146,7 @@ export class Signaling extends EventTarget {
         } else this._emit('reconnected', msg);
         break;
       case 'error':
-        if (['bad-password', 'no-room', 'room-full', 'rate-limited', 'room-deleted', 'kicked', 'bad-request'].includes(msg.code)) {
+        if (['bad-password', 'no-room', 'room-full', 'rate-limited', 'room-deleted', 'kicked', 'bad-request', 'server-error'].includes(msg.code)) {
           this._fatal = true;
           if (this._pending) {
             this._pending.reject(Object.assign(new Error(msg.message), { code: msg.code }));
@@ -141,6 +199,7 @@ export class Signaling extends EventTarget {
   close() {
     this.closed = true;
     clearInterval(this._timeTimer);
+    clearTimeout(this._attemptTimer);
     try {
       this.send({ type: 'leave' });
       this.ws?.close();

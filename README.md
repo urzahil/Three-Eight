@@ -87,6 +87,7 @@ three-eight.example.com {
 ```nginx
 server {
     listen 443 ssl http2;
+    listen [::]:443 ssl http2;   # mobile networks often connect over IPv6
     server_name three-eight.example.com;
     # ssl_certificate ...; ssl_certificate_key ...;
 
@@ -104,6 +105,8 @@ server {
 ```
 
 With `TRUST_PROXY=true` (the compose default), the server takes the client IP from `X-Forwarded-For`, which is used for login rate limiting. It also marks the admin cookie `Secure`. If you publish port 4567 directly to the internet without a proxy, set `TRUST_PROXY=false`, or bind the port to localhost only (`"127.0.0.1:4567:4567"`).
+
+**Works on Wi-Fi but not on mobile data?** If the lobby says *Can’t reach the server, retrying…* and then *Could not connect to the server*, the page loaded but the WebSocket (`/ws`) did not get through. Mobile networks (4G/5G) usually connect over IPv6. If your domain has an `AAAA` record, the proxy must forward WebSockets on its IPv6 listener too. Test with `curl -6 -i -N -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' https://three-eight.example.com/ws`, which should answer `101 Switching Protocols`. If you get into the room but a friend's tile stays on *connecting…* / *connection failed*, the problem is the carrier's NAT instead; see [Do I need TURN?](#do-i-need-turn).
 
 ### Without Docker
 
