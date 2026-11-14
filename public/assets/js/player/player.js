@@ -219,6 +219,7 @@ export class MoviePlayer extends EventTarget {
     this.video.load();
     this.file?.close?.(); // remote files: stop downloading
     this.file = null;
+    this._emit('unload');
     this.demux = null;
     this.mode = null;
     for (const [id, s] of this.subtitles) if (s.source === 'embedded') this.subtitles.delete(id);
@@ -233,7 +234,7 @@ export class MoviePlayer extends EventTarget {
     this.file = file;
     this.triedModes = new Set();
     this.diagnosed = false;
-    this._emit('status', { text: file.remote ? 'Connecting to Google Drive…' : 'Reading file…' });
+    this._emit('status', { text: file.peerOnly ? 'Connecting to your friend…' : file.remote ? 'Connecting to Google Drive…' : 'Reading file…' });
     const demux = await openDemuxer(file);
     if (token !== this._loadToken) return;
     this.demux = demux;
@@ -254,7 +255,15 @@ export class MoviePlayer extends EventTarget {
     const needSwitching = audio.length > 1 && !this.nativeAudioApi;
     let mode = 'native';
     if (mseOk && (!nativeOk || needSwitching)) mode = 'mse';
-    if (file.remote && !file.nativeUrl) {
+    if (file.swarm && mseOk) {
+      // Pieces that come from friends can't feed a <video src>: the remuxer reads them through the swarm.
+      mode = 'mse';
+    } else if (file.swarm && file.peerOnly) {
+      throw Object.assign(new Error('This browser can’t stream a movie from a friend’s copy. Use your own copy of the file instead.'), { remote: true, permanent: true });
+    } else if (file.swarm) {
+      // No MSE (old iOS): a Drive film plays natively from our server, without sharing.
+      file.swarm.dispose();
+    } else if (file.remote && !file.nativeUrl) {
       // The <video> element can't send the headers this file needs, so only our own reader can fetch it.
       if (!mseOk) throw new Error('This file can only be streamed with the built-in player, which your browser cannot use for it.');
       mode = 'mse';

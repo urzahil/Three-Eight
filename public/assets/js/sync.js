@@ -289,6 +289,8 @@ export class MovieSync extends EventTarget {
     return {
       file: this.localFile && { name: this.localFile.name, size: this.localFile.size, duration: this.localFile.duration },
       matches: this.fileMatches,
+      // where the file comes from: our device, Google Drive or friends' copies (through the swarm)
+      src: !p.file?.remote ? 'file' : p.file.peerOnly ? 'peers' : 'drive',
       buffering: this.fileMatches && p.loaded && !this.state.paused && p.video.readyState < 3,
     };
   }
@@ -324,6 +326,7 @@ export class MovieSync extends EventTarget {
         this.peerStatus.set(peer.id, {
           file: msg.file && typeof msg.file === 'object' ? { name: String(msg.file.name || ''), size: Number(msg.file.size) || 0, duration: Number(msg.file.duration) || 0 } : null,
           matches: !!msg.matches,
+          src: msg.src === 'drive' || msg.src === 'peers' ? msg.src : 'file',
           buffering: !!msg.buffering,
         });
         this._emit('status');

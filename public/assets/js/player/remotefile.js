@@ -29,7 +29,8 @@ export class RemoteFile {
    * @param {string|null} [o.nativeUrl]  URL a <video> element can play directly
    * @param {string} [o.url]  where to send Range requests (with the default `request`)
    * @param {() => object} [o.headers]  extra request headers, evaluated per request
-   * @param {(start, endInclusive, signal) => Promise<Response>} [o.request]  replaces the default fetch
+   * @param {(start, endInclusive, signal, opts: {small: boolean}) => Promise<Response>} [o.request]  replaces the default fetch
+   *   (`small` marks a polite read of a few blocks, e.g. an embedded subtitle: not worth fetching extra data for)
    * @param {(res: Response) => Promise<Error>} [o.explain]  turns an error response into an Error
    * @param {(err: Error) => Error} [o.networkError]  rewords a failed fetch
    */
@@ -50,7 +51,7 @@ export class RemoteFile {
     this.explain = o.explain || null;
     this.networkError = o.networkError || null;
     this.prefetching = false;
-    this.request = o.request || ((start, end, signal) => fetch(o.url, { headers: { ...(o.headers ? o.headers() : {}), Range: `bytes=${start}-${end}` }, signal }));
+    this.request = o.request || ((start, end, signal, _opts) => fetch(o.url, { headers: { ...(o.headers ? o.headers() : {}), Range: `bytes=${start}-${end}` }, signal }));
     this.blocks = new Map(); // index -> Uint8Array; Map order = LRU order (oldest first)
     this.cached = 0;
     this.pending = new Map(); // index -> Promise<Uint8Array> of in-flight downloads
@@ -171,15 +172,15 @@ export class RemoteFile {
       // this run, if any, is already cached or in flight, so the loop stops there).
       let b = rb;
       while (b - a + 1 < wantBlocks && b < lastBlock && !this.blocks.has(b + 1) && !this.pending.has(b + 1)) b++;
-      const promises = this._download(a, b);
+      const promises = this._download(a, b, small);
       for (let i = a; i <= rb; i++) out[i - first] = promises[i - a];
     }
     return out;
   }
 
   /** Start downloading blocks a..b with a single request; returns one promise per block. */
-  _download(a, b) {
-    const run = this._fetchRun(a, b).then((blocks) => {
+  _download(a, b, small = false) {
+    const run = this._fetchRun(a, b, small).then((blocks) => {
       blocks.forEach((blk, k) => this._store(a + k, blk));
       return blocks;
     });
@@ -209,6 +210,52 @@ export class RemoteFile {
       this.blocks.delete(k);
       this.cached -= v.length;
     }
+  }
+
+  // ---- sharing with other viewers (see swarm.js): the block cache doubles as the piece store ------
+  /** Are all blocks of [start, end) cached? */
+  isCached(start, end) {
+    const bs = this.blockSize;
+    for (let i = Math.floor(start / bs); i <= Math.floor((end - 1) / bs); i++) if (!this.blocks.has(i)) return false;
+    return end > start;
+  }
+
+  /** The bytes of [start, end) if every block is cached, else null. Does not refresh the LRU order. */
+  peek(start, end) {
+    if (this.closed || !this.isCached(start, end)) return null;
+    const bs = this.blockSize;
+    const out = new Uint8Array(end - start);
+    for (let i = Math.floor(start / bs); i <= Math.floor((end - 1) / bs); i++) {
+      const blk = this.blocks.get(i);
+      const from = Math.max(start, i * bs);
+      const to = Math.min(end, i * bs + blk.length);
+      out.set(blk.subarray(from - i * bs, to - i * bs), from - start);
+    }
+    return out;
+  }
+
+  /** Put bytes that arrived some other way (from a friend) into the cache. `start` must be block aligned. */
+  inject(start, data) {
+    const bs = this.blockSize;
+    if (this.closed || start % bs !== 0) return;
+    for (let o = 0; o < data.length; o += bs) {
+      const index = (start + o) / bs;
+      if (!this.blocks.has(index)) this._store(index, data.slice(o, o + bs));
+    }
+  }
+
+  /** Runs [first, last] of pieces (of `pieceSize` bytes, a multiple of the block size) that are completely cached. */
+  cachedPieces(pieceSize) {
+    const out = [];
+    const n = Math.ceil(this.size / pieceSize);
+    let run = null;
+    for (let p = 0; p < n; p++) {
+      if (this.isCached(p * pieceSize, Math.min(this.size, (p + 1) * pieceSize))) {
+        if (run) run[1] = p;
+        else out.push((run = [p, p]));
+      } else run = null;
+    }
+    return out;
   }
 
   /**
@@ -247,7 +294,7 @@ export class RemoteFile {
   }
 
   /** Download blocks a..b (inclusive) with one Range request, retrying transient failures. */
-  async _fetchRun(a, b) {
+  async _fetchRun(a, b, small = false) {
     await this._slot();
     try {
       let lastErr;
@@ -261,7 +308,7 @@ export class RemoteFile {
           if (this.closed) throw new RemoteError('The movie was closed.', { permanent: true });
         }
         try {
-          return await this._attempt(a, b);
+          return await this._attempt(a, b, small);
         } catch (err) {
           lastErr = err;
           if (this.closed) throw new RemoteError('The movie was closed.', { permanent: true });
@@ -275,7 +322,7 @@ export class RemoteFile {
     }
   }
 
-  async _attempt(a, b) {
+  async _attempt(a, b, small = false) {
     const bs = this.blockSize;
     const start = a * bs;
     const end = Math.min(this.size, (b + 1) * bs); // exclusive
@@ -289,7 +336,7 @@ export class RemoteFile {
     try {
       let res;
       try {
-        res = await this.request(start, end - 1, ctrl.signal);
+        res = await this.request(start, end - 1, ctrl.signal, { small });
       } catch (err) {
         throw this._netError(err, timedOut);
       }

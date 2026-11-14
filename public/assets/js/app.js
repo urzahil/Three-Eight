@@ -5,6 +5,7 @@ import { MoviePlayer } from './player/player.js';
 import { CompactPip } from './player/compactpip.js';
 import { LocalMedia, watchLevel, audioContext } from './media.js';
 import { DriveClient, pickSubtitle, subtitleMatches } from './drive.js';
+import { Swarm } from './player/swarm.js';
 
 // While the movie is in a Document Picture-in-Picture window, its controls live in that document.
 let pipWindow = null;
@@ -265,6 +266,23 @@ class Room {
     this.player = new MoviePlayer($('movie'), $('subs-layer'));
     this.player.video.volume = store.get('movieVolume', 1);
     this.sync = new MovieSync({ mesh: this.mesh, signaling, player: this.player, selfId: id });
+    // Film pieces are shared between the viewers (and a local copy can feed friends who have none).
+    this.swarm = new Swarm(this.mesh, { selfId: id, share: store.get('shareFile', true) !== false });
+    this._holderSig = '';
+    this.swarm.addEventListener('change', () => {
+      this._renderPeople();
+      // The overlay offers copies by name: redraw it only when that list changes (not on every cache update).
+      const m = this.sync.state.movie;
+      const sig = m ? this.swarm.holders(m).join(',') : '';
+      if (sig !== this._holderSig) {
+        this._holderSig = sig;
+        this._renderStage();
+        if ($('movie-dialog').open) this._renderMovieDialog();
+      }
+    });
+    this.player.addEventListener('unload', () => {
+      if (this.swarm.film?.local) this.swarm.closeFilm(); // a streamed film closes with its RemoteFile
+    });
     this.drive = null; // DriveClient when the admin attached a Google Drive folder to this room
     this.driveFolder = '';
     this._driveToken = 0;
@@ -573,7 +591,7 @@ class Room {
       if (movie) {
         const st = id === this.id ? { file: this.sync.localFile, matches: this.sync.fileMatches } : this.sync.peerStatus.get(id);
         const small = document.createElement('small');
-        small.textContent = !st || !st.file ? 'no movie file loaded' : st.matches ? (st.buffering ? 'loading…' : 'ready to watch') : 'different file';
+        small.textContent = !st || !st.file ? 'no movie file loaded' : st.matches ? (st.buffering ? 'loading…' : this._sourceText(id, st.src)) : 'different file';
         who.append(small);
       }
       const mic = icon(p.audio ? 'mic' : 'mic-off');
@@ -583,6 +601,17 @@ class Room {
       li.append(av, who, mic, cam);
       return li;
     }));
+  }
+
+  /** "own copy", "streaming (Drive)" or "streaming (from Alice)" for someone whose movie file is loaded and matches. */
+  _sourceText(id, src) {
+    if (id === this.id) src = !this.player.file?.remote ? 'file' : this.player.file.peerOnly ? 'peers' : 'drive';
+    if (src === 'drive') return 'streaming (Drive)';
+    if (src === 'peers') {
+      const holders = this.sync.state.movie ? this.swarm.holders(this.sync.state.movie).filter((h) => h !== id) : [];
+      return holders.length === 1 ? `streaming (from ${this.profileOf(holders[0]).name})` : 'streaming (from friends)';
+    }
+    return 'own copy';
   }
 
   // ---- chat --------------------------------------------------------------------------
@@ -794,16 +823,19 @@ class Room {
     const drive = !!this.drive;
     $('movie-dialog-current').hidden = !has && !s.movie;
     $('movie-unload').hidden = !has;
+    const share = 'The film is never stored on the server; only play/pause/seek and track choices are shared.';
     if (s.movie && !has) {
-      $('movie-dialog-text').textContent = drive
-        ? `Everyone is watching “${s.movie.name}” (${fmtSize(s.movie.size)}). Stream it from Google Drive, or choose your own copy of the same file — nothing gets uploaded.`
-        : `Everyone is watching “${s.movie.name}” (${fmtSize(s.movie.size)}). Choose your copy of the same file — nothing gets uploaded.`;
+      const friends = this.swarm.holders(s.movie);
+      const ways = [];
+      if (friends.length) ways.push(friends.length === 1 ? `${this.profileOf(friends[0]).name}’s copy` : 'a friend’s copy');
+      if (drive && s.movie.drive) ways.push('Google Drive');
+      $('movie-dialog-text').textContent = `Everyone is watching “${s.movie.name}” (${fmtSize(s.movie.size)}). ${ways.length ? `Stream it from ${ways.join(' or ')}, or choose your own copy of the same file.` : 'Choose your own copy of the same file.'}`;
     } else if (has) {
-      $('movie-dialog-text').textContent = `You're watching “${has.name}”. Pick another file to switch, or stop.`;
+      $('movie-dialog-text').textContent = `You're watching “${has.name}”. Pick another file to switch, or stop. Friends without the file can stream it from your copy (turn this off in Settings).`;
     } else if (drive) {
-      $('movie-dialog-text').textContent = 'Pick a movie from the room’s Google Drive folder, or choose a file on your device. Nothing is uploaded — only play/pause/seek and track choices are shared.';
+      $('movie-dialog-text').textContent = `Pick a movie from the room’s Google Drive folder, or choose a file on your device. ${share}`;
     } else {
-      $('movie-dialog-text').textContent = 'Everyone needs their own copy of the movie file. Nothing is uploaded — only play/pause/seek and track choices are shared.';
+      $('movie-dialog-text').textContent = `Choose a movie file on your device. Friends who don’t have it can stream it from your copy. ${share}`;
     }
   }
 
@@ -972,7 +1004,7 @@ class Room {
     let file;
     try {
       const folder = this.driveTrail[this.driveTrail.length - 1].id;
-      file = this.drive.remoteFile({ ...f, folder });
+      file = this.drive.remoteFile({ ...f, folder }, this.swarm);
     } catch (err) {
       toast(err.message, 'warn');
       return;
@@ -1031,12 +1063,19 @@ class Room {
     }
   }
 
-  /** The room's movie is on Drive and we can reach it: stream it with one click (a user gesture). */
+  /**
+   * Stream the room's movie with one click (a user gesture): from Google Drive and/or friends' copies. Both
+   * read through the swarm, which prefers friends who have the whole file and uses Drive for the rest.
+   */
   _streamRoomMovie() {
     const m = this.sync.state.movie;
-    if (!this.drive || !m?.drive) return;
+    if (!m || !(m.size > 0)) return;
     try {
-      this.chooseMovieFile(this.drive.remoteFile({ id: m.drive.id, name: String(m.name || 'Movie'), size: Number(m.size), folder: m.drive.folder }));
+      if (this.drive && m.drive) {
+        this.chooseMovieFile(this.drive.remoteFile({ id: m.drive.id, name: String(m.name || 'Movie'), size: Number(m.size), folder: m.drive.folder }, this.swarm));
+      } else {
+        this.chooseMovieFile(this.swarm.openRemote({ name: String(m.name || 'Movie'), size: Number(m.size) }));
+      }
     } catch (err) {
       toast(err.message, 'warn');
     }
@@ -1054,11 +1093,16 @@ class Room {
         d.returnValue = 'cancel';
         d.showModal();
       });
-      if (choice === 'cancel') return;
+      if (choice === 'cancel') {
+        file.close?.(); // a streamed file stops sharing
+        return;
+      }
       asRoom = choice === 'room';
     }
     this.loadingMovie = true;
     this.loadingRemote = !!file.remote;
+    this.loadingPeers = !!file.peerOnly;
+    file.swarm?.activate();
     this._renderStage();
     try {
       await this.player.load(file, { audioIndex: asRoom ? 0 : s.audio });
@@ -1087,6 +1131,7 @@ class Room {
     }
     const info = { name: file.name, size: file.size, duration: Math.round(this.player.duration * 10) / 10 };
     if (file.drive) info.drive = { ...file.drive };
+    if (!file.remote) this.swarm.openLocal(file); // a copy on this device can feed friends who have none
     this.sync.setLocalFile(info, asRoom);
     if (asRoom && file.drive?.folder) this._autoDriveSubtitle(file); // in the background: never holds up playback
     if (asRoom) this.mesh.broadcast({ type: 'chat', msg: { id: randomId(), from: this.id, name: this.name, text: `🎬 Started a movie: ${file.name}`, ts: this.signaling.now() } });
@@ -1108,20 +1153,35 @@ class Room {
     ov.replaceChildren();
     let overlay = null;
     if (this.loadingMovie) {
-      overlay = this._overlay('Opening movie…', this.loadingRemote ? 'Connecting to Google Drive…' : 'Reading the file on your device.', 'Cancel', () => {
+      overlay = this._overlay('Opening movie…', this.loadingPeers ? 'Connecting to your friend…' : this.loadingRemote ? 'Connecting to Google Drive…' : 'Reading the file on your device.', 'Cancel', () => {
         this.loadingMovie = false;
         this.player.unload();
         this._renderStage();
       });
     } else if (s.movie && !this.sync.localFile) {
       const fromDrive = !!(this.drive && s.movie.drive && s.movie.size > 0);
-      overlay = this._overlay(
-        `“${s.movie.name}”`,
-        `${fmtSize(s.movie.size)}${s.movie.duration ? ' · ' + fmtTime(s.movie.duration) : ''}. ${fromDrive ? 'Stream it from Google Drive, or use your own copy of this file, to join in.' : 'Choose your copy of this file to join in.'} ${s.paused ? '' : 'The movie is already playing — you will jump right in.'}`,
-        fromDrive ? 'Stream from Google Drive' : 'Choose file…',
-        fromDrive ? () => this._streamRoomMovie() : () => $('movie-file').click(),
-        fromDrive ? { label: 'Use my own copy…', onClick: () => $('movie-file').click() } : null,
-      );
+      const friends = s.movie.size > 0 ? this.swarm.holders(s.movie) : [];
+      const own = { label: 'Use my own copy…', onClick: () => $('movie-file').click() };
+      const stream = () => this._streamRoomMovie();
+      let title = `“${s.movie.name}”`;
+      let text = `${fmtSize(s.movie.size)}${s.movie.duration ? ' · ' + fmtTime(s.movie.duration) : ''}. `;
+      let button;
+      let others = [own];
+      if (friends.length) {
+        const from = friends.length === 1 ? `${this.profileOf(friends[0]).name}'s copy` : "a friend's copy";
+        button = `Stream from ${from}`;
+        if (fromDrive) others = [{ label: 'Stream from Google Drive', onClick: stream }, own];
+        text += `Stream it from ${from}${fromDrive ? ' or Google Drive' : ''}, or use your own copy of this file, to join in.`;
+      } else if (fromDrive) {
+        button = 'Stream from Google Drive';
+        text += 'Stream it from Google Drive, or use your own copy of this file, to join in.';
+      } else {
+        button = 'Choose file…';
+        text += 'Choose your copy of this file to join in.';
+        others = [];
+      }
+      if (!s.paused) text += ' The movie is already playing — you will jump right in.';
+      overlay = this._overlay(title, text, button, friends.length || fromDrive ? stream : () => $('movie-file').click(), others);
     } else if (!s.movie && this.sync.localFile) {
       overlay = this._overlay('Movie closed', 'The movie was closed for everyone.', 'OK', () => {
         this.player.unload();
@@ -1152,11 +1212,11 @@ class Room {
     b.textContent = button;
     b.onclick = onClick;
     wrap.append(h, p, b);
-    if (second) {
+    for (const sec of [].concat(second || [])) {
       const b2 = document.createElement('button');
       b2.className = 'btn secondary';
-      b2.textContent = second.label;
-      b2.onclick = second.onClick;
+      b2.textContent = sec.label;
+      b2.onclick = sec.onClick;
       wrap.append(b2);
     }
     return wrap;
@@ -1356,7 +1416,7 @@ class Room {
     const who = this.profileOf(peer.id).name;
     const by = state.by === peer.id ? who : this.profileOf(state.by).name;
     if (!sameMovie(prev.movie, state.movie)) {
-      if (state.movie) toast(`${by} started “${state.movie.name}”. ${this.drive && state.movie.drive ? 'Stream it from Google Drive' : 'Open your copy'} to watch along.`);
+      if (state.movie) toast(`${by} started “${state.movie.name}”. ${this.drive && state.movie.drive ? 'Stream it from Google Drive' : state.movie.size > 0 && state.by === peer.id ? `Stream it from ${who}'s copy` : 'Open your copy'} to watch along.`);
       else toast(`${by} closed the movie.`);
       return;
     }
@@ -1411,6 +1471,11 @@ class Room {
     $('set-lowband').checked = store.get('lowBandwidth', false);
     this.mesh.setLowPower($('set-lowband').checked);
     $('set-noise').checked = this.media.processing;
+    $('set-share').checked = this.swarm.share;
+    $('set-share').onchange = (e) => {
+      this.swarm.setShare(e.target.checked);
+      store.set('shareFile', e.target.checked);
+    };
 
     $('set-audio-dev').onchange = (e) => this._changeDevice('audio', e.target.value);
     $('set-video-dev').onchange = (e) => this._changeDevice('video', e.target.value);
@@ -1734,6 +1799,7 @@ class Room {
     this.closePip();
     this.sync.destroy();
     this.player.unload();
+    this.swarm.destroy();
     this.mesh.close();
     this.media.stop();
     this.signaling.close();

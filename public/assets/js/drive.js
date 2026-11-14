@@ -140,21 +140,38 @@ export class DriveClient {
     return { id: f.id, name: f.name };
   }
 
-  /** A Blob-like object the player can read with Range requests. */
-  remoteFile(file) {
+  /** One Range request to our server for the file with this ID (`end` inclusive). */
+  _range(id, start, end, signal) {
+    return fetch(`${this.base}/files/${checkId(id)}`, { headers: { ...this._headers(), Range: `bytes=${start}-${end}` }, signal });
+  }
+
+  /**
+   * A Blob-like object the player can read with Range requests. With a `swarm` (swarm.js) the other viewers
+   * of the room provide pieces too, and our server is asked only for what nobody else has.
+   */
+  remoteFile(file, swarm = null) {
     if (!(file.size > 0)) throw new Error('The size of this file is not known.');
     const url = `${this.base}/files/${checkId(file.id)}`;
-    const rf = new RemoteFile({
+    const common = {
       name: file.name,
       size: file.size,
       nativeUrl: `${url}?t=${encodeURIComponent(this.token)}`, // a <video> element cannot send headers
-      url,
-      headers: () => this._headers(), // read per request, so a refreshed token is used
       explain: serverError,
       networkError,
       retries: 2,
-    });
-    rf.drive = { id: file.id, folder: file.folder || '' };
+    };
+    const drive = { id: file.id, folder: file.folder || '' };
+    let rf;
+    if (swarm) {
+      rf = swarm.openRemote({ ...common, drive, server: (start, end, signal) => this._range(file.id, start, end, signal) });
+    } else {
+      rf = new RemoteFile({
+        ...common,
+        url,
+        headers: () => this._headers(), // read per request, so a refreshed token is used
+      });
+    }
+    rf.drive = drive;
     return rf;
   }
 

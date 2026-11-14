@@ -17,9 +17,10 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const stamp = Date.now().toString(36);
 const ROOM = 'drive-' + stamp;
 const PLAIN = 'plain-' + stamp;
+const SWARM = 'swarm-' + stamp;
 
 // ---- the fake Drive (served by fake-google.js to the real server) ---------------------------------------
-const ID = { root: 'ROOTFOLDER_0001', sub: 'SUBFOLDER_00002', mkv: 'MKVFILE_0000003', mp4: 'MP4FILE_0000004', srt: 'SRTFILE_0000005', txt: 'TXTFILE_0000006', srtIt: 'SRTIT_00000007', other: 'SRTOTHER_00008' };
+const ID = { root: 'ROOTFOLDER_0001', sub: 'SUBFOLDER_00002', mkv: 'MKVFILE_0000003', mp4: 'MP4FILE_0000004', srt: 'SRTFILE_0000005', txt: 'TXTFILE_0000006', srtIt: 'SRTIT_00000007', other: 'SRTOTHER_00008', bigFolder: 'BIGFOLDER_00009', big: 'BIGMKV_0000010' };
 const read = (f) => fs.readFileSync(path.join(FIX, f));
 const DATA = { [ID.mkv]: read('multi.mkv'), [ID.mp4]: read('single.mp4'), [ID.srt]: read('subs_en.srt'), [ID.txt]: Buffer.from('hi'),
   [ID.srtIt]: Buffer.from('1\n00:00:20,000 --> 00:00:25,000\nVentesimo secondo\n'), [ID.other]: Buffer.from('1\n00:00:01,000 --> 00:00:02,000\nUnrelated\n') };
@@ -33,6 +34,8 @@ function fillFakeGoogle(g) {
   g.addFile(ID.srt, 'multi.srt', ID.sub, DATA[ID.srt], 'application/x-subrip');
   g.addFile(ID.srtIt, 'multi.it.srt', ID.sub, DATA[ID.srtIt], 'application/x-subrip');
   g.addFile(ID.other, 'subs_en.srt', ID.sub, DATA[ID.other], 'application/x-subrip');
+  g.addFolder(ID.bigFolder, 'Big Movies'); // a film of about 55 pieces for the swarm test, in a room of its own
+  g.addFile(ID.big, 'big.mkv', ID.bigFolder, DATA[ID.big], 'video/x-matroska', 40000);
   g.mode.pageLimit = 2; // listings come in several pages
 }
 
@@ -96,6 +99,11 @@ async function adminApi(base) {
     execFileSync('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', '-i', path.join(FIX, 'multi.mp4'), '-map', '0:v', '-map', '0:a:0', '-c', 'copy', '-movflags', '+faststart', path.join(FIX, 'single.mp4')]);
   }
   Object.assign(DATA, { [ID.mp4]: read('single.mp4') });
+  if (!fs.existsSync(path.join(FIX, 'big.mkv'))) {
+    // Noisy video, about 60 MB for 160 s: longer than the 40 s the player buffers ahead, so seeking reaches pieces nobody has.
+    execFileSync('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', '-f', 'lavfi', '-i', 'testsrc2=size=640x360:rate=24:duration=160', '-f', 'lavfi', '-i', 'sine=frequency=440:duration=160', '-vf', 'noise=alls=60:allf=t+u', '-c:v', 'libx264', '-preset', 'veryfast', '-b:v', '3M', '-g', '48', '-c:a', 'aac', '-metadata:s:a:0', 'language=eng', path.join(FIX, 'big.mkv')]);
+  }
+  DATA[ID.big] = read('big.mkv');
 
   const google = await startFakeGoogle();
   fillFakeGoogle(google);
@@ -110,17 +118,19 @@ async function adminApi(base) {
   try {
     // --- admin: rooms, one with a Drive folder (the link may carry a resource key: it is ignored)
     const api = await adminApi(BASE);
-    for (const name of [ROOM, PLAIN]) assert.equal((await api('POST', '/api/admin/rooms', { name, password: 'secret' })).status, 201);
+    for (const name of [ROOM, PLAIN, SWARM]) assert.equal((await api('POST', '/api/admin/rooms', { name, password: 'secret' })).status, 201);
     const set = await api('PUT', `/api/admin/rooms/${ROOM}/drive`, { link: `https://drive.google.com/drive/folders/${ID.root}?resourcekey=ignored-1` });
     assert.equal(set.status, 200, JSON.stringify(set.body));
     assert.deepStrictEqual(set.body.check, { name: 'Movie Night Folder', items: 1 }, 'the admin check lists the folder (the subfolder; notes.txt is skipped)');
     assert.equal((await api('GET', '/api/admin/rooms')).body.serviceAccount, google.email);
     console.log('admin: room with a Drive folder created, check:', JSON.stringify(set.body.check));
 
+    assert.equal((await api('PUT', `/api/admin/rooms/${SWARM}/drive`, { link: ID.bigFolder })).status, 200);
     const served = [];
     const googleAttempts = []; // anything the browsers try to fetch from Google (must stay empty)
-    async function join(room, name, { viewport } = {}) {
+    async function join(room, name, { viewport, noMse = false } = {}) {
       const ctx = await browser.newContext({ permissions: ['camera', 'microphone'], viewport });
+      if (noMse) await ctx.addInitScript(() => { delete window.MediaSource; delete window.ManagedMediaSource; });
       const stats = { requests: [], server: [] };
       await ctx.route(/googleapis\.com|googleusercontent\.com|drive\.google\.com|accounts\.google\.com|gstatic\.com/, (route) => {
         googleAttempts.push(route.request().url());
@@ -159,7 +169,8 @@ async function adminApi(base) {
       const P = await join(PLAIN, 'Pat');
       await openDialog(P.page);
       assert(await P.page.locator('#drive-section').isHidden(), 'no Drive section without a folder');
-      assert.match(await P.page.textContent('#movie-dialog-text'), /own copy/);
+      assert.match(await P.page.textContent('#movie-dialog-text'), /stream it from your copy/);
+      assert.doesNotMatch(await P.page.textContent('#movie-dialog-text'), /everyone needs/i);
       assert.strictEqual(await P.page.evaluate(() => room.drive), null);
       await sleep(300);
       assert.strictEqual(P.stats.requests.length, 0, 'no Drive requests in a room without a folder');
@@ -318,7 +329,7 @@ async function adminApi(base) {
     await alice.keyboard.press('Escape');
     console.log('subtitles from Drive: auto-loaded, listed in the CC menu, switchable');
 
-    // --- native path: an MP4 whose <video> streams straight from Drive
+    // --- an MP4 from Drive: a swarm film always plays through the remuxer (pieces from friends can't feed a <video src>)
     await openDialog(bob);
     await bob.waitForSelector('#drive-section:not([hidden])');
     await waitFor(bob, () => document.querySelectorAll('#drive-list .drive-item').length > 0);
@@ -329,13 +340,7 @@ async function adminApi(base) {
     assert.match(await bob.textContent('#mismatch-text'), /multi\.mkv.*single\.mp4/);
     await bob.click('#mismatch-dialog button[value=room]');
     await waitFor(bob, () => document.getElementById('movie').readyState >= 2 && room.player.file?.name === 'single.mp4');
-    assert.strictEqual(await bob.evaluate(() => room.player.mode), 'native');
-    await sleep(2500);
-    const fetches = (S) => S.requests.filter((r) => r.path.endsWith('/files/' + ID.mp4) && r.type === 'fetch').length;
-    const fetchesAfterOpen = fetches(B.stats);
-    console.log('MEASURE mp4 native after open + 2.5s: fetch', fetchesAfterOpen, 'media', B.stats.requests.filter((r) => r.path.endsWith('/files/' + ID.mp4) && r.type === 'media').length);
-    assert(fetchesAfterOpen <= 3, `opening the MP4 should take a handful of fetches, took ${fetchesAfterOpen}`);
-    assert((await bob.evaluate(() => document.getElementById('movie').currentSrc)).startsWith(`${BASE}/api/rooms/${ROOM}/drive/files/${ID.mp4}?t=`), 'native <video> streams from our server');
+    assert.strictEqual(await bob.evaluate(() => room.player.mode), 'mse', 'swarm films use MSE');
     await waitFor(alice, () => room.sync.state.movie?.name === 'single.mp4');
     // Alice still holds the MKV (a different file): she switches by streaming the MP4 too
     await openDialog(alice);
@@ -345,17 +350,17 @@ async function adminApi(base) {
     assert(await item(alice, 'single.mp4').evaluate((e) => e.classList.contains('current')), 'new room movie highlighted');
     await item(alice, 'single.mp4').click();
     await waitFor(alice, () => document.getElementById('movie').readyState >= 2 && room.player.file?.name === 'single.mp4');
-    assert.strictEqual(await alice.evaluate(() => room.player.mode), 'native');
+    assert.strictEqual(await alice.evaluate(() => room.player.mode), 'mse');
     await waitFor(alice, () => /Everyone ready/.test(document.getElementById('m-ready').textContent));
     await ctl(alice, '#m-play');
     await sleep(3500);
     a = await state(alice); b = await state(bob);
-    console.log('native playing:', a.time, b.time);
-    assert(!a.paused && !b.paused && Math.abs(a.time - b.time) < 0.4, 'native playback in sync');
+    console.log('MP4 through the swarm, playing:', a.time, b.time);
+    assert(!a.paused && !b.paused && Math.abs(a.time - b.time) < 0.4, 'playback in sync');
     await ctl(bob, '#m-play');
     await sleep(800);
     a = await state(alice); b = await state(bob);
-    assert(a.paused && b.paused, 'native pause synced');
+    assert(a.paused && b.paused, 'pause synced');
     // no subtitle file matches single.mp4: the Drive group lists nothing (subtitles of other films stay hidden)
     await ctl(bob, '#m-subs');
     await waitFor(bob, () => {
@@ -365,9 +370,30 @@ async function adminApi(base) {
     const all = await bob.$$eval('#m-subs-menu button, #m-subs-menu h4', (els) => els.map((e) => e.textContent));
     assert(!all.some((t) => /multi\.srt|multi\.it\.srt|subs_en\.srt|From Google Drive/.test(t)), 'nothing from Drive listed when no file matches: ' + all);
     await bob.keyboard.press('Escape');
-    assert.strictEqual(fetches(B.stats), fetchesAfterOpen, 'native playback: the <video> element streams, nothing else fetches');
-    assert(B.stats.requests.some((r) => r.path.endsWith('/files/' + ID.mp4) && r.type === 'media'), 'the <video> element made the media requests');
     assert(A.stats.requests.some((r) => r.range && r.path.endsWith('/files/' + ID.mp4)), 'the browser used Range requests for the MP4');
+
+    // --- a browser without MSE (old iOS) plays a Drive film natively from our server, and does not share it
+    {
+      const D = await join(ROOM, 'Dave', { noMse: true });
+      const dave = D.page;
+      await waitFor(dave, () => document.getElementById('movie-overlay').textContent.includes('Stream from Google Drive'));
+      await dave.click('#movie-overlay button:has-text("Stream from Google Drive")');
+      await waitFor(dave, () => document.getElementById('movie').readyState >= 2 && room.player.file?.name === 'single.mp4');
+      assert.strictEqual(await dave.evaluate(() => room.player.mode), 'native');
+      assert((await dave.evaluate(() => document.getElementById('movie').currentSrc)).startsWith(`${BASE}/api/rooms/${ROOM}/drive/files/${ID.mp4}?t=`), 'native <video> streams from our server');
+      assert.strictEqual(await dave.evaluate(() => room.swarm.film), null, 'a native player does not take part in sharing');
+      await waitFor(alice, () => room.sync.peerStatus.size >= 2 && [...room.sync.peerStatus.values()].every((x) => x.matches));
+      await ctl(alice, '#m-play');
+      await sleep(3500);
+      const d = await state(dave);
+      a = await state(alice);
+      console.log('native (no MSE) playing:', a.time, d.time);
+      assert(!a.paused && !d.paused && Math.abs(a.time - d.time) < 0.4, 'native playback in sync with the swarm viewers');
+      assert(D.stats.requests.some((r) => r.type === 'media'), 'the <video> element made the media requests');
+      await ctl(alice, '#m-play');
+      await sleep(800);
+      await D.ctx.close();
+    }
 
     // --- a reconnect brings a fresh token; the same client (listings, open files) keeps working with it
     {
@@ -395,11 +421,111 @@ async function adminApi(base) {
     await waitFor(alice, () => room.drive !== null);
     console.log('admin folder change / removal / re-adding is picked up live');
 
+
+    // --- three viewers stream the same Drive MKV: the server sends each piece about once, the viewers share the rest
+    {
+      const big = DATA[ID.big];
+      const viewers = [];
+      const bytes = { total: 0, ranges: [] }; // what our server sent to all browsers for this film
+      for (const name of ['Alice', 'Bob', 'Carol']) {
+        const V = await join(SWARM, name);
+        V.page.on('response', (res) => {
+          const u = new URL(res.url());
+          if (!u.pathname.endsWith('/drive/files/' + ID.big)) return;
+          const n = Number(res.headers()['content-length'] || 0);
+          bytes.total += n;
+          const m = /bytes=(\d+)-(\d+)/.exec(res.request().headers().range || '');
+          if (m) bytes.ranges.push([Number(m[1]), Number(m[2])]);
+        });
+        viewers.push(V);
+      }
+      const [va, vb, vc] = viewers.map((v) => v.page);
+      await vb.waitForSelector('#room:not([hidden])');
+      await openDialog(va);
+      await waitFor(va, () => document.querySelectorAll('#drive-list .drive-item').length === 1);
+      await item(va, 'big.mkv').click();
+      await waitFor(va, () => document.getElementById('movie').readyState >= 2 && !document.getElementById('stage').hidden);
+      const fresh = (p) => waitFor(p, () => document.getElementById('movie-overlay').textContent.includes('Stream from Google Drive'));
+      await Promise.all([fresh(vb), fresh(vc)]);
+      // Bob and Carol click at the same moment
+      await Promise.all([vb, vc].map((p) => p.click('#movie-overlay button:has-text("Stream from Google Drive")')));
+      await Promise.all([vb, vc].map((p) => waitFor(p, () => document.getElementById('movie').readyState >= 2 && room.player.file?.name === 'big.mkv')));
+      for (const p of [va, vb, vc]) assert.strictEqual(await p.evaluate(() => room.player.mode), 'mse');
+      await waitFor(va, () => /Everyone ready/.test(document.getElementById('m-ready').textContent));
+      await ctl(va, '#m-play');
+      await sleep(7000);
+      let t = await Promise.all([va, vb, vc].map(state));
+      assert(t.every((x) => !x.paused) && Math.max(...t.map((x) => x.time)) - Math.min(...t.map((x) => x.time)) < 0.5, 'three viewers play in sync: ' + JSON.stringify(t.map((x) => x.time)));
+      // everybody jumps to the same place at the same time
+      const seekAll = async (sec) => {
+        await ctl(vb, '#m-time');
+        const bx = await vb.locator('#m-seek').boundingBox();
+        await vb.mouse.click(bx.x + bx.width * (sec / 160), bx.y + bx.height / 2);
+        await sleep(3500);
+      };
+      // (after a jump the slower viewer catches up by playing a little faster, so allow it a few seconds)
+      const settle = async (pages, min, tol = 0.5) => {
+        for (let i = 0; i < 60; i++) {
+          const ts = await Promise.all(pages.map(state));
+          const spread = Math.max(...ts.map((x) => x.time)) - Math.min(...ts.map((x) => x.time));
+          if (ts.every((x) => !x.paused && x.time > min) && spread < tol) return ts;
+          await sleep(500);
+        }
+        return Promise.all(pages.map(state));
+      };
+      await seekAll(100);
+      t = await settle([va, vb, vc], 99.5);
+      assert(t.every((x) => x.time > 99.5) && Math.max(...t.map((x) => x.time)) - Math.min(...t.map((x) => x.time)) < 0.5, 'seek in sync: ' + JSON.stringify(t.map((x) => x.time)));
+      await sleep(3000);
+      const unique = (() => {
+        const r = [...bytes.ranges].sort((x, y) => x[0] - y[0]);
+        let n = 0, hi = -1;
+        for (const [a0, b0] of r) { n += Math.max(0, b0 - Math.max(a0, hi + 1) + 1); hi = Math.max(hi, b0); }
+        return n;
+      })();
+      const stats = await Promise.all([va, vb, vc].map((p) => p.evaluate(() => ({ ...room.swarm.stats, cached: room.player.file.cachedPieces(1048576) }))));
+      // The film as far as the three of them have watched: the pieces cached by any viewer.
+      const needed = new Set();
+      for (const x of stats) for (const [f0, l0] of x.cached) for (let k = f0; k <= l0; k++) needed.add(k);
+      const neededBytes = [...needed].reduce((n, k) => n + Math.min(1048576, big.length - k * 1048576), 0);
+      const ratio = bytes.total / big.length;
+      console.log(`MEASURE 3 viewers, ${(big.length / 1048576).toFixed(1)} MiB film: our server sent ${(bytes.total / 1048576).toFixed(2)} MiB in ${bytes.ranges.length} requests = ${ratio.toFixed(2)} x the file size; the viewers needed ${(neededBytes / 1048576).toFixed(2)} MiB of it, so ${(bytes.total / neededBytes).toFixed(2)} x what was needed; duplicated bytes: ${(bytes.total / unique).toFixed(2)} x`);
+      console.log('MEASURE swarm per viewer (bytes from server / from friends / served to friends):', stats.map((x) => `${x.server}/${x.peers}/${x.served}`).join('  '), ' pieces cached:', JSON.stringify(stats.map((x) => x.cached)));
+      // the people list says where each viewer gets the film from
+      await va.evaluate(() => document.querySelector('.tab[data-tab="people"]').click());
+      await waitFor(va, () => [...document.querySelectorAll('#people li small')].filter((e) => e.textContent === 'streaming (Drive)').length === 3);
+      assert.strictEqual(await va.$$eval('#people li small', (els) => els.map((e) => e.textContent).join('|')), 'streaming (Drive)|streaming (Drive)|streaming (Drive)');
+      await va.evaluate(() => document.querySelector('.tab[data-tab="chat"]').click());
+      assert(ratio <= 1.4, `the server sent ${ratio.toFixed(2)} x the film`);
+      assert(bytes.total / neededBytes <= 1.4, `the server sent ${(bytes.total / neededBytes).toFixed(2)} x what the viewers needed`);
+      assert(bytes.total / unique <= 1.4, 'the same bytes were sent more than ~once');
+      assert(stats.every((x) => x.peers > 0 || x.server > 0) && stats.reduce((n, x) => n + x.peers, 0) > 0, 'viewers got pieces from each other');
+
+      // A viewer freezes (stops answering friends, like a stuck tab): the others fall back for the pieces it was meant to
+      // fetch (planning again without it, so one of them fetches each piece from the server) and keep playing.
+      const before = bytes.total;
+      await vc.evaluate(() => { room.swarm._onFilm = () => {}; });
+      await seekAll(66); // the film between the part the viewers read from the start and the part they read after the jump: nobody has it
+      t = await settle([va, vb], 68);
+      const fb = await Promise.all([va, vb].map((p) => p.evaluate(() => room.swarm.stats.fallbacks)));
+      console.log('MEASURE after one viewer froze: times', JSON.stringify(t.map((x) => x.time)), '| fallbacks', fb.join(','), '| server bytes for the rest of the film:', ((bytes.total - before) / 1048576).toFixed(2), 'MiB');
+      assert(t.every((x) => !x.paused) && Math.abs(t[0].time - t[1].time) < 0.5, 'the others keep playing in sync: ' + JSON.stringify(t.map((x) => x.time)));
+      assert(fb[0] + fb[1] >= 1, 'the frozen friend was skipped (fallback)');
+      assert(bytes.total / big.length <= 1.4, 'still about one copy: ' + (bytes.total / big.length).toFixed(2));
+      // Carol leaves in the middle of the stream
+      await viewers[2].ctx.close();
+      await seekAll(20);
+      t = await settle([va, vb], 20.5);
+      assert(t.every((x) => !x.paused && x.time > 20.5 && x.time < 40) && Math.abs(t[0].time - t[1].time) < 0.5, 'still playing after she left: ' + JSON.stringify(t.map((x) => x.time)));
+      for (const v of viewers.slice(0, 2)) await v.ctx.close();
+      console.log('three viewers share the film; a frozen and a departed viewer did not stop the others');
+    }
+
     // --- the browser never contacted Google, and everything it fetched from our server carried the room token
     assert.deepStrictEqual(googleAttempts, [], 'the browser tried to contact Google');
     let driveRequests = 0;
     for (const S of served) {
-      const bad = S.server.filter((p) => !(p.startsWith('/assets/') || p.startsWith('/api/') || p === '/ws' || p.startsWith('/' + ROOM) || p.startsWith('/' + PLAIN) || p === '/favicon.ico' || p === '/healthz'));
+      const bad = S.server.filter((p) => !(p.startsWith('/assets/') || p.startsWith('/api/') || p === '/ws' || p.startsWith('/' + ROOM) || p.startsWith('/' + PLAIN) || p.startsWith('/' + SWARM) || p === '/favicon.ico' || p === '/healthz'));
       assert.deepStrictEqual(bad, [], 'unexpected requests to our server');
       for (const r of S.requests) {
         driveRequests++;
