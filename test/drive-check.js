@@ -301,7 +301,8 @@ async function adminApi(base) {
     await ctl(bob, '#m-subs');
     await waitFor(bob, () => [...document.querySelectorAll('#m-subs-menu button span')].some((s) => s.textContent === 'multi.it.srt'));
     const menu = await bob.$$eval('#m-subs-menu button span', (els) => els.map((e) => e.textContent));
-    assert(menu.includes('subs_en.srt') && !menu.includes('multi.srt'), 'drive group: other files only, the shared one is a normal entry: ' + menu);
+    assert(menu.includes('multi.it.srt') && !menu.includes('multi.srt'), 'drive group: the shared one is a normal entry: ' + menu);
+    assert(!menu.includes('subs_en.srt'), 'subtitle files of other films are not listed: ' + menu);
     assert.match(await bob.textContent('#m-subs-menu'), /From Google Drive[\s\S]*Load subtitle file/, 'local file option kept below the Drive group');
     assert.match(await bob.textContent('#m-subs-menu'), /From Google Drive/);
     await bob.click('#m-subs-menu button:has-text("multi.it.srt")');
@@ -408,6 +409,12 @@ async function adminApi(base) {
     await sleep(800);
     a = await state(alice); b = await state(bob);
     assert(a.paused && b.paused, 'native pause synced');
+    // no subtitle file matches single.mp4: the Drive group then lists them all, so odd names stay reachable
+    await ctl(bob, '#m-subs');
+    await waitFor(bob, () => [...document.querySelectorAll('#m-subs-menu button span')].some((s) => s.textContent === 'subs_en.srt'));
+    const all = await bob.$$eval('#m-subs-menu button span', (els) => els.map((e) => e.textContent));
+    assert(['multi.srt', 'multi.it.srt', 'subs_en.srt'].every((n) => all.includes(n)), 'all listed when none match: ' + all);
+    await bob.keyboard.press('Escape');
     assert.strictEqual(fetches(B.stats), fetchesAfterOpen, 'native playback: the <video> element streams, nothing else fetches');
     assert(B.stats.requests.some((r) => r.url.includes(ID.mp4) && r.type === 'media'), 'the <video> element made the media requests');
     assert(A.stats.requests.some((r) => r.range && r.url.includes(ID.mp4)), 'the browser used Range requests for the MP4');

@@ -143,7 +143,7 @@ Notes:
 - Google may temporarily block a heavily downloaded file ("download quota exceeded"). Use a local copy until it clears.
 - Embedded subtitles in a streamed film are read only when you select them, one small download at a time, so they load slowly; a separate `.srt`, `.vtt` or `.ass` file next to the movie is much faster. MKV files without a subtitle index can't be read while streaming at all.
 - If Google shows "your computer or network may be sending automated queries", it is blocking downloads from that internet connection (the app then says so). Wait a few hours, switch network or VPN, or use a local copy of the film.
-- A subtitle file next to the movie with the same name (`Arrival.srt`, `Arrival.en.srt`, ...) loads automatically for everyone when someone starts the movie from Drive. Without an exact match, the file in the browser's language is preferred. Any other subtitle files in the movie's folder are listed under **From Google Drive** in the CC menu.
+- A subtitle file next to the movie with the same name (`Arrival.srt`, `Arrival.en.srt`, ...) loads automatically for everyone when someone starts the movie from Drive. Without an exact match, the file in the browser's language is preferred. Names like `Film.en.srt` or `Film ENG.srt` are recognised. Other subtitle files for the film in its folder are listed under **From Google Drive** in the CC menu.
 
 ## Configuration
 

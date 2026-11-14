@@ -1,7 +1,7 @@
 // Unit tests for the Drive helpers that need no browser.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { pickSubtitle, DriveClient } from '../public/assets/js/drive.js';
+import { pickSubtitle, subtitleMatches, DriveClient } from '../public/assets/js/drive.js';
 
 const sub = (name) => ({ kind: 'subtitle', name });
 const pick = (movie, names, lang) => pickSubtitle(movie, names.map(sub), lang)?.name ?? null;
@@ -45,4 +45,28 @@ test('addKey validates ids and keys and never overwrites a known key', () => {
   d.addKey('THIRDFOLDER_0003', 'bad key,/');
   d.addKey('FOURTHFOLDER_004', '');
   assert.deepEqual([...d.keys], [['ROOTFOLDER_0001', 'R-1'], ['SUBFOLDER_00002', 'S-1']]);
+});
+
+test('subtitleMatches: this film\'s files, not other films\'', () => {
+  const yes = [
+    ['15 - Beyond The Black Rainbow.mkv', '15 - Beyond The Black Rainbow ENG.srt'],
+    ['Film.mkv', 'Film_ita.srt'], ['Film.mkv', 'Film - English.srt'], ['Film.mkv', 'Film (SDH).srt'], ['Film.mkv', 'Film [eng].srt'],
+    ['Film.mkv', 'film.EN.forced.srt'], ['Film.mkv', 'Film.srt'], ['Film.mkv', 'Film.2016.srt'], ['Film.mkv', 'Film - ita - forced.srt'],
+  ];
+  const no = [
+    ['Alien.mkv', 'Alien 3.srt'], ['15 - Beyond The Black Rainbow.mkv', '14 - The Aerial SPA.srt'],
+    ['Aliens.mkv', 'Alien.srt'], ['Alien.mkv', 'Aliens.srt'], ['Alien.mkv', 'Aliens ENG.srt'], ['Film.mkv', 'Film Director Cut.srt'],
+    ['Film.mkv', 'Film - Making Of.srt'], ['Film.mkv', 'Other.srt'],
+  ];
+  for (const [m, f] of yes) assert.equal(subtitleMatches(m, f), true, `${f} should match ${m}`);
+  for (const [m, f] of no) assert.equal(subtitleMatches(m, f), false, `${f} should not match ${m}`);
+});
+
+test('pickSubtitle understands space-separated tags and language names', () => {
+  const M = '15 - Beyond The Black Rainbow.mkv';
+  assert.equal(pick(M, ['14 - The Aerial SPA.srt', '15 - Beyond The Black Rainbow ENG.srt'], 'en'), '15 - Beyond The Black Rainbow ENG.srt');
+  assert.equal(pick(M, ['14 - The Aerial SPA.srt'], 'en'), null);
+  assert.equal(pick('Film.mkv', ['Film - Italian.srt', 'Film - English.srt'], 'en-GB'), 'Film - English.srt');
+  assert.equal(pick('Film.mkv', ['Film ENG.srt', 'Film ITA.srt'], 'it'), 'Film ITA.srt');
+  assert.equal(pick('Film.mkv', ['Film ENG.srt', 'Film.srt'], 'en'), 'Film.srt');
 });

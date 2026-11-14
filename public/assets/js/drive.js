@@ -60,22 +60,45 @@ const KEY_RE = /^[A-Za-z0-9_-]{0,200}$/;
 const LANG3 = { en: ['eng'], it: ['ita'], fr: ['fre', 'fra'], de: ['ger', 'deu'], es: ['spa'], pt: ['por'], nl: ['dut', 'nld'], ru: ['rus'], ja: ['jpn'], zh: ['chi', 'zho'], ko: ['kor'], pl: ['pol'], sv: ['swe'], tr: ['tur'], cs: ['cze', 'ces'], da: ['dan'], fi: ['fin'], no: ['nor'], hu: ['hun'], el: ['gre', 'ell'], he: ['heb'], ar: ['ara'], uk: ['ukr'], ro: ['rum', 'ron'] };
 const baseName = (name) => String(name).replace(/\.[^./]+$/, '').toLowerCase();
 
+const LANG_NAMES = { en: 'english', it: 'italian', fr: 'french', de: 'german', es: 'spanish', pt: 'portuguese', nl: 'dutch', ru: 'russian', ja: 'japanese', zh: 'chinese', ko: 'korean', pl: 'polish', sv: 'swedish', tr: 'turkish', cs: 'czech', da: 'danish', fi: 'finnish', no: 'norwegian', hu: 'hungarian', el: 'greek', he: 'hebrew', ar: 'arabic', uk: 'ukrainian', ro: 'romanian' };
+// Words that may follow a movie's name in a subtitle file's name without making it another film's file.
+const TAGS = new Set(['forced', 'sdh', 'hi', 'cc', 'full', 'default', ...Object.keys(LANG3), ...Object.values(LANG3).flat(), ...Object.values(LANG_NAMES)]);
+const TOKEN_SPLIT = /[\s_\-.()[\]]+/;
+
+/** The part of a subtitle's base name after the movie's, as tokens; null if it is not this movie's subtitle. */
+function subtitleSuffix(movieName, subName) {
+  const mb = baseName(movieName);
+  const sb = baseName(subName);
+  if (sb === mb) return [];
+  if (!sb.startsWith(mb)) return null;
+  const rest = sb.slice(mb.length);
+  const tokens = rest.split(TOKEN_SPLIT).filter(Boolean);
+  if (rest[0] === '.') return tokens; // Movie.en.srt, Movie.2016.srt: whatever follows the dot
+  // Movie ENG.srt, Movie_ita.srt, Movie - English.srt, Movie (SDH).srt: only known tags, never more words
+  // (that would be "Alien 3" for "Alien", or "Aliens" for "Alien").
+  if (!/^[\s_\-([]/.test(rest) || !tokens.length || !tokens.every((t) => TAGS.has(t))) return null;
+  return tokens;
+}
+
+/** Is this subtitle file for this movie (rather than for another film in the same folder)? */
+export function subtitleMatches(movieName, subName) {
+  return subtitleSuffix(movieName, subName) !== null;
+}
+
 /**
- * Which subtitle file next to a movie should load automatically? Candidates have the movie's
- * base name, optionally followed by a dotted suffix (Arrival.srt, Arrival.en.srt, Arrival.eng.forced.srt).
- * Preference: no suffix, then the browser's language, then not "forced", then by name. Returns a file or null.
+ * Which subtitle file next to a movie should load automatically? See subtitleMatches for the names that
+ * count. Preference: no suffix, then the browser's language, then not "forced", then by name.
+ * Returns a file or null.
  */
 export function pickSubtitle(movieName, files, lang = '') {
-  const mb = baseName(movieName);
   const l = String(lang).toLowerCase().split(/[-_]/)[0];
-  const codes = new Set([l, ...(LANG3[l] || [])].filter(Boolean));
+  const codes = new Set([l, LANG_NAMES[l], ...(LANG3[l] || [])].filter(Boolean));
   const cands = [];
   for (const f of files) {
     if (f.kind !== 'subtitle') continue;
-    const b = baseName(f.name);
-    if (b !== mb && !b.startsWith(mb + '.')) continue;
-    const parts = b.slice(mb.length + 1).split(/[._\- ]+/).filter(Boolean);
-    cands.push({ f, exact: b === mb, lang: parts.some((p) => codes.has(p)), forced: parts.includes('forced') });
+    const parts = subtitleSuffix(movieName, f.name);
+    if (!parts) continue;
+    cands.push({ f, exact: !parts.length, lang: parts.some((p) => codes.has(p)), forced: parts.includes('forced') });
   }
   const rank = (c) => [c.exact ? 0 : 1, c.lang ? 0 : 1, c.forced ? 1 : 0];
   cands.sort((a, b) => {

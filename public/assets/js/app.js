@@ -4,7 +4,7 @@ import { MovieSync, sameMovie } from './sync.js';
 import { MoviePlayer } from './player/player.js';
 import { CompactPip } from './player/compactpip.js';
 import { LocalMedia, watchLevel, audioContext } from './media.js';
-import { DriveClient, pickSubtitle } from './drive.js';
+import { DriveClient, pickSubtitle, subtitleMatches } from './drive.js';
 
 // While the movie is in a Document Picture-in-Picture window, its controls live in that document.
 let pipWindow = null;
@@ -1319,7 +1319,10 @@ class Room {
     const dsubs = this._driveSubtitles();
     if (dsubs) {
       const shared = new Set(s.subFiles.map((f) => f.name));
-      const files = dsubs.items.filter((f) => !shared.has(f.name));
+      // A folder can hold several films with their subtitles: list this film's. If none is recognisably
+      // its own (oddly named files in a one-film folder), list them all so they stay reachable.
+      const own = dsubs.items.filter((f) => subtitleMatches(s.movie.name, f.name));
+      const files = (own.length ? own : dsubs.items).filter((f) => !shared.has(f.name));
       const dh = document.createElement('h4');
       dh.textContent = 'From Google Drive';
       if (dsubs.status === 'loading') items.push(dh, this._menuItem('Loading…', false, () => {}, '', true));
