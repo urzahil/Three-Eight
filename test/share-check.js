@@ -4,7 +4,7 @@
 // Starts its own server. Fixtures: `bash test/make-fixtures.sh` first.
 // Usage: node test/share-check.js
 const { chromium } = require('playwright');
-const { spawn } = require('child_process');
+const { spawn, execFileSync } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const net = require('net');
@@ -16,6 +16,8 @@ const MOVIE = path.join(FIX, 'multi.mkv');
 const ADMIN = 'test';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const ROOM = 'share-' + Date.now().toString(36);
+const ROOM2 = ROOM + '-relay';
+const MEASURE_ONLY = !!process.env.MEASURE_ONLY; // only the upload measurement (to run it against an older commit)
 const waitFor = (page, fn, arg, timeout = 20000) => page.waitForFunction(fn, arg, { timeout, polling: 200 });
 const state = (p) => p.evaluate(() => ({ paused: document.getElementById('movie').paused, time: window.room.player.time }));
 async function ctl(page, sel) {
@@ -61,9 +63,10 @@ async function startServer() {
     const cookie = login.headers.get('set-cookie').split(';')[0];
     const made = await fetch(BASE + '/api/admin/rooms', { method: 'POST', headers: { 'content-type': 'application/json', cookie }, body: JSON.stringify({ name: ROOM, password: 'secret' }) });
     assert.equal(made.status, 201);
+    assert.equal((await fetch(BASE + '/api/admin/rooms', { method: 'POST', headers: { 'content-type': 'application/json', cookie }, body: JSON.stringify({ name: ROOM2, password: 'secret' }) })).status, 201);
 
     const pages = [];
-    async function join(name) {
+    async function join(name, room = ROOM) {
       const ctx = await browser.newContext({ permissions: ['camera', 'microphone'] });
       const page = await ctx.newPage();
       const movieBytes = []; // anything our server sends that looks like movie data
@@ -72,7 +75,7 @@ async function startServer() {
         const u = new URL(res.url());
         if (u.origin === BASE && /\/drive\/|\.mkv|\.mp4/.test(u.pathname)) movieBytes.push(u.pathname);
       });
-      await page.goto(`${BASE}/${ROOM}?debug`);
+      await page.goto(`${BASE}/${room}?debug`);
       await page.fill('#lobby-name', name);
       await page.fill('#lobby-password', 'secret');
       await page.click('#lobby-join');
@@ -81,6 +84,8 @@ async function startServer() {
       pages.push(v);
       return v;
     }
+    basic: {
+    if (MEASURE_ONLY) break basic;
     const A = await join('Alice');
     const B = await join('Bob');
     const [alice, bob] = [A.page, B.page];
@@ -164,6 +169,7 @@ async function startServer() {
     const servedBefore = await alice.evaluate(() => room.swarm.stats.served);
     const denied = await C.page.evaluate(async (aliceId) => {
       const m = room.sync.state.movie;
+      room.swarm.have.clear(); // Bob would relay what he has: only Alice is asked here
       room.swarm.have.set(aliceId, { key: `s:${m.size}`, local: true, ranges: [[0, 4]], via: 'file' }); // as if she still advertised it
       const rf = room.swarm.openRemote({ name: m.name, size: m.size });
       rf.swarm.activate();
@@ -190,6 +196,78 @@ async function startServer() {
     await A.ctx.close();
     await waitFor(bob, () => room.mesh.peers.size === 1);
     assert.strictEqual(await bob.evaluate(() => room.swarm.holders(room.sync.state.movie).length), 0);
+    }
+
+    // --- one sharer, three streamers: friends pass pieces on, so Alice uploads about one copy, not one per friend
+    {
+      const BIG = path.join(FIX, 'big.mkv');
+      if (!fs.existsSync(BIG)) {
+        execFileSync('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', '-f', 'lavfi', '-i', 'testsrc2=size=640x360:rate=24:duration=160', '-f', 'lavfi', '-i', 'sine=frequency=440:duration=160', '-vf', 'noise=alls=60:allf=t+u', '-c:v', 'libx264', '-preset', 'veryfast', '-b:v', '3M', '-g', '48', '-c:a', 'aac', '-metadata:s:a:0', 'language=eng', BIG]);
+      }
+      const bigSize = fs.statSync(BIG).size;
+      const A2 = await join('Alice', ROOM2);
+      const others = [];
+      for (const n of ['Bob', 'Carol', 'Dave']) others.push(await join(n, ROOM2));
+      const alice = A2.page;
+      const ps = others.map((o) => o.page);
+      await alice.setInputFiles('#movie-file', BIG);
+      await waitFor(alice, () => document.getElementById('movie').readyState >= 2);
+      await Promise.all(ps.map((p) => waitFor(p, () => document.getElementById('movie-overlay').textContent.includes("Stream from Alice's copy"))));
+      await Promise.all(ps.map((p) => p.click('#movie-overlay button:has-text("Stream from Alice\'s copy")')));
+      await Promise.all(ps.map((p) => waitFor(p, () => document.getElementById('movie').readyState >= 2 && room.player.file?.peerOnly)));
+      await waitFor(alice, () => /Everyone ready/.test(document.getElementById('m-ready').textContent));
+      const all = [alice, ...ps];
+      const settle = async (pages, min, tol = 0.5) => {
+        for (let i = 0; i < 60; i++) {
+          const ts = await Promise.all(pages.map(state));
+          const spread = Math.max(...ts.map((x) => x.time)) - Math.min(...ts.map((x) => x.time));
+          if (ts.every((x) => !x.paused && x.time > min) && spread < tol) return ts;
+          await sleep(500);
+        }
+        return Promise.all(pages.map(state));
+      };
+      const seekAll = async (sec) => {
+        await ctl(ps[0], '#m-time');
+        const bx = await ps[0].locator('#m-seek').boundingBox();
+        await ps[0].mouse.click(bx.x + bx.width * (sec / 160), bx.y + bx.height / 2);
+        await sleep(3000);
+      };
+      await ctl(alice, '#m-play');
+      await sleep(7000);
+      let t = await settle(all, 5);
+      assert(t.every((x) => !x.paused) && Math.max(...t.map((x) => x.time)) - Math.min(...t.map((x) => x.time)) < 0.5, 'four viewers in sync: ' + JSON.stringify(t.map((x) => x.time)));
+      await seekAll(100);
+      t = await settle(all, 99.5);
+      assert(t.every((x) => x.time > 99.5) && Math.max(...t.map((x) => x.time)) - Math.min(...t.map((x) => x.time)) < 0.5, 'seek in sync: ' + JSON.stringify(t.map((x) => x.time)));
+      await sleep(3000);
+      const st = await Promise.all(ps.map((p) => p.evaluate(() => ({ ...room.swarm.stats, cached: room.player.file.cachedPieces(1048576) }))));
+      const needed = new Set();
+      for (const x of st) for (const [f0, l0] of x.cached) for (let k = f0; k <= l0; k++) needed.add(k);
+      const neededBytes = [...needed].reduce((n, k) => n + Math.min(1048576, bigSize - k * 1048576), 0);
+      const streamed = st.reduce((n, x) => n + x.peers, 0);
+      const up = await alice.evaluate(() => room.swarm.stats.served);
+      console.log(`MEASURE sharer upload, 3 streamers: Alice uploaded ${(up / 1048576).toFixed(1)} MiB; the streamers needed ${(neededBytes / 1048576).toFixed(1)} MiB of the film (they received ${(streamed / 1048576).toFixed(1)} MiB in all) = ${(up / neededBytes).toFixed(2)} x the needed bytes; per streamer received: ${st.map((x) => (x.peers / 1048576).toFixed(1)).join(' / ')} MiB`);
+      if (MEASURE_ONLY) {
+        console.log('MEASURE ONLY done');
+      } else {
+        assert(up <= 1.4 * neededBytes, `Alice uploaded ${(up / neededBytes).toFixed(2)} x what the streamers needed`);
+        assert(st.every((x) => x.server === 0));
+        // Alice leaves in the middle of the film: what the others have cached keeps playing, the rest fails with a message
+        await A2.ctx.close();
+        await Promise.all(ps.map((p) => waitFor(p, () => room.mesh.peers.size === 2)));
+        await seekAll(20);
+        t = await settle(ps, 20.5);
+        assert(t.every((x) => !x.paused && x.time > 20.5), 'cached part keeps playing without Alice: ' + JSON.stringify(t.map((x) => x.time)));
+        // a part that nobody fetched: not hanging; a message, and the page still answers
+        await seekAll(75);
+        await waitFor(ps[0], () => [...document.querySelectorAll('.toast')].some((x) => /Could not get this part of the movie|Nobody is sharing/.test(x.textContent)), undefined, 45000);
+        assert.strictEqual(await ps[0].evaluate(() => 1 + 1), 2, 'the page is responsive');
+        await seekAll(30);
+        t = await settle(ps, 30.5);
+        assert(t.every((x) => !x.paused), 'and playback resumes in the cached part: ' + JSON.stringify(t.map((x) => x.time)));
+        console.log('Alice left: cached parts kept playing, the missing part failed with a message');
+      }
+    }
     console.log('SHARE CHECK OK');
   } finally {
     await browser.close().catch(() => {});
