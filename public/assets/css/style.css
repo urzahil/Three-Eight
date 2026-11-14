@@ -243,6 +243,31 @@ button:focus-visible, .seek:focus-visible { outline: 2px solid var(--accent); ou
 /* ---- Dialogs & toasts ---- */
 .dialog { background: var(--bg-2); color: var(--text); border: 1px solid var(--line); border-radius: 16px; padding: 24px; width: min(440px, calc(100vw - 32px)); box-shadow: var(--shadow); }
 .dialog::backdrop { background: var(--backdrop); }
+.dialog .stack > * { min-width: 0; }
+@media (max-width: 480px) { .dialog { padding: 18px 16px; } }
+
+/* ---- Google Drive browser (movie dialog) ---- */
+#movie-dialog.has-drive { width: min(560px, calc(100vw - 32px)); }
+.drive { display: flex; flex-direction: column; gap: 8px; }
+.drive h3 { margin: 0; font-size: 13px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+.crumbs { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 4px; font-size: 14px; }
+.crumbs button { font: inherit; color: var(--accent); background: transparent; border: 0; padding: 4px 6px; border-radius: 6px; cursor: pointer; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.crumbs button:hover { background: var(--bg-3); }
+.crumbs .sep { color: var(--muted); }
+.crumbs .here { padding: 4px 6px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
+.drive-list { display: flex; flex-direction: column; gap: 2px; max-height: min(40vh, 320px); overflow-y: auto; border: 1px solid var(--line); border-radius: 10px; padding: 4px; background: var(--bg); }
+.drive-list > p { margin: 10px; font-size: 14px; }
+.drive-list > p.error { color: var(--danger-text); }
+.drive-item { display: flex; align-items: center; gap: 10px; width: 100%; min-width: 0; text-align: left; padding: 9px 10px; border: 0; border-radius: 8px; background: transparent; color: var(--text); font: inherit; font-size: 14px; cursor: pointer; }
+.drive-item:hover:not(:disabled) { background: var(--bg-3); }
+.drive-item:disabled { color: var(--muted); cursor: default; }
+.drive-item svg { flex: none; width: 18px; height: 18px; color: var(--muted); }
+.drive-item[data-kind=folder] svg { color: var(--accent); }
+.drive-item .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.drive-item .meta { flex: none; font-size: 12px; color: var(--muted); white-space: nowrap; }
+.drive-item.current { background: var(--bg-3); box-shadow: inset 3px 0 0 var(--accent); }
+.drive-list .btn { align-self: flex-start; margin: 0 10px 10px; padding: 6px 12px; }
+.movie-overlay .stack .btn.secondary { background: transparent; }
 .toasts { position: fixed; left: 50%; top: 64px; transform: translateX(-50%); display: flex; flex-direction: column; gap: 8px; z-index: 100; width: min(420px, calc(100vw - 32px)); pointer-events: none; }
 .toast { background: var(--bg-3); border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; box-shadow: var(--shadow); font-size: 14px; animation: toast-in 160ms ease-out; pointer-events: auto; }
 .toast.warn { border-color: var(--warn-border); }

@@ -107,7 +107,7 @@ async function waitFor(page, fn, arg, timeout = 15000) {
   // --- movie
   await alice.setInputFiles('#movie-file', MOVIE);
   await waitFor(alice, () => !document.getElementById('stage').hidden && document.getElementById('movie').readyState >= 2, null, 20000);
-  await waitFor(bob, () => !document.getElementById('stage').hidden && document.getElementById('movie-overlay').textContent.includes('Choose'));
+  await waitFor(bob, () => !document.getElementById('stage').hidden && document.getElementById('movie-overlay').textContent.includes("Stream from Alice's copy"));
   console.log('bob sees movie prompt');
   await bob.setInputFiles('#movie-file', MOVIE);
   await waitFor(bob, () => document.getElementById('movie').readyState >= 2, null, 20000);

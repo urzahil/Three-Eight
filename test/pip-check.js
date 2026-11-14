@@ -63,7 +63,7 @@ async function pair(browser, label, { aliceInit } = {}) {
   const [alice, bob] = pages;
   await alice.setInputFiles('#movie-file', MOVIE);
   await waitFor(alice, () => !document.getElementById('stage').hidden && document.getElementById('movie').readyState >= 2, null, 20000);
-  await waitFor(bob, () => document.getElementById('movie-overlay').textContent.includes('Choose'));
+  await waitFor(bob, () => document.getElementById('movie-overlay').textContent.includes('Use my own copy') || document.getElementById('movie-overlay').textContent.includes('Choose'));
   await bob.setInputFiles('#movie-file', MOVIE);
   await waitFor(bob, () => document.getElementById('movie').readyState >= 2, null, 20000);
   await waitFor(alice, () => /Everyone ready/.test(document.getElementById('m-ready').textContent));

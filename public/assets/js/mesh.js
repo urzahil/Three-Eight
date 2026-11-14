@@ -4,6 +4,11 @@
 
 const CHUNK = 12 * 1024;
 
+// The film channel carries binary film pieces only, so they never queue up in front of chat and sync
+// messages on the JSON channel. Sends wait in a queue while more than FILM_HIGH bytes are buffered.
+const FILM_HIGH = 1024 * 1024;
+const FILM_LOW = 256 * 1024;
+
 // Upload budget per outgoing video stream, by number of remote peers:
 // in a mesh every participant uploads one copy per peer.
 function videoBudget(peerCount, lowPower) {
@@ -51,6 +56,29 @@ class Peer {
       this.open = false;
     };
     this.dc.onmessage = (ev) => this._onData(ev.data);
+
+    // Second negotiated channel (id 1): film pieces. Reliable and ordered, like the first.
+    this.filmOpen = false;
+    this.filmQueue = []; // [{ buf, tag }] waiting for the buffer to drain
+    this.filmQueued = 0; // bytes in filmQueue
+    this.film = pc.createDataChannel('film', { negotiated: true, id: 1, ordered: true });
+    this.film.binaryType = 'arraybuffer';
+    this.film.bufferedAmountLowThreshold = FILM_LOW;
+    this.film.onopen = () => {
+      this.filmOpen = true;
+      this.mesh._emit('film-open', { peer: this });
+    };
+    this.film.onclose = () => {
+      const was = this.filmOpen;
+      this.filmOpen = false;
+      this.filmQueue = [];
+      this.filmQueued = 0;
+      if (was) this.mesh._emit('film-close', { peer: this });
+    };
+    this.film.onbufferedamountlow = () => this._pumpFilm();
+    this.film.onmessage = (ev) => {
+      if (ev.data instanceof ArrayBuffer) this.mesh._emit('film', { peer: this, data: ev.data });
+    };
 
     pc.ontrack = (ev) => {
       if (!this.stream.getTracks().includes(ev.track)) {
@@ -178,6 +206,49 @@ class Peer {
     return true;
   }
 
+  /**
+   * Send one binary film message (an ArrayBuffer or typed array). It goes out at once while the channel's
+   * buffer is below the high-water mark, otherwise it waits in a queue. `tag` lets dropFilm() remove it
+   * again. Returns false if the film channel is not open.
+   */
+  sendFilm(buf, tag = '') {
+    if (!this.filmOpen || this.film.readyState !== 'open') return false;
+    this.filmQueue.push({ buf, tag });
+    this.filmQueued += buf.byteLength;
+    this._pumpFilm();
+    return true;
+  }
+
+  _pumpFilm() {
+    const ch = this.film;
+    while (this.filmQueue.length && ch.readyState === 'open' && ch.bufferedAmount <= FILM_HIGH) {
+      const { buf } = this.filmQueue.shift();
+      this.filmQueued -= buf.byteLength;
+      try {
+        ch.send(buf);
+      } catch {
+        this.filmQueue = [];
+        this.filmQueued = 0;
+        return;
+      }
+    }
+  }
+
+  /** Remove queued (not yet handed to the channel) film messages with this tag. */
+  dropFilm(tag) {
+    if (!this.filmQueue.length) return;
+    this.filmQueue = this.filmQueue.filter((m) => {
+      if (m.tag !== tag) return true;
+      this.filmQueued -= m.buf.byteLength;
+      return false;
+    });
+  }
+
+  /** Bytes of film data not yet delivered to the network (queued or buffered). */
+  get filmBacklog() {
+    return this.filmQueued + (this.film.readyState === 'open' ? this.film.bufferedAmount : 0);
+  }
+
   _onData(raw) {
     if (typeof raw !== 'string') return;
     let msg;
@@ -215,6 +286,7 @@ class Peer {
     clearTimeout(this._watchdog);
     try {
       this.dc.close();
+      this.film.close();
     } catch {
       /* ignore */
     }
@@ -321,6 +393,15 @@ export class Mesh extends EventTarget {
 
   send(id, msg) {
     return this.peers.get(id)?.send(msg) || false;
+  }
+
+  /** Send a binary film message to one peer (see Peer.sendFilm). */
+  sendFilm(id, buf, tag) {
+    return this.peers.get(id)?.sendFilm(buf, tag) || false;
+  }
+
+  dropFilm(id, tag) {
+    this.peers.get(id)?.dropFilm(tag);
   }
 
   broadcast(msg) {

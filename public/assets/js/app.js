@@ -4,6 +4,8 @@ import { MovieSync, sameMovie } from './sync.js';
 import { MoviePlayer } from './player/player.js';
 import { CompactPip } from './player/compactpip.js';
 import { LocalMedia, watchLevel, audioContext } from './media.js';
+import { DriveClient, pickSubtitle, subtitleMatches } from './drive.js';
+import { Swarm } from './player/swarm.js';
 
 // While the movie is in a Document Picture-in-Picture window, its controls live in that document.
 let pipWindow = null;
@@ -38,12 +40,12 @@ function showMessage(title, text) {
   show('message');
 }
 
-function toast(text, kind = '') {
+function toast(text, kind = '', ms = 0) {
   const el = document.createElement('div');
   el.className = 'toast ' + kind;
   el.textContent = text;
   $('toasts').appendChild(el);
-  setTimeout(() => el.remove(), kind === 'warn' ? 6000 : 3500);
+  setTimeout(() => el.remove(), ms || (kind === 'warn' ? 6000 : 3500));
   while ($('toasts').children.length > 4) $('toasts').firstChild.remove();
 }
 
@@ -264,6 +266,27 @@ class Room {
     this.player = new MoviePlayer($('movie'), $('subs-layer'));
     this.player.video.volume = store.get('movieVolume', 1);
     this.sync = new MovieSync({ mesh: this.mesh, signaling, player: this.player, selfId: id });
+    // Film pieces are shared between the viewers (and a local copy can feed friends who have none).
+    this.swarm = new Swarm(this.mesh, { selfId: id, share: store.get('shareFile', true) !== false });
+    this._holderSig = '';
+    this.swarm.addEventListener('change', () => {
+      this._renderPeople();
+      // The overlay offers copies by name: redraw it only when that list changes (not on every cache update).
+      const m = this.sync.state.movie;
+      const sig = m ? this.swarm.holders(m).join(',') : '';
+      if (sig !== this._holderSig) {
+        this._holderSig = sig;
+        this._renderStage();
+        if ($('movie-dialog').open) this._renderMovieDialog();
+      }
+    });
+    this.player.addEventListener('unload', () => {
+      if (this.swarm.film?.local) this.swarm.closeFilm(); // a streamed film closes with its RemoteFile
+    });
+    this.drive = null; // DriveClient when the admin attached a Google Drive folder to this room
+    this.driveFolder = '';
+    this._driveToken = 0;
+    this._setDrive(welcome.drive);
 
     if (new URLSearchParams(location.search).has('debug')) window.room = this;
     document.title = `${roomName} · Three-Eight`;
@@ -284,7 +307,11 @@ class Room {
     }
 
     signaling.addEventListener('disconnected', () => this._setConn('Reconnecting to server…'));
-    signaling.addEventListener('reconnected', () => this._setConn(''));
+    signaling.addEventListener('reconnected', (e) => {
+      this._setConn('');
+      this._setDrive(e.detail?.drive); // the admin may have changed it while we were away
+    });
+    signaling.addEventListener('drive', (e) => this._setDrive(e.detail));
     signaling.addEventListener('fatal', (e) => {
       this.leave(false);
       showMessage('Disconnected', e.detail.message || 'You were disconnected from the room.');
@@ -294,6 +321,7 @@ class Room {
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState === 'visible') this._wakeLock();
     });
+    this.initialized = true;
     if (!welcome.peers.length) this._systemMessage('You are the first one here. Click “Invite” to copy the room link.');
   }
 
@@ -563,7 +591,7 @@ class Room {
       if (movie) {
         const st = id === this.id ? { file: this.sync.localFile, matches: this.sync.fileMatches } : this.sync.peerStatus.get(id);
         const small = document.createElement('small');
-        small.textContent = !st || !st.file ? 'no movie file loaded' : st.matches ? (st.buffering ? 'loading…' : 'ready to watch') : 'different file';
+        small.textContent = !st || !st.file ? 'no movie file loaded' : st.matches ? (st.buffering ? 'loading…' : this._sourceText(id, st.src)) : 'different file';
         who.append(small);
       }
       const mic = icon(p.audio ? 'mic' : 'mic-off');
@@ -573,6 +601,17 @@ class Room {
       li.append(av, who, mic, cam);
       return li;
     }));
+  }
+
+  /** "own copy", "streaming (Drive)" or "streaming (from Alice)" for someone whose movie file is loaded and matches. */
+  _sourceText(id, src) {
+    if (id === this.id) src = !this.player.file?.remote ? 'file' : this.player.file.peerOnly ? 'peers' : 'drive';
+    if (src === 'drive') return 'streaming (Drive)';
+    if (src === 'peers') {
+      const holders = this.sync.state.movie ? this.swarm.holders(this.sync.state.movie).filter((h) => h !== id) : [];
+      return holders.length === 1 ? `streaming (from ${this.profileOf(holders[0]).name})` : 'streaming (from friends)';
+    }
+    return 'own copy';
   }
 
   // ---- chat --------------------------------------------------------------------------
@@ -657,7 +696,7 @@ class Room {
     $('movie-file').addEventListener('change', (e) => {
       const f = e.target.files[0];
       e.target.value = '';
-      $('movie-dialog').close();
+      $('movie-dialog').close('file');
       if (f) this.chooseMovieFile(f);
     });
     $('movie-dialog').addEventListener('close', () => {
@@ -676,18 +715,7 @@ class Room {
       e.target.value = '';
       if (!f) return;
       if (f.size > 5 * 1024 * 1024) return toast('Subtitle file is too large.', 'warn');
-      let text = await f.text();
-      if (text.includes('�')) {
-        // Not UTF-8: most older subtitle files are Windows-1252 / Latin-1.
-        try {
-          text = new TextDecoder('windows-1252').decode(await f.arrayBuffer());
-        } catch {
-          /* keep */
-        }
-      }
-      const id = 'x' + (await hashText(text));
-      sync.addSubtitleFile({ id, name: f.name, text });
-      toast(`Subtitles “${f.name}” shared with everyone.`);
+      await this._shareSubtitle(f.name, new Uint8Array(await f.arrayBuffer()));
     });
 
     // Controls
@@ -726,9 +754,10 @@ class Room {
 
     // Player events
     p.addEventListener('tracks', () => this._renderMenus());
-    p.addEventListener('notice', (e) => toast(e.detail.text, 'warn'));
+    // `long` messages (a serious, lasting problem such as a used-up quota) need time to be read.
+    p.addEventListener('notice', (e) => toast(e.detail.text, 'warn', e.detail.long ? 25000 : 0));
     p.addEventListener('fatal', (e) => {
-      toast(e.detail.text, 'warn');
+      toast(e.detail.text, 'warn', e.detail.long ? 25000 : 0);
       this._renderStage();
     });
     p.addEventListener('status', (e) => {
@@ -737,6 +766,10 @@ class Room {
     for (const ev of ['play', 'pause', 'ended']) p.addEventListener(ev, () => this._refreshPlayButton());
 
     sync.addEventListener('state', () => {
+      if ($('movie-dialog').open) {
+        this._renderMovieDialog();
+        this._renderDriveItems(); // subtitle files become available once a movie is chosen
+      }
       this._updatePlaybackState();
       this._renderStage();
       this._renderMenus();
@@ -762,19 +795,290 @@ class Room {
     fn();
   }
 
+  /** Decode subtitle bytes and share them with the room (from a local file or Google Drive). */
+  async _shareSubtitle(name, bytes, message) {
+    let text = new TextDecoder().decode(bytes);
+    if (text.includes('�')) {
+      // Not UTF-8: most older subtitle files are Windows-1252 / Latin-1.
+      try {
+        text = new TextDecoder('windows-1252').decode(bytes);
+      } catch {
+        /* keep */
+      }
+    }
+    const id = 'x' + (await hashText(text));
+    this.sync.addSubtitleFile({ id, name, text });
+    toast(message || `Subtitles “${name}” shared with everyone.`);
+  }
+
   openMovieDialog() {
+    this._renderMovieDialog();
+    this._renderDriveSection();
+    $('movie-dialog').showModal();
+  }
+
+  _renderMovieDialog() {
     const s = this.sync.state;
     const has = this.sync.localFile;
+    const drive = !!this.drive;
     $('movie-dialog-current').hidden = !has && !s.movie;
     $('movie-unload').hidden = !has;
+    const share = 'The film is never stored on the server; only play/pause/seek and track choices are shared.';
     if (s.movie && !has) {
-      $('movie-dialog-text').textContent = `Everyone is watching “${s.movie.name}” (${fmtSize(s.movie.size)}). Choose your copy of the same file — nothing gets uploaded.`;
+      const friends = this.swarm.holders(s.movie);
+      const ways = [];
+      if (friends.length) ways.push(friends.length === 1 ? `${this.profileOf(friends[0]).name}’s copy` : 'a friend’s copy');
+      if (drive && s.movie.drive) ways.push('Google Drive');
+      $('movie-dialog-text').textContent = `Everyone is watching “${s.movie.name}” (${fmtSize(s.movie.size)}). ${ways.length ? `Stream it from ${ways.join(' or ')}, or choose your own copy of the same file.` : 'Choose your own copy of the same file.'}`;
     } else if (has) {
-      $('movie-dialog-text').textContent = `You're watching “${has.name}”. Pick another file to switch, or stop.`;
+      $('movie-dialog-text').textContent = `You're watching “${has.name}”. Pick another file to switch, or stop. Friends without the file can stream it from your copy (turn this off in Settings).`;
+    } else if (drive) {
+      $('movie-dialog-text').textContent = `Pick a movie from the room’s Google Drive folder, or choose a file on your device. ${share}`;
     } else {
-      $('movie-dialog-text').textContent = 'Everyone needs their own copy of the movie file. Nothing is uploaded — only play/pause/seek and track choices are shared.';
+      $('movie-dialog-text').textContent = `Choose a movie file on your device. Friends who don’t have it can stream it from your copy. ${share}`;
     }
-    $('movie-dialog').showModal();
+  }
+
+  // ---- Google Drive folder -------------------------------------------------------------
+  /**
+   * Apply the room's Drive settings, { token, folder } (from the welcome message, a reconnect or an admin
+   * change). null removes them. The same folder with a new token (after a reconnect) keeps the client,
+   * its cached listings and the files being streamed: they read the token again for every request.
+   */
+  _setDrive(cfg) {
+    const ok = cfg && typeof cfg === 'object' && typeof cfg.token === 'string' && typeof cfg.folder === 'string';
+    const folder = ok ? cfg.folder : '';
+    if (ok && this.drive && folder === this.driveFolder) {
+      this.drive.setToken(cfg.token);
+      return;
+    }
+    if (!ok && !this.drive) return;
+    this.driveFolder = folder;
+    this.drive = ok ? new DriveClient({ room: this.roomName, token: cfg.token, folder }) : null;
+    this.driveTrail = null;
+    this.driveRootName = '';
+    this._driveShown = null;
+    this._driveSubs = null;
+    if (!this.initialized) return;
+    if ($('movie-dialog').open) {
+      this._renderMovieDialog();
+      this._renderDriveSection();
+    }
+    this._renderStage();
+  }
+
+  _renderDriveSection() {
+    const on = !!this.drive;
+    $('drive-section').hidden = !on;
+    $('movie-dialog').classList.toggle('has-drive', on);
+    if (!on) return;
+    if (!this.driveTrail) {
+      this.driveTrail = [{ id: this.drive.folder, name: this.driveRootName || 'Drive folder' }];
+      const drive = this.drive;
+      drive.folderInfo().then((info) => {
+        if (drive !== this.drive || !this.driveTrail) return;
+        this.driveRootName = info.name;
+        this.driveTrail[0].name = info.name;
+        this._renderDriveCrumbs();
+      }, () => { /* keep the fallback name; listing shows the real error */ });
+    }
+    this._renderDriveCrumbs();
+    this._loadDriveFolder();
+  }
+
+  _renderDriveCrumbs() {
+    const nav = $('drive-crumbs');
+    nav.replaceChildren();
+    const last = this.driveTrail.length - 1;
+    this.driveTrail.forEach((c, i) => {
+      if (i) {
+        const sep = document.createElement('span');
+        sep.className = 'sep';
+        sep.setAttribute('aria-hidden', 'true');
+        sep.textContent = '›';
+        nav.append(sep);
+      }
+      if (i === last) {
+        const here = document.createElement('span');
+        here.className = 'here';
+        here.setAttribute('aria-current', 'location');
+        here.textContent = c.name;
+        here.title = c.name;
+        nav.append(here);
+      } else {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.textContent = c.name;
+        b.title = c.name;
+        b.onclick = () => {
+          this.driveTrail.length = i + 1;
+          this._renderDriveCrumbs();
+          this._loadDriveFolder();
+        };
+        nav.append(b);
+      }
+    });
+  }
+
+  async _loadDriveFolder() {
+    const drive = this.drive;
+    const folder = this.driveTrail[this.driveTrail.length - 1];
+    const token = ++this._driveToken;
+    const list = $('drive-list');
+    const note = (text, cls = '') => {
+      const p = document.createElement('p');
+      p.className = 'muted ' + cls;
+      p.textContent = text;
+      return p;
+    };
+    this._driveShown = null;
+    list.replaceChildren(note('Loading…'));
+    let items;
+    try {
+      items = await drive.list(folder.id);
+    } catch (err) {
+      if (token !== this._driveToken || drive !== this.drive) return;
+      const retry = document.createElement('button');
+      retry.type = 'button';
+      retry.className = 'btn';
+      retry.textContent = 'Try again';
+      retry.onclick = () => this._loadDriveFolder();
+      list.replaceChildren(note(err.message || 'Could not load the folder.', 'error'), retry);
+      return;
+    }
+    if (token !== this._driveToken || drive !== this.drive) return;
+    this._driveShown = items;
+    this._renderDriveItems();
+  }
+
+  _renderDriveItems() {
+    const items = this._driveShown;
+    if (!items) return;
+    const list = $('drive-list');
+    if (!items.length) {
+      const p = document.createElement('p');
+      p.className = 'muted';
+      p.textContent = 'No videos or subtitle files in this folder.';
+      list.replaceChildren(p);
+      return;
+    }
+    const room = this.sync.state.movie;
+    const canSub = !!(room || this.sync.localFile);
+    const rows = items.map((f) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'drive-item';
+      b.dataset.kind = f.kind;
+      const name = document.createElement('span');
+      name.className = 'name';
+      name.textContent = f.name;
+      name.title = f.name;
+      const meta = document.createElement('span');
+      meta.className = 'meta';
+      if (f.kind === 'video') {
+        meta.textContent = [fmtSize(f.size), f.durationMs ? fmtTime(f.durationMs / 1000) : ''].filter(Boolean).join(' · ');
+        if (room && (room.drive?.id === f.id || (room.size && room.size === f.size && room.name === f.name))) {
+          b.classList.add('current');
+          b.setAttribute('aria-current', 'true');
+          meta.textContent = 'now playing' + (meta.textContent ? ' · ' + meta.textContent : '');
+        }
+        b.onclick = () => this._streamDriveFile(f);
+      } else if (f.kind === 'subtitle') {
+        meta.textContent = canSub ? 'subtitles' : 'pick a movie first';
+        b.disabled = !canSub;
+        b.onclick = () => this._shareDriveSubtitle(f, b);
+      } else {
+        b.onclick = () => {
+          this.driveTrail.push({ id: f.id, name: f.name });
+          this._renderDriveCrumbs();
+          this._loadDriveFolder();
+        };
+      }
+      b.append(icon(f.kind === 'folder' ? 'folder' : f.kind === 'video' ? 'film' : 'cc'), name, meta);
+      return b;
+    });
+    list.replaceChildren(...rows);
+  }
+
+  _streamDriveFile(f) {
+    let file;
+    try {
+      const folder = this.driveTrail[this.driveTrail.length - 1].id;
+      file = this.drive.remoteFile({ ...f, folder }, this.swarm);
+    } catch (err) {
+      toast(err.message, 'warn');
+      return;
+    }
+    $('movie-dialog').close('drive');
+    this.chooseMovieFile(file);
+  }
+
+  async _shareDriveSubtitle(f, button) {
+    if (button) button.disabled = true;
+    try {
+      await this._shareSubtitle(f.name, await this.drive.downloadText(f));
+      if ($('movie-dialog').open) $('movie-dialog').close('subtitles');
+    } catch (err) {
+      toast(err.message || 'Could not download the subtitles.', 'warn', err.permanent ? 25000 : 0);
+      if (button) button.disabled = false;
+    }
+  }
+
+  /** Subtitle files in the folder of the room's Drive movie, for the CC menu. Listed lazily (the listing is cached). */
+  _driveSubtitles() {
+    const m = this.sync.state.movie;
+    const folder = this.drive && m?.drive?.folder;
+    if (!folder) return null;
+    let st = this._driveSubs;
+    if (!st || st.folder !== folder) {
+      const drive = this.drive;
+      st = this._driveSubs = { folder, status: 'loading', items: [] };
+      drive.list(folder).then((items) => {
+        st.status = 'ok';
+        st.items = items.filter((f) => f.kind === 'subtitle');
+      }, (err) => {
+        st.status = 'error';
+        st.error = err.message;
+      }).then(() => {
+        if (this._driveSubs === st) this._renderMenus();
+      });
+    }
+    return st;
+  }
+
+  /** Started a movie from Drive for the room: share the subtitle file next to it, if there is a clear match. */
+  async _autoDriveSubtitle(file) {
+    const drive = this.drive;
+    const m = file.drive;
+    if (!drive || !m?.folder) return;
+    let pick = null;
+    try {
+      pick = pickSubtitle(file.name, await drive.list(m.folder), navigator.language);
+      const st = this.sync.state;
+      if (!pick || drive !== this.drive || st.sub || st.subFiles.length || st.movie?.name !== file.name) return;
+      await this._shareSubtitle(pick.name, await drive.downloadText(pick), `Subtitles “${pick.name}” loaded from Google Drive. Turn them off in the CC menu.`);
+    } catch (err) {
+      console.warn('Automatic subtitles failed', err);
+      toast(`Could not load subtitles${pick ? ` “${pick.name}”` : ''} from Google Drive.`, 'warn');
+    }
+  }
+
+  /**
+   * Stream the room's movie with one click (a user gesture): from Google Drive and/or friends' copies. Both
+   * read through the swarm, which prefers friends who have the whole file and uses Drive for the rest.
+   */
+  _streamRoomMovie() {
+    const m = this.sync.state.movie;
+    if (!m || !(m.size > 0)) return;
+    try {
+      if (this.drive && m.drive) {
+        this.chooseMovieFile(this.drive.remoteFile({ id: m.drive.id, name: String(m.name || 'Movie'), size: Number(m.size), folder: m.drive.folder }, this.swarm));
+      } else {
+        this.chooseMovieFile(this.swarm.openRemote({ name: String(m.name || 'Movie'), size: Number(m.size) }));
+      }
+    } catch (err) {
+      toast(err.message, 'warn');
+    }
   }
 
   async chooseMovieFile(file) {
@@ -789,16 +1093,23 @@ class Room {
         d.returnValue = 'cancel';
         d.showModal();
       });
-      if (choice === 'cancel') return;
+      if (choice === 'cancel') {
+        file.close?.(); // a streamed file stops sharing
+        return;
+      }
       asRoom = choice === 'room';
     }
     this.loadingMovie = true;
+    this.loadingRemote = !!file.remote;
+    this.loadingPeers = !!file.peerOnly;
+    file.swarm?.activate();
     this._renderStage();
     try {
       await this.player.load(file, { audioIndex: asRoom ? 0 : s.audio });
     } catch (err) {
       console.error(err);
-      toast('Could not open this file: ' + (err.message || err), 'warn');
+      toast(file.remote && err.remote ? err.message : 'Could not open this file: ' + (err.message || err), 'warn', err.permanent ? 25000 : 0);
+      this.player.unload();
       this.loadingMovie = false;
       this._renderStage();
       return;
@@ -819,7 +1130,10 @@ class Room {
       }).catch(() => { v.muted = wasMuted; });
     }
     const info = { name: file.name, size: file.size, duration: Math.round(this.player.duration * 10) / 10 };
+    if (file.drive) info.drive = { ...file.drive };
+    if (!file.remote) this.swarm.openLocal(file); // a copy on this device can feed friends who have none
     this.sync.setLocalFile(info, asRoom);
+    if (asRoom && file.drive?.folder) this._autoDriveSubtitle(file); // in the background: never holds up playback
     if (asRoom) this.mesh.broadcast({ type: 'chat', msg: { id: randomId(), from: this.id, name: this.name, text: `🎬 Started a movie: ${file.name}`, ts: this.signaling.now() } });
     this._renderStage();
     this._renderMenus();
@@ -839,18 +1153,35 @@ class Room {
     ov.replaceChildren();
     let overlay = null;
     if (this.loadingMovie) {
-      overlay = this._overlay('Opening movie…', 'Reading the file on your device.', 'Cancel', () => {
+      overlay = this._overlay('Opening movie…', this.loadingPeers ? 'Connecting to your friend…' : this.loadingRemote ? 'Connecting to Google Drive…' : 'Reading the file on your device.', 'Cancel', () => {
         this.loadingMovie = false;
         this.player.unload();
         this._renderStage();
       });
     } else if (s.movie && !this.sync.localFile) {
-      overlay = this._overlay(
-        `“${s.movie.name}”`,
-        `${fmtSize(s.movie.size)}${s.movie.duration ? ' · ' + fmtTime(s.movie.duration) : ''}. Choose your copy of this file to join in. ${s.paused ? '' : 'The movie is already playing — you will jump right in.'}`,
-        'Choose file…',
-        () => $('movie-file').click(),
-      );
+      const fromDrive = !!(this.drive && s.movie.drive && s.movie.size > 0);
+      const friends = s.movie.size > 0 ? this.swarm.holders(s.movie) : [];
+      const own = { label: 'Use my own copy…', onClick: () => $('movie-file').click() };
+      const stream = () => this._streamRoomMovie();
+      let title = `“${s.movie.name}”`;
+      let text = `${fmtSize(s.movie.size)}${s.movie.duration ? ' · ' + fmtTime(s.movie.duration) : ''}. `;
+      let button;
+      let others = [own];
+      if (friends.length) {
+        const from = friends.length === 1 ? `${this.profileOf(friends[0]).name}'s copy` : "a friend's copy";
+        button = `Stream from ${from}`;
+        if (fromDrive) others = [{ label: 'Stream from Google Drive', onClick: stream }, own];
+        text += `Stream it from ${from}${fromDrive ? ' or Google Drive' : ''}, or use your own copy of this file, to join in.`;
+      } else if (fromDrive) {
+        button = 'Stream from Google Drive';
+        text += 'Stream it from Google Drive, or use your own copy of this file, to join in.';
+      } else {
+        button = 'Choose file…';
+        text += 'Choose your copy of this file to join in.';
+        others = [];
+      }
+      if (!s.paused) text += ' The movie is already playing — you will jump right in.';
+      overlay = this._overlay(title, text, button, friends.length || fromDrive ? stream : () => $('movie-file').click(), others);
     } else if (!s.movie && this.sync.localFile) {
       overlay = this._overlay('Movie closed', 'The movie was closed for everyone.', 'OK', () => {
         this.player.unload();
@@ -868,7 +1199,7 @@ class Room {
     this._renderReady();
   }
 
-  _overlay(title, text, button, onClick) {
+  _overlay(title, text, button, onClick, second = null) {
     const wrap = document.createElement('div');
     wrap.className = 'stack';
     const h = document.createElement('h2');
@@ -881,6 +1212,13 @@ class Room {
     b.textContent = button;
     b.onclick = onClick;
     wrap.append(h, p, b);
+    for (const sec of [].concat(second || [])) {
+      const b2 = document.createElement('button');
+      b2.className = 'btn secondary';
+      b2.textContent = sec.label;
+      b2.onclick = sec.onClick;
+      wrap.append(b2);
+    }
     return wrap;
   }
 
@@ -1033,7 +1371,8 @@ class Room {
     const items = [this._menuItem('Off', !s.sub, () => this.sync.setSubtitle(null))];
     for (const t of info?.subtitleTracks || []) {
       let note = '';
-      if (t.unsupported) note = 'not supported';
+      if (t.unsupported) note = ['not available when streaming', 'could not be loaded'].includes(t.unsupported) ? t.unsupported : 'not supported';
+      else if (t.waiting) note = 'loads when selected'; // streaming: read on demand
       else if (t.progress < 1) note = `loading ${Math.round(t.progress * 100)}%`;
       else if (t.source === 'external') note = 'file';
       items.push(this._menuItem(t.label, s.sub === t.id, () => this.sync.setSubtitle(t.id), note, !!t.unsupported));
@@ -1041,6 +1380,26 @@ class Room {
     // Shared subtitle files we haven't received yet.
     for (const f of s.subFiles) {
       if (!info?.subtitleTracks.some((t) => t.id === f.id)) items.push(this._menuItem(f.name, s.sub === f.id, () => this.sync.setSubtitle(f.id), 'receiving…', true));
+    }
+    // Subtitle files next to the movie on Drive (ones already shared show up above as normal entries).
+    const dsubs = this._driveSubtitles();
+    if (dsubs) {
+      const shared = new Set(s.subFiles.map((f) => f.name));
+      // A folder can hold several films with their subtitles: list only this film's (none if none match).
+      const files = dsubs.items.filter((f) => subtitleMatches(s.movie.name, f.name) && !shared.has(f.name));
+      const dh = document.createElement('h4');
+      dh.textContent = 'From Google Drive';
+      if (dsubs.status === 'loading') items.push(dh, this._menuItem('Loading…', false, () => {}, '', true));
+      else if (dsubs.status === 'error') items.push(dh, this._menuItem('Could not list the folder', false, () => { this._driveSubs = null; this._renderMenus(); }, 'retry'));
+      else if (files.length) {
+        items.push(dh);
+        for (const f of files) items.push(this._menuItem(f.name, false, () => this._shareDriveSubtitle(f), fmtSize(f.size)));
+      }
+      if (dsubs.status === 'ok' && files.length) {
+        const lh = document.createElement('h4');
+        lh.textContent = 'From your device';
+        items.push(lh);
+      }
     }
     const load = document.createElement('button');
     load.type = 'button';
@@ -1057,7 +1416,7 @@ class Room {
     const who = this.profileOf(peer.id).name;
     const by = state.by === peer.id ? who : this.profileOf(state.by).name;
     if (!sameMovie(prev.movie, state.movie)) {
-      if (state.movie) toast(`${by} started “${state.movie.name}”. Open your copy to watch along.`);
+      if (state.movie) toast(`${by} started “${state.movie.name}”. ${this.drive && state.movie.drive ? 'Stream it from Google Drive' : state.movie.size > 0 && state.by === peer.id ? `Stream it from ${who}'s copy` : 'Open your copy'} to watch along.`);
       else toast(`${by} closed the movie.`);
       return;
     }
@@ -1112,6 +1471,11 @@ class Room {
     $('set-lowband').checked = store.get('lowBandwidth', false);
     this.mesh.setLowPower($('set-lowband').checked);
     $('set-noise').checked = this.media.processing;
+    $('set-share').checked = this.swarm.share;
+    $('set-share').onchange = (e) => {
+      this.swarm.setShare(e.target.checked);
+      store.set('shareFile', e.target.checked);
+    };
 
     $('set-audio-dev').onchange = (e) => this._changeDevice('audio', e.target.value);
     $('set-video-dev').onchange = (e) => this._changeDevice('video', e.target.value);
@@ -1435,6 +1799,7 @@ class Room {
     this.closePip();
     this.sync.destroy();
     this.player.unload();
+    this.swarm.destroy();
     this.mesh.close();
     this.media.stop();
     this.signaling.close();

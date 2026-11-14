@@ -97,6 +97,10 @@ export class Signaling extends EventTarget {
           this.ws?.close();
         }
         break;
+      case 'drive':
+        // The admin attached, changed or removed the room's Google Drive folder.
+        this._emit('drive', msg.drive || null);
+        break;
       case 'peer-joined':
         this._emit('peer-joined', msg);
         break;

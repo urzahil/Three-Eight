@@ -110,6 +110,7 @@ class Feeder {
     this.cursor = this.engine.demux.createCursor(this.track.id);
     this.cursor.seek(Math.max(0, movieTime));
     this.eos = false;
+    this.failed = false;
     this.lastEnd = -1;
     this.positionedAt = movieTime;
     this.engine.wake();
@@ -142,7 +143,7 @@ class Feeder {
     while (!engine.destroyed) {
       const gen = this.gen;
       const t = engine.video.currentTime;
-      if (!this.cursor || this.eos || this.bufferedAhead(t) > this.ahead) {
+      if (!this.cursor || this.eos || this.failed || this.bufferedAhead(t) > this.ahead) {
         await engine.waitWake(250);
         continue;
       }
@@ -150,9 +151,24 @@ class Feeder {
       try {
         batch = await this.cursor.next();
       } catch (err) {
+        if (gen !== this.gen) continue; // we moved on (seek); the error belongs to the old position
+        if (!err?.remote) {
+          engine.fail(err);
+          return;
+        }
+        // Reading the remote file failed even after the file's own retries. Tell the user, then
+        // try again from the playhead (a few times, unless retrying cannot help). A seek
+        // retries too, because reposition() clears the failed state.
         engine.fail(err);
-        return;
+        this.failures = (this.failures || 0) + 1;
+        if (err.permanent || this.failures > 2) this.failed = true;
+        else {
+          await engine.waitWake(4000);
+          if (gen === this.gen) this.reposition(Math.max(0, engine.video.currentTime - SHIFT));
+        }
+        continue;
       }
+      this.failures = 0;
       if (gen !== this.gen) continue;
       if (!batch || !batch.samples.length) {
         this.eos = true;
@@ -237,7 +253,7 @@ export class MseEngine extends EventTarget {
     const movie = t - SHIFT;
     for (const f of this.feeders) {
       if (f.positionedAt != null && f.lastEnd < 0 && Math.abs(f.positionedAt - movie) < 0.05) continue;
-      if (!f.continuousAt(t)) f.reposition(movie);
+      if (f.failed || !f.continuousAt(t)) f.reposition(movie);
     }
     this.wake();
   }

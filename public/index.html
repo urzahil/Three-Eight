@@ -110,7 +110,7 @@
       <section id="main" class="main">
         <div id="stage" class="stage" hidden>
           <div id="movie-box" class="movie-box">
-            <video id="movie" playsinline></video>
+            <video id="movie" playsinline disableremoteplayback></video>
             <div id="subs-layer" class="subs-layer"></div>
             <div id="movie-overlay" class="movie-overlay" hidden></div>
             <div id="movie-controls" class="movie-controls">
@@ -183,7 +183,12 @@
   <dialog id="movie-dialog" class="dialog">
     <form method="dialog" class="stack">
       <h2>Watch together</h2>
-      <p id="movie-dialog-text" class="muted">Everyone needs their own copy of the movie file. Nothing is uploaded — only play/pause/seek commands are shared.</p>
+      <p id="movie-dialog-text" class="muted">Choose a movie file on your device. Friends who don’t have it can stream it from your copy.</p>
+      <section id="drive-section" class="drive" aria-labelledby="drive-title" hidden>
+        <h3 id="drive-title">From Google Drive</h3>
+        <nav id="drive-crumbs" class="crumbs" aria-label="Folder path"></nav>
+        <div id="drive-list" class="drive-list" aria-live="polite"></div>
+      </section>
       <label class="btn primary file-btn"><svg><use href="#i-folder"/></svg> Choose movie file…<input id="movie-file" type="file" accept="video/*,.mkv,.mp4,.m4v,.mov,.webm,.avi"></label>
       <div id="movie-dialog-current" hidden>
         <button id="movie-unload" class="btn" value="unload">Stop using my file</button>
@@ -211,6 +216,7 @@
       <label>Camera <select id="set-video-dev"></select></label>
       <label class="check"><input id="set-noise" type="checkbox" checked> Noise suppression &amp; echo cancellation</label>
       <label class="check"><input id="set-lowband" type="checkbox"> Low-bandwidth video (recommended on slow connections)</label>
+      <label class="check"><input id="set-share" type="checkbox" checked> Share my movie file with the room (friends can stream it from my copy)</label>
       <label>Subtitle size
         <select id="set-subsize">
           <option value="0.8">Small</option><option value="1" selected>Normal</option><option value="1.25">Large</option><option value="1.5">Huge</option>

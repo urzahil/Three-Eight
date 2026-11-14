@@ -19,6 +19,22 @@ function newer(a, b) {
   return a.by > b.by;
 }
 
+const DRIVE_ID = /^[A-Za-z0-9_-]{10,200}$/;
+
+/** A peer's movie info with its Google Drive reference validated (it ends up in request URLs). */
+function cleanMovie(movie) {
+  if (!movie || typeof movie !== 'object') return movie;
+  const d = movie.drive;
+  if (d === undefined) return movie;
+  const { drive, ...rest } = movie;
+  if (d && typeof d === 'object' && typeof d.id === 'string' && DRIVE_ID.test(d.id)) {
+    rest.drive = { id: d.id };
+    // The folder the video was listed in (where its subtitle files live); optional.
+    if (typeof d.folder === 'string' && DRIVE_ID.test(d.folder)) rest.drive.folder = d.folder;
+  }
+  return rest;
+}
+
 export function sameMovie(a, b) {
   if (!a || !b) return false;
   if (a.size && b.size && a.size === b.size) return true;
@@ -271,8 +287,10 @@ export class MovieSync extends EventTarget {
   _myStatus() {
     const p = this.player;
     return {
-      file: this.localFile,
+      file: this.localFile && { name: this.localFile.name, size: this.localFile.size, duration: this.localFile.duration },
       matches: this.fileMatches,
+      // where the file comes from: our device, Google Drive or friends' copies (through the swarm)
+      src: !p.file?.remote ? 'file' : p.file.peerOnly ? 'peers' : 'drive',
       buffering: this.fileMatches && p.loaded && !this.state.paused && p.video.readyState < 3,
     };
   }
@@ -292,7 +310,7 @@ export class MovieSync extends EventTarget {
         if (!s || typeof s.seq !== 'number' || typeof s.by !== 'string') return;
         if (!newer(s, this.state)) return;
         const prev = this.state;
-        this.state = { ...emptyState(), ...s, subFiles: Array.isArray(s.subFiles) ? s.subFiles.slice(0, 50) : [] };
+        this.state = { ...emptyState(), ...s, movie: cleanMovie(s.movie) ?? null, subFiles: Array.isArray(s.subFiles) ? s.subFiles.slice(0, 50) : [] };
         if (!sameMovie(prev.movie, this.state.movie)) this.useAnyway = false;
         // Fetch any shared subtitle file we don't have yet.
         for (const f of this.state.subFiles) {
@@ -308,6 +326,7 @@ export class MovieSync extends EventTarget {
         this.peerStatus.set(peer.id, {
           file: msg.file && typeof msg.file === 'object' ? { name: String(msg.file.name || ''), size: Number(msg.file.size) || 0, duration: Number(msg.file.duration) || 0 } : null,
           matches: !!msg.matches,
+          src: msg.src === 'drive' || msg.src === 'peers' ? msg.src : 'file',
           buffering: !!msg.buffering,
         });
         this._emit('status');
