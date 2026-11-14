@@ -19,6 +19,21 @@ function newer(a, b) {
   return a.by > b.by;
 }
 
+const DRIVE_ID = /^[A-Za-z0-9_-]{10,200}$/;
+const DRIVE_KEY = /^[A-Za-z0-9_-]{0,200}$/;
+
+/** A peer's movie info with its Google Drive reference validated (it ends up in request URLs and headers). */
+function cleanMovie(movie) {
+  if (!movie || typeof movie !== 'object') return movie;
+  const d = movie.drive;
+  if (d === undefined) return movie;
+  const { drive, ...rest } = movie;
+  if (d && typeof d === 'object' && typeof d.id === 'string' && DRIVE_ID.test(d.id) && typeof d.resourceKey === 'string' && DRIVE_KEY.test(d.resourceKey)) {
+    rest.drive = { id: d.id, resourceKey: d.resourceKey };
+  }
+  return rest;
+}
+
 export function sameMovie(a, b) {
   if (!a || !b) return false;
   if (a.size && b.size && a.size === b.size) return true;
@@ -271,7 +286,7 @@ export class MovieSync extends EventTarget {
   _myStatus() {
     const p = this.player;
     return {
-      file: this.localFile,
+      file: this.localFile && { name: this.localFile.name, size: this.localFile.size, duration: this.localFile.duration },
       matches: this.fileMatches,
       buffering: this.fileMatches && p.loaded && !this.state.paused && p.video.readyState < 3,
     };
@@ -292,7 +307,7 @@ export class MovieSync extends EventTarget {
         if (!s || typeof s.seq !== 'number' || typeof s.by !== 'string') return;
         if (!newer(s, this.state)) return;
         const prev = this.state;
-        this.state = { ...emptyState(), ...s, subFiles: Array.isArray(s.subFiles) ? s.subFiles.slice(0, 50) : [] };
+        this.state = { ...emptyState(), ...s, movie: cleanMovie(s.movie) ?? null, subFiles: Array.isArray(s.subFiles) ? s.subFiles.slice(0, 50) : [] };
         if (!sameMovie(prev.movie, this.state.movie)) this.useAnyway = false;
         // Fetch any shared subtitle file we don't have yet.
         for (const f of this.state.subFiles) {

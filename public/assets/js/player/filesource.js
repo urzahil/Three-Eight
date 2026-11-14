@@ -2,10 +2,13 @@
 
 export class FileSource {
   /** @param {Blob} file */
-  constructor(file, windowSize = 2 * 1024 * 1024) {
+  constructor(file, windowSize = file.remote ? 4 * 1024 * 1024 : 2 * 1024 * 1024) {
     this.file = file;
     this.size = file.size;
     this.windowSize = windowSize;
+    // Remote files: start small so playback begins (and seeks land) quickly,
+    // then grow to the full window while reading sequentially.
+    this.ramp = file.remote ? Math.min(windowSize, 1024 * 1024) : windowSize;
     this.bufStart = 0;
     this.buf = new Uint8Array(0);
   }
@@ -20,7 +23,8 @@ export class FileSource {
   async ensure(pos, len) {
     if (pos >= this.bufStart && pos + len <= this.bufStart + this.buf.length) return true;
     if (pos >= this.size) return false;
-    const want = Math.max(len, this.windowSize);
+    const want = Math.max(len, this.ramp);
+    this.ramp = Math.min(this.windowSize, this.ramp * 2);
     this.buf = await this.read(pos, want);
     this.bufStart = pos;
     return pos + len <= this.bufStart + this.buf.length;

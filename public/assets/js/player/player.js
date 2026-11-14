@@ -47,6 +47,7 @@ async function openDemuxer(file) {
     if (await MkvDemuxer.probe(file)) return await MkvDemuxer.open(file);
     if (await Mp4Demuxer.probe(file)) return await Mp4Demuxer.open(file);
   } catch (err) {
+    if (err?.remote) throw err; // a failed download is not an unknown container
     console.warn('Could not parse container, falling back to native playback:', err);
   }
   return null;
@@ -208,6 +209,7 @@ export class MoviePlayer extends EventTarget {
     this.objectUrl = null;
     this.video.removeAttribute('src');
     this.video.load();
+    this.file?.close?.(); // remote files: stop downloading
     this.file = null;
     this.demux = null;
     this.mode = null;
@@ -221,7 +223,8 @@ export class MoviePlayer extends EventTarget {
     this.unload();
     const token = ++this._loadToken;
     this.file = file;
-    this._emit('status', { text: 'Reading file…' });
+    this.triedModes = new Set();
+    this._emit('status', { text: file.remote ? 'Connecting to Google Drive…' : 'Reading file…' });
     const demux = await openDemuxer(file);
     if (token !== this._loadToken) return;
     this.demux = demux;
@@ -242,6 +245,11 @@ export class MoviePlayer extends EventTarget {
     const needSwitching = audio.length > 1 && !this.nativeAudioApi;
     let mode = 'native';
     if (mseOk && (!nativeOk || needSwitching)) mode = 'mse';
+    if (file.remote && !file.nativeUrl) {
+      // The <video> element can't send the headers this file needs, so only our own reader can fetch it.
+      if (!mseOk) throw new Error('This file can only be streamed with the built-in player, which your browser cannot use for it.');
+      mode = 'mse';
+    }
     if (!mseOk && needSwitching) {
       // Can't remux: only the default track will play natively.
       this.audioTracks.forEach((t, i) => { if (i !== 0) t.supported = false; t.note = 'switching unavailable'; });
@@ -289,8 +297,11 @@ export class MoviePlayer extends EventTarget {
       setTimeout(done, 15000);
     });
     if (mode === 'native') {
-      this.objectUrl = URL.createObjectURL(this.file);
-      this.video.src = this.objectUrl;
+      if (this.file.remote) this.video.src = this.file.nativeUrl; // the browser streams it by itself
+      else {
+        this.objectUrl = URL.createObjectURL(this.file);
+        this.video.src = this.objectUrl;
+      }
       await metadata;
       if (startTime) this.video.currentTime = startTime;
       this._applyNativeAudio();
@@ -298,7 +309,7 @@ export class MoviePlayer extends EventTarget {
     } else {
       const engine = new MseEngine(this.video, this.demux);
       this.engine = engine;
-      engine.addEventListener('error', () => this._onEngineError());
+      engine.addEventListener('error', (e) => this._onEngineError(e.detail));
       const at = this.audioTrackList[this.audioIndex];
       const audio = at && this.audioTracks[this.audioIndex]?.supported ? at : null;
       this.mseAudio = audio;
@@ -367,14 +378,30 @@ export class MoviePlayer extends EventTarget {
     return id;
   }
 
+  /** Remote files: wait until the movie itself has started buffering, so subtitles don't compete with it. */
+  async _waitForBuffer(token) {
+    const v = this.video;
+    for (let i = 0; i < 40 && token === this._loadToken; i++) {
+      const b = v.buffered;
+      if (b.length && b.end(b.length - 1) - v.currentTime >= 8) return;
+      await new Promise((r) => setTimeout(r, 500));
+    }
+  }
+
   async _extractSubtitles(token) {
     const pending = [...this.subtitles.values()].filter((s) => s.source === 'embedded' && s.format);
     if (!pending.length || !this.demux) return;
+    const remote = !!this.file.remote;
     this.extractAbort = new AbortController();
     const byId = new Map(pending.map((s) => [Number(s.id.slice(1)), s]));
     let lastEmit = 0;
+    let skipped = [];
     try {
-      await this.demux.extractSubtitles(
+      if (remote) {
+        await this._waitForBuffer(token);
+        if (token !== this._loadToken) return;
+      }
+      skipped = await this.demux.extractSubtitles(
         (trackId, cues) => {
           const s = byId.get(trackId);
           if (!s) return;
@@ -394,11 +421,20 @@ export class MoviePlayer extends EventTarget {
           }
         },
         this.extractAbort.signal,
-      );
+        { remote },
+      ) || [];
     } catch (err) {
       console.warn('Subtitle extraction failed', err);
     }
     if (token !== this._loadToken) return;
+    if (skipped.length) {
+      // Reading them would download a large part of the movie.
+      for (const id of skipped) {
+        const s = byId.get(id);
+        if (s) s.unsupported = 'not available when streaming';
+      }
+      this._emit('notice', { text: 'Embedded subtitles can\u2019t be read while streaming from Google Drive. Add an .srt next to the movie and load it from the subtitle menu.' });
+    }
     for (const s of pending) {
       s.progress = 1;
       // Close gaps for cues without durations (end = next start).
@@ -421,7 +457,7 @@ export class MoviePlayer extends EventTarget {
       this._emit('tracks');
       return;
     }
-    if (this.mode === 'mse' && !this.triedModes.has('native')) {
+    if (this.mode === 'mse' && !this.triedModes.has('native') && (!this.file.remote || this.file.nativeUrl)) {
       await this._start('native', time);
       this._emit('tracks');
       return;
@@ -429,7 +465,13 @@ export class MoviePlayer extends EventTarget {
     this._emit('fatal', { text: 'Your browser cannot play this file' + (err?.message ? `: ${err.message}` : '.') });
   }
 
-  _onEngineError() {
+  _onEngineError(err) {
+    if (err?.remote) {
+      // Reading the remote file failed (quota, network...). Switching players would not help
+      // and would only repeat the failing requests: tell the user; the feeder retries on its own.
+      this._emit('notice', { text: err.message });
+      return;
+    }
     this._onVideoError();
   }
 }

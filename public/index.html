@@ -184,6 +184,11 @@
     <form method="dialog" class="stack">
       <h2>Watch together</h2>
       <p id="movie-dialog-text" class="muted">Everyone needs their own copy of the movie file. Nothing is uploaded — only play/pause/seek commands are shared.</p>
+      <section id="drive-section" class="drive" aria-labelledby="drive-title" hidden>
+        <h3 id="drive-title">From Google Drive</h3>
+        <nav id="drive-crumbs" class="crumbs" aria-label="Folder path"></nav>
+        <div id="drive-list" class="drive-list" aria-live="polite"></div>
+      </section>
       <label class="btn primary file-btn"><svg><use href="#i-folder"/></svg> Choose movie file…<input id="movie-file" type="file" accept="video/*,.mkv,.mp4,.m4v,.mov,.webm,.avi"></label>
       <div id="movie-dialog-current" hidden>
         <button id="movie-unload" class="btn" value="unload">Stop using my file</button>

@@ -369,14 +369,14 @@ export class Mp4Demuxer {
     return new Mp4Cursor(this, this.tracks.find((t) => t.id === trackId));
   }
 
-  async readSamples(t, from, to) {
+  async readSamples(t, from, to, maxGap = 1024 * 1024) {
     // Read [from, to) samples, merging nearby byte ranges into single reads.
     const out = [];
     let i = from;
     while (i < to) {
       let j = i;
       let end = t.offsets[i] + t.sizes[i];
-      while (j + 1 < to && t.offsets[j + 1] >= t.offsets[i] && t.offsets[j + 1] - end < 1024 * 1024 && t.offsets[j + 1] + t.sizes[j + 1] - t.offsets[i] < 32 * 1024 * 1024) {
+      while (j + 1 < to && t.offsets[j + 1] >= t.offsets[i] && t.offsets[j + 1] - end < maxGap && t.offsets[j + 1] + t.sizes[j + 1] - t.offsets[i] < 32 * 1024 * 1024) {
         j++;
         end = Math.max(end, t.offsets[j] + t.sizes[j]);
       }
@@ -391,15 +391,30 @@ export class Mp4Demuxer {
     return out;
   }
 
-  async extractSubtitles(onCues, onProgress, signal) {
+  /**
+   * Reads only the subtitle samples. With opts.remote (streaming over HTTP) tracks
+   * whose samples are spread over too many blocks of the file are skipped, because
+   * every block is a download. Returns the skipped track ids.
+   */
+  async extractSubtitles(onCues, onProgress, signal, opts = {}) {
     const subs = this.tracks.filter((t) => t.type === 'subtitle' && t.subFormat);
+    const skipped = [];
     let done = 0;
     for (const t of subs) {
+      if (opts.remote) {
+        const blocks = new Set();
+        for (let i = 0; i < t.count; i++) blocks.add(Math.floor(t.offsets[i] / (256 * 1024)));
+        if (blocks.size > (opts.maxRemoteCues || 600)) {
+          skipped.push(t.id);
+          onProgress?.(++done / subs.length);
+          continue;
+        }
+      }
       const cues = [];
       for (let i = 0; i < t.count; i += 500) {
-        if (signal?.aborted) return;
+        if (signal?.aborted) return skipped;
         const end = Math.min(t.count, i + 500);
-        const datas = await this.readSamples(t, i, end);
+        const datas = await this.readSamples(t, i, end, opts.remote ? 16 * 1024 : undefined);
         for (let k = i; k < end; k++) {
           const text = decodeTextSample(t.subFormat, datas[k - i]);
           if (!text) continue;
@@ -411,6 +426,7 @@ export class Mp4Demuxer {
       onProgress?.(++done / subs.length);
     }
     onProgress?.(1);
+    return skipped;
   }
 }
 
