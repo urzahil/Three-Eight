@@ -50,7 +50,7 @@ function fakeGoogle(stats, quota) {
     const url = new URL(req.url());
     const h = req.headers();
     if (req.method() === 'OPTIONS') return route.fulfill({ status: 204, headers: cors });
-    stats.requests.push({ url: req.url(), range: h.range, keys: h['x-goog-drive-resource-keys'] });
+    stats.requests.push({ url: req.url(), range: h.range, keys: h['x-goog-drive-resource-keys'], type: req.resourceType() });
     if (req.headers().referer) stats.referers.push(req.headers().referer);
     if (url.searchParams.get('key') !== KEY) return err(route, 400, 'keyInvalid', 'API key not valid. Please pass a valid API key.');
     const keys = h['x-goog-drive-resource-keys'] || '';
@@ -70,6 +70,11 @@ function fakeGoogle(stats, quota) {
     if (!META[id]) return err(route, 404, 'notFound', 'File not found: ' + id);
     if (needs(id)) return err(route, 404, 'notFound', 'File not found: ' + id);
     if (url.searchParams.get('alt') !== 'media') return json(route, 200, META[id]);
+    if (quota.block && url.searchParams.get('alt') === 'media') {
+      // Google's "automated queries" page for a blocked IP address comes without CORS headers (Playwright would
+      // add them to a fulfilled response), so scripts only see net::ERR_FAILED / "Failed to fetch".
+      return route.abort('failed');
+    }
     if (quota.on && id === ID.mkv) return err(route, 403, 'downloadQuotaExceeded', 'The download quota for this file has been exceeded.');
     const data = DATA[id];
     const r = /^bytes=(\d+)-(\d*)$/.exec(h.range || '');
@@ -241,6 +246,12 @@ async function adminApi(base) {
     await sleep(4000);
     let a = await state(alice), b = await state(bob);
     assert(!a.paused && !b.paused, 'both play');
+    // Opening the MKV (header, Cues, tracks) and 4 s of playback: measured 3 fetches (~1 MiB minimum requests,
+    // two at a time) plus the 1 MiB-to-4 MiB windows for the 4 MB file. Allow some slack, but a burst of
+    // small subtitle reads (the old behaviour) would blow well past it.
+    const openCount = A.stats.requests.filter((r) => r.range && r.url.includes(ID.mkv)).length;
+    console.log('MEASURE mkv range requests after open + ~4s play:', openCount);
+    assert(openCount <= 8, `too many requests to open and play the MKV: ${openCount}`);
     assert(Math.abs(a.time - b.time) < 0.4, `drift ${a.time} vs ${b.time}`);
     await ctl(bob, '#m-play');
     await sleep(800);
@@ -261,6 +272,8 @@ async function adminApi(base) {
     // embedded subtitles are not downloaded while streaming
     const embedded = await alice.evaluate(() => room.player.info.subtitleTracks.filter((t) => t.source === 'embedded').map((t) => t.unsupported || 'ok'));
     console.log('embedded subtitle tracks while streaming:', embedded);
+    assert.deepStrictEqual(await alice.evaluate(() => room.player.info.subtitleTracks.filter((t) => t.source === 'embedded').map((t) => [t.waiting, t.progress, room.player.subtitles.get(t.id).cues.length])), [[true, 0, 0], [true, 0, 0]], 'embedded subtitle tracks are not read until selected');
+    assert.match(await alice.evaluate(() => document.getElementById('m-subs-menu').innerText), /loads when selected/);
     // a track that would need many separate downloads (or a whole-file scan) is skipped, not fetched
     const skipped = await alice.evaluate(() => room.player.demux.extractSubtitles(() => {}, () => {}, null, { remote: true, maxRemoteCues: 1 }));
     assert.strictEqual(skipped.length, 2, 'over-budget subtitle tracks are skipped when streaming');
@@ -297,6 +310,15 @@ async function adminApi(base) {
     a = await state(alice); b = await state(bob);
     assert(/Ventesimo/.test(a.subs) && /Ventesimo/.test(b.subs), `chosen Drive subtitles switch for both: ${JSON.stringify([a.subs, b.subs])}`);
     assert.strictEqual(await alice.evaluate(() => room.sync.state.subFiles.length), 2);
+    // an embedded track is read when it is selected: then its cues arrive for both peers
+    await ctl(bob, '#m-subs');
+    await bob.click('#m-subs-menu button:has-text("loads when selected") >> nth=0');
+    await waitFor(bob, () => room.player.subtitles.get(room.sync.state.sub)?.cues.length > 0);
+    await waitFor(alice, () => room.player.subtitles.get(room.sync.state.sub)?.cues.length > 0);
+    assert.strictEqual(await bob.evaluate(() => room.player.subtitles.get(room.sync.state.sub).source), 'embedded');
+    await seekBob(21);
+    a = await state(alice); b = await state(bob);
+    assert(/Twenty seconds/.test(a.subs) && /Twenty seconds/.test(b.subs), `embedded subtitles read on demand: ${JSON.stringify([a.subs, b.subs])}`);
     // the highlighted current movie in the dialog
     await openDialog(alice);
     await waitFor(alice, () => document.querySelectorAll('#drive-list .drive-item').length === 5);
@@ -331,6 +353,23 @@ async function adminApi(base) {
     await C.ctx.close();
     console.log('phone layout ok');
 
+    // --- Google blocks downloads for this connection (HTML page without CORS headers, the JSON API still works)
+    {
+      const D = await join(ROOM, 'Dan', { quota: { block: true } });
+      await waitFor(D.page, () => document.getElementById('movie-overlay').textContent.includes('Stream from Google Drive'));
+      await D.page.click('#movie-overlay button:has-text("Stream from Google Drive")');
+      await waitFor(D.page, () => [...document.querySelectorAll('.toast')].some((t) => /temporarily blocking downloads/.test(t.textContent)), null, 30000);
+      await sleep(3000);
+      const media = D.stats.requests.filter((r) => r.url.includes('alt=media'));
+      const diag = D.stats.requests.filter((r) => r.url.includes('fields=id') && !r.url.includes('mimeType'));
+      console.log('blocked: media attempts', media.length, 'diagnosis calls', diag.length);
+      assert(media.length >= 1 && media.length <= 2, `retry storm: ${media.length} media requests`);
+      assert.strictEqual(diag.length, 1, 'one cheap diagnosis call');
+      assert.strictEqual(await D.page.evaluate(() => room.player.loaded), false);
+      assert((await D.page.textContent('#movie-overlay')).includes('Stream from Google Drive'), 'overlay offers streaming again');
+      await D.ctx.close();
+    }
+
     // --- native path: an MP4 whose <video> streams straight from Drive
     await openDialog(bob);
     await bob.waitForSelector('#drive-section:not([hidden])');
@@ -343,6 +382,11 @@ async function adminApi(base) {
     await bob.click('#mismatch-dialog button[value=room]');
     await waitFor(bob, () => document.getElementById('movie').readyState >= 2 && room.player.file?.name === 'single.mp4');
     assert.strictEqual(await bob.evaluate(() => room.player.mode), 'native');
+    await sleep(2500);
+    const fetches = (S) => S.requests.filter((r) => r.url.includes(ID.mp4) && r.url.includes('alt=media') && r.type === 'fetch').length;
+    const fetchesAfterOpen = fetches(B.stats);
+    console.log('MEASURE mp4 native after open + 2.5s: fetch', fetchesAfterOpen, 'media', B.stats.requests.filter((r) => r.url.includes(ID.mp4) && r.type === 'media').length);
+    assert(fetchesAfterOpen <= 3, `opening the MP4 should take a handful of fetches, took ${fetchesAfterOpen}`);
     assert((await bob.evaluate(() => document.getElementById('movie').currentSrc)).startsWith('https://www.googleapis.com/drive/v3/files/' + ID.mp4), 'native <video> streams from Google');
     await waitFor(alice, () => room.sync.state.movie?.name === 'single.mp4');
     // Alice still holds the MKV (a different file): she switches by streaming the MP4 too
@@ -364,6 +408,8 @@ async function adminApi(base) {
     await sleep(800);
     a = await state(alice); b = await state(bob);
     assert(a.paused && b.paused, 'native pause synced');
+    assert.strictEqual(fetches(B.stats), fetchesAfterOpen, 'native playback: the <video> element streams, nothing else fetches');
+    assert(B.stats.requests.some((r) => r.url.includes(ID.mp4) && r.type === 'media'), 'the <video> element made the media requests');
     assert(A.stats.requests.some((r) => r.range && r.url.includes(ID.mp4)), 'the browser used Range requests for the MP4');
 
     // --- the admin removes the folder: the Drive UI disappears, and comes back when re-added

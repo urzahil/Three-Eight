@@ -32,6 +32,8 @@ export class RemoteFile {
    * @param {(start, endInclusive, signal) => Promise<Response>} [o.request]  replaces the default fetch
    * @param {(res: Response) => Promise<Error>} [o.explain]  turns an error response into an Error
    * @param {(err: Error) => Error} [o.networkError]  rewords a failed fetch
+   * @param {(err: Error) => Promise<Error|null>} [o.diagnose]  called after repeated network-level failures
+   *   (fetch rejected, e.g. a CORS-less block page): may return a better explanation. A permanent one stops all further downloads.
    */
   constructor(o) {
     this.name = o.name;
@@ -41,12 +43,17 @@ export class RemoteFile {
     this.blockSize = o.blockSize || 256 * 1024;
     this.cacheBytes = o.cacheBytes ?? 192 * MiB;
     this.maxRequest = Math.max(this.blockSize, o.maxRequest ?? 8 * MiB);
-    this.maxParallel = o.maxParallel ?? 6;
+    this.minRequest = o.minRequest ?? MiB; // fewer, larger requests: a small read still fetches this much, if it is missing
+    this.maxParallel = o.maxParallel ?? 2;
+    this.networkRetryDelay = o.networkRetryDelay ?? 2000;
     this.retries = o.retries ?? 3;
     this.backoff = o.backoff ?? 400;
     this.readAhead = o.readAhead !== false;
     this.explain = o.explain || null;
     this.networkError = o.networkError || null;
+    this.diagnose = o.diagnose || null;
+    this.fatal = null; // a permanent explanation (e.g. "blocked"): nothing more is downloaded
+    this.prefetching = false;
     this.request = o.request || ((start, end, signal) => fetch(o.url, { headers: { ...(o.headers ? o.headers() : {}), Range: `bytes=${start}-${end}` }, signal }));
     this.blocks = new Map(); // index -> Uint8Array; Map order = LRU order (oldest first)
     this.cached = 0;
@@ -66,6 +73,40 @@ export class RemoteFile {
     return { size: b - a, arrayBuffer: () => this._read(a, b) };
   }
 
+  /**
+   * A view for slow, polite reading of small pieces (embedded subtitles): shares the cache,
+   * but reads exactly the blocks needed (no minimum request size, no read-ahead), waiting
+   * `pace` ms before each request.
+   */
+  lite({ pace = 0 } = {}) {
+    return {
+      name: this.name,
+      size: this.size,
+      remote: true,
+      slice: (start = 0, end = this.size) => {
+        const a = Math.max(0, Math.min(this.size, start));
+        const b = Math.max(a, Math.min(this.size, end));
+        return { size: b - a, arrayBuffer: () => this._read(a, b, { small: true, pace }) };
+      },
+    };
+  }
+
+  /**
+   * Native playback downloads by itself and only reports "network error". To learn whether the
+   * server really is unreachable (or blocking us), read one small uncached piece ourselves:
+   * returns the explaining Error, or null when the file can be read (so the failure is something else).
+   */
+  async diagnoseFailure() {
+    if (this.fatal) return this.fatal;
+    const at = Math.floor(this.size / 2 / this.blockSize) * this.blockSize;
+    try {
+      await this.lite().slice(at, at + 1).arrayBuffer();
+      return null;
+    } catch (err) {
+      return err?.remote ? err : null;
+    }
+  }
+
   /** Abort in-flight requests and drop the cache. The file is unusable afterwards. */
   close() {
     this.closed = true;
@@ -77,12 +118,19 @@ export class RemoteFile {
   }
 
   // ---- reading -------------------------------------------------------------
-  async _read(start, end) {
+  async _read(start, end, { small = false, pace = 0 } = {}) {
     if (this.closed) throw new RemoteError('The movie was closed.', { permanent: true });
     if (end <= start) return new ArrayBuffer(0);
     const bs = this.blockSize;
     const first = Math.floor(start / bs);
-    const got = await Promise.all(this._blocks(first, Math.floor((end - 1) / bs)));
+    const last = Math.floor((end - 1) / bs);
+    if (pace) {
+      let need = false;
+      for (let i = first; i <= last && !need; i++) need = !this.blocks.has(i) && !this.pending.has(i);
+      if (need) await new Promise((r) => setTimeout(r, pace));
+      if (this.closed) throw new RemoteError('The movie was closed.', { permanent: true });
+    }
+    const got = await Promise.all(this._blocks(first, last, small));
     const out = new Uint8Array(end - start);
     for (let i = 0; i < got.length; i++) {
       const bStart = (first + i) * bs;
@@ -90,12 +138,12 @@ export class RemoteFile {
       const to = Math.min(end, bStart + got[i].length);
       out.set(got[i].subarray(from - bStart, to - bStart), from - start);
     }
-    if (this.readAhead) this._prefetch(start, end);
+    if (this.readAhead && !small) this._prefetch(start, end);
     return out.buffer;
   }
 
   /** For blocks first..last: a cached block, or a promise of one. Starts any missing downloads. */
-  _blocks(first, last) {
+  _blocks(first, last, small = false) {
     const out = [];
     const missing = []; // contiguous runs of blocks nobody has asked for yet: [a, b]
     let run = null;
@@ -121,9 +169,15 @@ export class RemoteFile {
       } else run[1] = i;
       out.push(null);
     }
-    for (const [a, b] of missing) {
+    const lastBlock = Math.ceil(this.size / this.blockSize) - 1;
+    const wantBlocks = small ? 0 : Math.ceil(this.minRequest / this.blockSize);
+    for (const [a, rb] of missing) {
+      // Extend a short run to the minimum request size, over blocks nobody has (the next block of
+      // this run, if any, is already cached or in flight, so the loop stops there).
+      let b = rb;
+      while (b - a + 1 < wantBlocks && b < lastBlock && !this.blocks.has(b + 1) && !this.pending.has(b + 1)) b++;
       const promises = this._download(a, b);
-      for (let i = a; i <= b; i++) out[i - first] = promises[i - a];
+      for (let i = a; i <= rb; i++) out[i - first] = promises[i - a];
     }
     return out;
   }
@@ -177,11 +231,13 @@ export class RemoteFile {
       return;
     }
     s.end = end;
-    if (end >= this.size) return;
+    if (end >= this.size || this.prefetching) return; // at most one prefetch at a time
     const len = Math.min(this.maxRequest, Math.max(bs, end - start));
     const first = Math.floor(end / bs);
     const last = Math.floor((Math.min(this.size, end + len) - 1) / bs);
-    Promise.all(this._blocks(first, last)).catch(noop);
+    this.prefetching = true;
+    const done = () => { this.prefetching = false; };
+    Promise.all(this._blocks(first, last)).then(done, done);
   }
 
   // ---- network ---------------------------------------------------------------
@@ -200,15 +256,23 @@ export class RemoteFile {
     await this._slot();
     try {
       let lastErr;
+      let netFails = 0;
       for (let attempt = 0; attempt <= this.retries; attempt++) {
         if (this.closed) throw new RemoteError('The movie was closed.', { permanent: true });
-        if (attempt) await new Promise((r) => setTimeout(r, this.backoff * 2 ** (attempt - 1) * (0.75 + Math.random() * 0.5)));
+        if (this.fatal) throw this.fatal;
+        if (attempt) {
+          // HTTP errors back off exponentially; a request that never got an answer is retried once, slowly.
+          const wait = lastErr.network ? this.networkRetryDelay : this.backoff * 2 ** (attempt - 1) * (0.75 + Math.random() * 0.5);
+          await new Promise((r) => setTimeout(r, wait));
+          if (this.closed) throw new RemoteError('The movie was closed.', { permanent: true });
+        }
         try {
           return await this._attempt(a, b);
         } catch (err) {
           lastErr = err;
           if (this.closed) throw new RemoteError('The movie was closed.', { permanent: true });
           if (err.permanent) throw err;
+          if (err.network && ++netFails >= 2) throw await this._explainNetworkFailure(err);
         }
       }
       throw lastErr;
@@ -268,6 +332,22 @@ export class RemoteFile {
     }
   }
 
+  /** Two network-level failures in a row: ask whether it is something specific (a block, being offline). */
+  async _explainNetworkFailure(err) {
+    let better = null;
+    if (this.diagnose) {
+      try {
+        better = await this.diagnose(err);
+      } catch {
+        /* keep the plain error */
+      }
+    }
+    if (this.closed || !better) return err;
+    Object.assign(better, { remote: true, network: false });
+    if (better.permanent) this.fatal = better;
+    return better;
+  }
+
   _netError(err, timedOut) {
     let e = err;
     if (this.networkError) {
@@ -278,6 +358,6 @@ export class RemoteFile {
       }
     }
     if (!(e instanceof Error)) e = new Error(timedOut ? 'The download timed out.' : 'Network error.');
-    return Object.assign(e, { remote: true, status: 0, permanent: false });
+    return Object.assign(e, { remote: true, status: 0, permanent: false, network: true });
   }
 }

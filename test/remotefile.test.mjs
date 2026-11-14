@@ -20,7 +20,18 @@ function makeData(n) {
  */
 function serve(data, { delay = 0, behave = null } = {}) {
   const calls = [];
+  let active = 0;
+  calls.maxActive = 0;
   globalThis.fetch = async (url, init = {}) => {
+    active++;
+    calls.maxActive = Math.max(calls.maxActive, active);
+    try {
+      return await handle(url, init);
+    } finally {
+      active--;
+    }
+  };
+  const handle = async (url, init) => {
     const m = /^bytes=(\d+)-(\d+)$/.exec(init.headers?.Range || '');
     const call = { start: m ? Number(m[1]) : 0, end: m ? Number(m[2]) : data.length - 1, headers: init.headers, aborted: false };
     calls.push(call);
@@ -39,7 +50,7 @@ function serve(data, { delay = 0, behave = null } = {}) {
   return calls;
 }
 
-const file = (data, o = {}) => new RemoteFile({ name: 'm.mkv', size: data.length, url: 'https://example.test/f', blockSize: BS, readAhead: false, backoff: 1, ...o });
+const file = (data, o = {}) => new RemoteFile({ name: 'm.mkv', size: data.length, url: 'https://example.test/f', blockSize: BS, readAhead: false, backoff: 1, minRequest: BS, networkRetryDelay: 1, ...o });
 const read = async (f, a, b) => Buffer.from(await f.slice(a, b).arrayBuffer());
 
 test('reads across block boundaries, including the partial last block', async () => {
@@ -206,4 +217,101 @@ test('a sequential reader gets the next window prefetched', async () => {
   await read(f, 40 * BS, 41 * BS); // a seek elsewhere is not read-ahead material
   await new Promise((r) => setTimeout(r, 20));
   assert.equal(calls.length, n + 2);
+});
+
+test('at most 2 requests run in parallel by default', async () => {
+  const data = makeData(32 * BS);
+  const calls = serve(data, { delay: 10 });
+  const f = file(data, { maxRequest: BS }); // every block is its own request
+  await Promise.all([0, 1, 2, 3, 4, 5].map((i) => read(f, i * BS, (i + 1) * BS)));
+  assert.equal(calls.length, 6);
+  assert.equal(calls.maxActive, 2);
+});
+
+test('small reads are extended to the minimum request size, over missing blocks only, clipped to the file end', async () => {
+  const data = makeData(32 * BS);
+  const calls = serve(data);
+  const f = file(data, { minRequest: 4 * BS });
+  await read(f, 10 * BS + 5, 10 * BS + 50);
+  assert.deepEqual([calls[0].start / BS, (calls[0].end + 1) / BS], [10, 14], 'one block asked for, four fetched');
+  await read(f, 8 * BS, 9 * BS); // the extension stops at the cached block 10
+  assert.deepEqual([calls[1].start / BS, (calls[1].end + 1) / BS], [8, 10]);
+  await read(f, 12 * BS, 13 * BS);
+  assert.equal(calls.length, 2, 'already cached');
+  await read(f, 30 * BS, 31 * BS); // near the end
+  assert.equal(calls[2].end, data.length - 1);
+  assert.equal(calls[2].start, 30 * BS, 'only what is left');
+  await read(f, 20 * BS, 22 * BS); // already longer than the minimum: no padding
+  assert.equal(calls[3].end - calls[3].start + 1, 4 * BS, 'a 2 block read still gets the minimum');
+  await read(f, 24 * BS, 29 * BS);
+  assert.equal(calls[4].end - calls[4].start + 1, 5 * BS, 'bigger reads are not padded');
+});
+
+test('lite reads fetch exactly the blocks needed', async () => {
+  const data = makeData(32 * BS);
+  const calls = serve(data);
+  const f = file(data, { minRequest: 4 * BS });
+  const lite = f.lite({ pace: 1 });
+  assert.deepEqual(Buffer.from(await lite.slice(5 * BS + 1, 5 * BS + 9).arrayBuffer()), data.subarray(5 * BS + 1, 5 * BS + 9));
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].end - calls[0].start + 1, BS);
+});
+
+test('a request without any answer is retried exactly once, after the delay', async () => {
+  const data = makeData(8 * BS);
+  const calls = serve(data, { behave: () => { throw new TypeError('Failed to fetch'); } });
+  const f = file(data, { networkRetryDelay: 80 });
+  const t0 = Date.now();
+  await assert.rejects(read(f, 0, BS), (e) => e.remote && e.network && !e.permanent);
+  assert.equal(calls.length, 2);
+  assert.ok(Date.now() - t0 >= 70, 'waited before retrying');
+});
+
+test('the diagnose hook explains repeated network failures; a permanent answer stops all downloads', async () => {
+  const data = makeData(8 * BS);
+  const calls = serve(data, { behave: () => { throw new TypeError('Failed to fetch'); } });
+  let asked = 0;
+  const blocked = Object.assign(new Error('blocked by the server'), { permanent: true });
+  const f = file(data, { diagnose: async () => { asked++; return blocked; } });
+  await assert.rejects(read(f, 0, BS), (e) => e === blocked && e.permanent && e.remote);
+  assert.equal(calls.length, 2);
+  assert.equal(asked, 1);
+  await assert.rejects(read(f, 4 * BS, 5 * BS), (e) => e === blocked);
+  assert.equal(await f.diagnoseFailure(), blocked);
+  assert.equal(calls.length, 2, 'no further fetches');
+  assert.equal(asked, 1);
+});
+
+test('a diagnosis that finds nothing keeps the network error and does not stop later reads', async () => {
+  const data = makeData(8 * BS);
+  let fail = true;
+  const calls = serve(data, { behave: () => { if (fail) throw new TypeError('Failed to fetch'); return null; } });
+  const f = file(data, { diagnose: async () => null });
+  await assert.rejects(read(f, 0, BS), (e) => e.network);
+  fail = false;
+  assert.deepEqual(await read(f, 0, BS), data.subarray(0, BS));
+  assert.equal(calls.length, 3);
+});
+
+test('diagnoseFailure reads one uncached piece: null if it works, the explanation if not', async () => {
+  const data = makeData(8 * BS);
+  serve(data);
+  assert.equal(await file(data).diagnoseFailure(), null);
+  serve(data, { behave: () => { throw new TypeError('x'); } });
+  const f = file(data, { networkError: () => new Error('offline-ish') });
+  const err = await f.diagnoseFailure();
+  assert.equal(err.message, 'offline-ish');
+});
+
+test('only one read-ahead download is in flight at a time', async () => {
+  const data = makeData(64 * BS);
+  const calls = serve(data, { delay: 30 });
+  const f = file(data, { readAhead: true, maxRequest: 4 * BS });
+  await read(f, 0, 4 * BS);
+  await read(f, 4 * BS, 8 * BS); // starts the prefetch of 8..11 (slow)
+  await read(f, 8 * BS, 9 * BS); // joins that prefetch
+  const before = calls.length;
+  await read(f, 12 * BS, 16 * BS); // sequential again: new prefetch only when the earlier one is done
+  await new Promise((r) => setTimeout(r, 100));
+  assert.ok(calls.length - before <= 3);
 });

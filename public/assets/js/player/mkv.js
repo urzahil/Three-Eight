@@ -479,9 +479,10 @@ export class MkvDemuxer {
    * onCues(trackId, cues[]) is called progressively; onProgress(0..1).
    * With opts.remote (streaming over HTTP) we never scan the whole file: tracks that
    * would need that, or too many separate reads, are skipped. Returns the skipped track ids.
+   * opts.only limits it to one track id; opts.pace waits that many ms before each download.
    */
   async extractSubtitles(onCues, onProgress, signal, opts = {}) {
-    const subs = this.tracks.filter((t) => t.type === 'subtitle' && t.subFormat);
+    const subs = this.tracks.filter((t) => t.type === 'subtitle' && t.subFormat && (opts.only == null || t.id === opts.only));
     if (!subs.length) return [];
     const set = new Set(subs.map((t) => t.number));
     const byNum = new Map(subs.map((t) => [t.number, t]));
@@ -511,9 +512,9 @@ export class MkvDemuxer {
     for (const c of subCues) counts.set(c.track, (counts.get(c.track) || 0) + 1);
     const allIndexed = subs.every((t) => counts.get(t.number) > 0);
     // Each indexed block costs at least one remote request, so cap how many we are willing to fetch.
-    if (opts.remote && (!allIndexed || subCues.length > (opts.maxRemoteCues || 600))) return subs.map((t) => t.id);
+    if (opts.remote && (!allIndexed || subCues.length > (opts.maxRemoteCues || 3000))) return subs.map((t) => t.id);
     if (allIndexed) {
-      const src = new FileSource(this.file, 128 * 1024);
+      const src = new FileSource(opts.remote && this.file.lite ? this.file.lite({ pace: opts.pace }) : this.file, 128 * 1024);
       let i = 0;
       for (const c of subCues) {
         if (signal?.aborted) return;

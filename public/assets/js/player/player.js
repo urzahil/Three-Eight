@@ -42,6 +42,13 @@ function trackLabel(t, n, kind) {
   return parts.length ? parts.join(' · ') : `Track ${n}`;
 }
 
+// Close gaps for cues without durations (end = next start).
+function closeGaps(s) {
+  for (let i = 0; i < s.cues.length - 1; i++) {
+    if (s.cues[i].end > s.cues[i + 1].start && s.cues[i].end - s.cues[i].start === 4) s.cues[i].end = s.cues[i + 1].start;
+  }
+}
+
 async function openDemuxer(file) {
   try {
     if (await MkvDemuxer.probe(file)) return await MkvDemuxer.open(file);
@@ -194,7 +201,7 @@ export class MoviePlayer extends EventTarget {
       duration: this.duration,
       mode: this.mode,
       audioTracks: this.audioTracks,
-      subtitleTracks: [...this.subtitles.values()].map((s) => ({ id: s.id, label: s.label, source: s.source, progress: s.progress, unsupported: s.unsupported })),
+      subtitleTracks: [...this.subtitles.values()].map((s) => ({ id: s.id, label: s.label, source: s.source, progress: s.progress, unsupported: s.unsupported, waiting: !!s.idle })),
       audioIndex: this.audioIndex,
       subtitleId: this.subtitleId,
     };
@@ -203,6 +210,7 @@ export class MoviePlayer extends EventTarget {
   unload() {
     this._loadToken++;
     this.extractAbort?.abort();
+    this.extracting = null;
     this.engine?.destroy();
     this.engine = null;
     if (this.objectUrl) URL.revokeObjectURL(this.objectUrl);
@@ -224,6 +232,7 @@ export class MoviePlayer extends EventTarget {
     const token = ++this._loadToken;
     this.file = file;
     this.triedModes = new Set();
+    this.diagnosed = false;
     this._emit('status', { text: file.remote ? 'Connecting to Google Drive…' : 'Reading file…' });
     const demux = await openDemuxer(file);
     if (token !== this._loadToken) return;
@@ -264,7 +273,7 @@ export class MoviePlayer extends EventTarget {
       for (const t of demux.tracks.filter((x) => x.type === 'subtitle')) {
         n++;
         const id = `e${t.id}`;
-        this.subtitles.set(id, { id, label: trackLabel(t, n, 'subtitle'), cues: [], source: 'embedded', progress: t.subFormat ? 0 : 1, unsupported: t.subFormat ? null : t.unsupported, format: t.subFormat });
+        this.subtitles.set(id, { id, label: trackLabel(t, n, 'subtitle'), cues: [], source: 'embedded', progress: t.subFormat ? 0 : 1, unsupported: t.subFormat ? null : t.unsupported, format: t.subFormat, idle: !!(file.remote && t.subFormat) });
       }
     }
 
@@ -353,6 +362,8 @@ export class MoviePlayer extends EventTarget {
 
   setSubtitle(id) {
     this.subtitleId = id;
+    if (this.extracting && this.extracting.id !== id) this._cancelExtract();
+    if (id && this.file?.remote) this._extractTrack(id);
     this._showCues(true);
     this._emit('tracks');
   }
@@ -378,29 +389,17 @@ export class MoviePlayer extends EventTarget {
     return id;
   }
 
-  /** Remote files: wait until the movie itself has started buffering, so subtitles don't compete with it. */
-  async _waitForBuffer(token) {
-    const v = this.video;
-    for (let i = 0; i < 40 && token === this._loadToken; i++) {
-      const b = v.buffered;
-      if (b.length && b.end(b.length - 1) - v.currentTime >= 8) return;
-      await new Promise((r) => setTimeout(r, 500));
-    }
-  }
-
   async _extractSubtitles(token) {
     const pending = [...this.subtitles.values()].filter((s) => s.source === 'embedded' && s.format);
     if (!pending.length || !this.demux) return;
-    const remote = !!this.file.remote;
+    // Streaming: every request counts, so a track is only read once it is selected (see _extractTrack).
+    if (this.file.remote) return;
+    const remote = false;
     this.extractAbort = new AbortController();
     const byId = new Map(pending.map((s) => [Number(s.id.slice(1)), s]));
     let lastEmit = 0;
     let skipped = [];
     try {
-      if (remote) {
-        await this._waitForBuffer(token);
-        if (token !== this._loadToken) return;
-      }
       skipped = await this.demux.extractSubtitles(
         (trackId, cues) => {
           const s = byId.get(trackId);
@@ -427,22 +426,86 @@ export class MoviePlayer extends EventTarget {
       console.warn('Subtitle extraction failed', err);
     }
     if (token !== this._loadToken) return;
-    if (skipped.length) {
-      // Reading them would download a large part of the movie.
-      for (const id of skipped) {
-        const s = byId.get(id);
-        if (s) s.unsupported = 'not available when streaming';
-      }
-      this._emit('notice', { text: 'Embedded subtitles can\u2019t be read while streaming from Google Drive. Add an .srt next to the movie and load it from the subtitle menu.' });
-    }
     for (const s of pending) {
       s.progress = 1;
-      // Close gaps for cues without durations (end = next start).
-      for (let i = 0; i < s.cues.length - 1; i++) {
-        if (s.cues[i].end > s.cues[i + 1].start && s.cues[i].end - s.cues[i].start === 4) s.cues[i].end = s.cues[i + 1].start;
-      }
+      closeGaps(s);
     }
     if (this.subtitleId && byId.has(Number(this.subtitleId.slice(1)))) this._showCues(true);
+    this._emit('tracks');
+  }
+
+  _cancelExtract() {
+    const cur = this.extracting;
+    if (!cur) return;
+    this.extracting = null;
+    cur.ctl.abort(); // _extractTrack resets the track when it notices
+  }
+
+  /**
+   * Streaming: read one embedded subtitle track, only when it is selected. Sequential, with a pause
+   * between downloads, so a long track trickles in instead of bursting requests at the server.
+   */
+  async _extractTrack(id) {
+    const s = this.subtitles.get(id);
+    if (!s || s.source !== 'embedded' || !s.idle || !this.demux) return;
+    this._cancelExtract();
+    s.idle = false;
+    s.progress = 0;
+    s.cues = [];
+    const token = this._loadToken;
+    const ctl = new AbortController();
+    this.extractAbort = ctl;
+    const me = (this.extracting = { id, ctl });
+    let skipped = [];
+    let failure = null;
+    let lastEmit = 0;
+    this._emit('tracks');
+    try {
+      skipped = await this.demux.extractSubtitles(
+        (trackId, cues) => {
+          if (ctl.signal.aborted) return;
+          for (const c of cues) {
+            const n = normalizeEmbeddedCue(s.format, c);
+            if (n) s.cues.push(n);
+          }
+          s.cues = sortCues(s.cues);
+          if (this.subtitleId === s.id) this._showCues();
+        },
+        (p) => {
+          s.progress = p;
+          const now = performance.now();
+          if (now - lastEmit > 500) {
+            lastEmit = now;
+            this._emit('tracks');
+          }
+        },
+        ctl.signal,
+        { remote: true, only: Number(id.slice(1)), pace: 150 },
+      ) || [];
+    } catch (err) {
+      failure = err;
+    }
+    if (token !== this._loadToken) return;
+    if (this.extracting === me) this.extracting = null;
+    if (ctl.signal.aborted) {
+      // Another subtitle was chosen meanwhile: forget the partial result, a later selection starts over.
+      s.idle = true;
+      s.progress = 0;
+      s.cues = [];
+    } else if (failure) {
+      console.warn('Subtitle extraction failed', failure);
+      s.progress = 1;
+      s.unsupported = 'could not be loaded';
+      this._emit('notice', { text: failure.remote ? failure.message : 'Could not read the embedded subtitles.', long: !!failure.blocked });
+    } else if (skipped.length) {
+      s.progress = 1;
+      s.unsupported = 'not available when streaming';
+      this._emit('notice', { text: 'These embedded subtitles can\u2019t be read while streaming. Add an .srt next to the movie and load it from the subtitle menu.' });
+    } else {
+      s.progress = 1;
+      closeGaps(s);
+    }
+    if (this.subtitleId === id) this._showCues(true);
     this._emit('tracks');
   }
 
@@ -451,6 +514,18 @@ export class MoviePlayer extends EventTarget {
     const err = this.video.error;
     console.warn('Video error', err);
     const time = this.time;
+    if (this.mode === 'native' && this.file.remote && !this.diagnosed && (err?.code === 2 || err?.code === 4)) {
+      // The element downloads by itself and only says "network error". Find out whether Google is
+      // blocking us (or we are offline) before trying anything else.
+      this.diagnosed = true;
+      const file = this.file;
+      const why = await file.diagnoseFailure?.();
+      if (this.file !== file) return;
+      if (why) {
+        this._emit('fatal', { text: why.message, long: !!why.blocked });
+        return;
+      }
+    }
     if (this.mode === 'native' && this.mseOk && !this.triedModes.has('mse')) {
       this._emit('notice', { text: 'Native playback failed, switching to the built-in player…' });
       await this._start('mse', time);
@@ -469,7 +544,7 @@ export class MoviePlayer extends EventTarget {
     if (err?.remote) {
       // Reading the remote file failed (quota, network...). Switching players would not help
       // and would only repeat the failing requests: tell the user; the feeder retries on its own.
-      this._emit('notice', { text: err.message });
+      this._emit('notice', { text: err.message, long: !!err.blocked });
       return;
     }
     this._onVideoError();

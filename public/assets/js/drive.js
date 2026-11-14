@@ -86,6 +86,8 @@ export function pickSubtitle(movieName, files, lang = '') {
   return cands.length ? cands[0].f : null;
 }
 
+const BLOCKED = 'Google is temporarily blocking downloads from your internet connection (it suspects automated traffic). This usually clears within a few hours. Try another network, turn off a VPN if you use one, or use your own copy of the film.';
+
 export const driveNetworkError = (cause) => Object.assign(new Error('Could not reach Google Drive.'), { remote: true, cause });
 
 export class DriveClient {
@@ -129,6 +131,21 @@ export class DriveClient {
     } catch (err) {
       throw driveNetworkError(err);
     }
+  }
+
+  /**
+   * A media request failed without any answer (no CORS headers: typically Google's "automated queries"
+   * page for a blocked IP address). One cheap JSON call tells the cases apart: if the API still answers,
+   * the block is specific to downloads. Returns an Error to show, or null if there is nothing to add.
+   */
+  async diagnose(id) {
+    try {
+      await fetch(this._url(id, { fields: 'id' }), { headers: this._headers(id) });
+    } catch {
+      if (typeof navigator !== 'undefined' && navigator.onLine === false) return Object.assign(new Error('You seem to be offline.'), { remote: true });
+      return null;
+    }
+    return Object.assign(new Error(BLOCKED), { remote: true, permanent: true, blocked: true });
   }
 
   /** Name of a folder (the configured one by default). */
@@ -204,6 +221,7 @@ export class DriveClient {
       headers: () => this._headers(file.id),
       explain: driveErrorFromResponse,
       networkError: driveNetworkError,
+      diagnose: () => this.diagnose(file.id),
     });
     rf.drive = { id: file.id, resourceKey: file.resourceKey || '', folder: file.folder || '', folderKey: file.folderKey || '' };
     return rf;
@@ -216,7 +234,7 @@ export class DriveClient {
     try {
       res = await fetch(this._url(file.id, { alt: 'media' }), { headers: this._headers(file.id) });
     } catch (err) {
-      throw driveNetworkError(err);
+      throw (await this.diagnose(file.id)) || driveNetworkError(err);
     }
     if (!res.ok) throw await driveErrorFromResponse(res);
     let buf;

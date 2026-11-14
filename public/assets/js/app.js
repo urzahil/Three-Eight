@@ -39,12 +39,12 @@ function showMessage(title, text) {
   show('message');
 }
 
-function toast(text, kind = '') {
+function toast(text, kind = '', ms = 0) {
   const el = document.createElement('div');
   el.className = 'toast ' + kind;
   el.textContent = text;
   $('toasts').appendChild(el);
-  setTimeout(() => el.remove(), kind === 'warn' ? 6000 : 3500);
+  setTimeout(() => el.remove(), ms || (kind === 'warn' ? 6000 : 3500));
   while ($('toasts').children.length > 4) $('toasts').firstChild.remove();
 }
 
@@ -725,9 +725,10 @@ class Room {
 
     // Player events
     p.addEventListener('tracks', () => this._renderMenus());
-    p.addEventListener('notice', (e) => toast(e.detail.text, 'warn'));
+    // `long` messages (Google blocking downloads) explain something people need time to read.
+    p.addEventListener('notice', (e) => toast(e.detail.text, 'warn', e.detail.long ? 25000 : 0));
     p.addEventListener('fatal', (e) => {
-      toast(e.detail.text, 'warn');
+      toast(e.detail.text, 'warn', e.detail.long ? 25000 : 0);
       this._renderStage();
     });
     p.addEventListener('status', (e) => {
@@ -978,7 +979,7 @@ class Room {
       await this._shareSubtitle(f.name, await this.drive.downloadText(f));
       if ($('movie-dialog').open) $('movie-dialog').close('subtitles');
     } catch (err) {
-      toast(err.message || 'Could not download the subtitles.', 'warn');
+      toast(err.message || 'Could not download the subtitles.', 'warn', err.blocked ? 25000 : 0);
       if (button) button.disabled = false;
     }
   }
@@ -1057,7 +1058,7 @@ class Room {
       await this.player.load(file, { audioIndex: asRoom ? 0 : s.audio });
     } catch (err) {
       console.error(err);
-      toast(file.remote && err.remote ? err.message : 'Could not open this file: ' + (err.message || err), 'warn');
+      toast(file.remote && err.remote ? err.message : 'Could not open this file: ' + (err.message || err), 'warn', err.blocked ? 25000 : 0);
       this.player.unload();
       this.loadingMovie = false;
       this._renderStage();
@@ -1304,7 +1305,8 @@ class Room {
     const items = [this._menuItem('Off', !s.sub, () => this.sync.setSubtitle(null))];
     for (const t of info?.subtitleTracks || []) {
       let note = '';
-      if (t.unsupported) note = t.unsupported === 'not available when streaming' ? t.unsupported : 'not supported';
+      if (t.unsupported) note = ['not available when streaming', 'could not be loaded'].includes(t.unsupported) ? t.unsupported : 'not supported';
+      else if (t.waiting) note = 'loads when selected'; // streaming: read on demand
       else if (t.progress < 1) note = `loading ${Math.round(t.progress * 100)}%`;
       else if (t.source === 'external') note = 'file';
       items.push(this._menuItem(t.label, s.sub === t.id, () => this.sync.setSubtitle(t.id), note, !!t.unsupported));
