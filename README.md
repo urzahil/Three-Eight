@@ -13,7 +13,7 @@ Video meetups and movie nights with friends, entirely in the browser (Chrome, Fi
 ```
              ┌──────────── signaling only (tiny JSON over WebSocket) ───────────┐
   Browser A ─┤                                                                  ├─ Browser B
-             └────── audio · video · chat · movie sync (WebRTC, direct P2P) ─────┘
+             └───── audio · video · chat · movie sync (WebRTC, direct P2P) ─────┘
 ```
 
 - **Server** (`server/`): Node.js with one dependency (`ws`). It serves the static app, stores rooms and their scrypt-hashed passwords in `/data/rooms.json`, checks the password when someone joins, relays WebRTC offers, answers and ICE candidates between members of the same room, and answers clock-sync pings.
