@@ -1319,10 +1319,8 @@ class Room {
     const dsubs = this._driveSubtitles();
     if (dsubs) {
       const shared = new Set(s.subFiles.map((f) => f.name));
-      // A folder can hold several films with their subtitles: list this film's. If none is recognisably
-      // its own (oddly named files in a one-film folder), list them all so they stay reachable.
-      const own = dsubs.items.filter((f) => subtitleMatches(s.movie.name, f.name));
-      const files = (own.length ? own : dsubs.items).filter((f) => !shared.has(f.name));
+      // A folder can hold several films with their subtitles: list only this film's (none if none match).
+      const files = dsubs.items.filter((f) => subtitleMatches(s.movie.name, f.name) && !shared.has(f.name));
       const dh = document.createElement('h4');
       dh.textContent = 'From Google Drive';
       if (dsubs.status === 'loading') items.push(dh, this._menuItem('Loading…', false, () => {}, '', true));

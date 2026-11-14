@@ -409,11 +409,14 @@ async function adminApi(base) {
     await sleep(800);
     a = await state(alice); b = await state(bob);
     assert(a.paused && b.paused, 'native pause synced');
-    // no subtitle file matches single.mp4: the Drive group then lists them all, so odd names stay reachable
+    // no subtitle file matches single.mp4: the Drive group lists nothing (subtitles of other films stay hidden)
     await ctl(bob, '#m-subs');
-    await waitFor(bob, () => [...document.querySelectorAll('#m-subs-menu button span')].some((s) => s.textContent === 'subs_en.srt'));
-    const all = await bob.$$eval('#m-subs-menu button span', (els) => els.map((e) => e.textContent));
-    assert(['multi.srt', 'multi.it.srt', 'subs_en.srt'].every((n) => all.includes(n)), 'all listed when none match: ' + all);
+    await waitFor(bob, () => {
+      const t = [...document.querySelectorAll('#m-subs-menu button, #m-subs-menu h4')].map((e) => e.textContent);
+      return t.some((x) => x.includes('Load subtitle file')) && !t.some((x) => x.includes('Loading…'));
+    });
+    const all = await bob.$$eval('#m-subs-menu button, #m-subs-menu h4', (els) => els.map((e) => e.textContent));
+    assert(!all.some((t) => /multi\.srt|multi\.it\.srt|subs_en\.srt|From Google Drive/.test(t)), 'nothing from Drive listed when no file matches: ' + all);
     await bob.keyboard.press('Escape');
     assert.strictEqual(fetches(B.stats), fetchesAfterOpen, 'native playback: the <video> element streams, nothing else fetches');
     assert(B.stats.requests.some((r) => r.url.includes(ID.mp4) && r.type === 'media'), 'the <video> element made the media requests');
