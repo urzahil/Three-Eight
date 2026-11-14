@@ -918,3 +918,48 @@ test('cues: asks local holders first, then moves on when one does not answer', a
   assert.equal(a.swarm.have.has('z-local'), false);
   net.closeAll();
 });
+
+// ---- a silent or departed peer must cost one timeout, not one per queued piece --------------------------------------------
+test('a silent fetcher costs one timeout in all: pieces queued behind its slots do not ask it again', async () => {
+  const net = new Net();
+  const data = makeData(8 * P);
+  const server = makeServer(data);
+  const a = net.node('alice', { firstByteMs: 80 }); // a relay gets twice that
+  const b = net.node('bob', { firstByteMs: 80 });
+  net.connect('alice', 'bob');
+  const fa = driveFile(a.swarm, data, server);
+  const fb = driveFile(b.swarm, data, server);
+  fa.swarm.activate();
+  fb.swarm.activate();
+  await sleep(30);
+  net.silent.add('bob'); // frozen: its odd pieces (streamers [alice, bob]) never come
+  const t0 = Date.now();
+  assert((await read(fa, 0, 8 * P)).equals(data), 'the whole film arrives');
+  const took = Date.now() - t0;
+  assert.equal(a.mesh.out(T.WANT).length, 2, 'bob was asked for two pieces (his two slots) and then left alone');
+  assert(took < 330, `one timeout (160 ms) plus the reads, not one per queued piece: ${took} ms`);
+  net.closeAll();
+});
+
+test('a peer that leaves while pieces are queued for it frees them at once', async () => {
+  const net = new Net();
+  const data = makeData(8 * P);
+  const server = makeServer(data);
+  const a = net.node('alice', { firstByteMs: 5000 });
+  const b = net.node('bob');
+  net.connect('alice', 'bob');
+  const fa = driveFile(a.swarm, data, server);
+  const fb = driveFile(b.swarm, data, server);
+  fa.swarm.activate();
+  fb.swarm.activate();
+  await sleep(30);
+  net.silent.add('bob');
+  const pending = read(fa, 0, 8 * P);
+  await sleep(40);
+  a.mesh.peers.delete('bob');
+  a.mesh.dispatchEvent(new CustomEvent('peer-removed', { detail: { peer: { id: 'bob' } } }));
+  const t0 = Date.now();
+  assert((await pending).equals(data));
+  assert(Date.now() - t0 < 500, 'no waiting for the long timeouts');
+  net.closeAll();
+});
