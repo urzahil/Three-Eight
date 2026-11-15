@@ -23,7 +23,7 @@ const crypto = require('crypto');
 const zlib = require('zlib');
 const { WebSocketServer } = require('ws');
 const { RoomStore, RoomError, parseDriveFolder } = require('./store');
-const { limiterKey } = require('./ip');
+const { limiterKey, forwardedAddress } = require('./ip');
 const { GoogleDrive, DriveError, ID_RE: DRIVE_ID_RE, FOLDER, kindOf, loadServiceAccount, parseRange, MiB } = require('./drive');
 
 const PORT = parseInt(process.env.PORT || '4567', 10);
@@ -384,7 +384,8 @@ function forwardedValue(req, header) {
 
 function clientIp(req) {
   if (TRUSTED_HOPS > 0) {
-    const fwd = forwardedValue(req, 'x-forwarded-for');
+    // Only a real IP address counts (a forged header can hold any text, which would make unbounded limiter keys).
+    const fwd = forwardedAddress(forwardedValue(req, 'x-forwarded-for'));
     if (fwd) return fwd;
   }
   return req.socket.remoteAddress || '';
@@ -442,11 +443,14 @@ function parseCookies(req) {
 }
 
 // Simple sliding-window limiter for failed password attempts.
+// At most MAX_LIMITER_KEYS clients are remembered per limiter: when it is full, expired entries go first, then the oldest.
+const MAX_LIMITER_KEYS = 10000;
 class FailLimiter {
-  constructor(max, windowMs) {
+  constructor(max, windowMs, maxKeys = MAX_LIMITER_KEYS) {
     this.max = max;
     this.windowMs = windowMs;
-    this.map = new Map();
+    this.maxKeys = maxKeys;
+    this.map = new Map(); // key -> {first, count}; insertion order = order of `first`
   }
   blocked(key) {
     const e = this.map.get(key);
@@ -472,8 +476,14 @@ class FailLimiter {
   fail(key) {
     const now = Date.now();
     const e = this.map.get(key);
-    if (!e || now - e.first > this.windowMs) this.map.set(key, { first: now, count: 1 });
-    else e.count++;
+    if (e && now - e.first <= this.windowMs) {
+      e.count++;
+      return;
+    }
+    this.map.delete(key); // a new window: re-insert at the end, so the map stays ordered oldest first
+    if (this.map.size >= this.maxKeys) this.sweep();
+    if (this.map.size >= this.maxKeys) this.map.delete(this.map.keys().next().value);
+    this.map.set(key, { first: now, count: 1 });
   }
   sweep() {
     const now = Date.now();
@@ -687,7 +697,7 @@ async function handleApi(req, res, url) {
     const ip = limiterKey(clientIp(req));
     if (adminLimiter.blocked(ip)) return sendJson(res, 429, { error: 'Too many attempts. Try again later.' });
     const body = await readJson(req);
-    if (!safeEqual(body.password || '', ADMIN_PASSWORD)) {
+    if (!safeEqual(typeof body.password === 'string' ? body.password : '', ADMIN_PASSWORD)) {
       adminLimiter.fail(ip);
       return sendJson(res, 401, { error: 'Wrong password' });
     }
@@ -717,8 +727,10 @@ async function handleApi(req, res, url) {
     }
     if (!name && req.method === 'POST') {
       const body = await readJson(req);
+      const password = body.password == null ? '' : body.password;
+      if (typeof password !== 'string') return sendJson(res, 400, { error: 'The password must be text.' });
       try {
-        await store.create(String(body.name || '').trim(), String(body.password || ''));
+        await store.create(typeof body.name === 'string' ? body.name.trim() : '', password);
       } catch (err) {
         if (!(err instanceof RoomError)) throw err;
         return sendJson(res, 400, { error: err.message });
@@ -729,7 +741,7 @@ async function handleApi(req, res, url) {
       const body = await readJson(req);
       let drive;
       try {
-        drive = parseDriveFolder(typeof body.link === 'string' ? body.link : '');
+        drive = parseDriveFolder(body.link == null ? '' : body.link);
       } catch (err) {
         return sendJson(res, 400, { error: err.message });
       }
@@ -746,13 +758,15 @@ async function handleApi(req, res, url) {
     }
     if (name && parts.length === 4 && req.method === 'PUT') {
       const body = await readJson(req);
+      const password = body.password == null ? '' : body.password;
+      if (typeof password !== 'string') return sendJson(res, 400, { error: 'The password must be text.' });
       try {
-        await store.setPassword(name, String(body.password || ''));
+        await store.setPassword(name, password);
       } catch (err) {
         if (!(err instanceof RoomError)) throw err;
         return sendJson(res, 400, { error: err.message });
       }
-      if (body.kick) kickRoom(name, 'kicked', 'The room password was changed. Please rejoin.');
+      if (body.kick === true) kickRoom(name, 'kicked', 'The room password was changed. Please rejoin.');
       else pushDrive(name); // everyone's old Drive token just stopped working: hand out the new one
       return sendJson(res, 200, { ok: true });
     }
@@ -868,8 +882,15 @@ function send(ws, msg) {
   if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(msg));
 }
 
+/** True when this socket is the live member registered under its room and id (not merely a socket with those fields set). */
+function registered(ws) {
+  return !!ws.room && live.get(ws.room)?.get(ws.id)?.ws === ws;
+}
+
+// Only text is a name: any other JSON value (an object whose toString is a number, an array, ...) becomes "Guest".
 function cleanName(name) {
-  return String(name || '').replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 40) || 'Guest';
+  if (typeof name !== 'string') return 'Guest';
+  return name.replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 40) || 'Guest';
 }
 
 function leave(ws) {
@@ -887,16 +908,24 @@ function leave(ws) {
 }
 
 async function handleJoin(ws, msg) {
-  const roomName = String(msg.room || '');
+  // Every field comes from the client's JSON: only text is usable (ID_RE.test would also accept an array of one string).
+  if (typeof msg.room !== 'string' || typeof msg.id !== 'string' || (msg.password != null && typeof msg.password !== 'string')) {
+    send(ws, { type: 'error', code: 'bad-request', message: 'Invalid join request' });
+    return;
+  }
+  const roomName = msg.room;
+  const id = msg.id;
+  const password = msg.password == null ? '' : msg.password;
   const r = store.get(roomName);
   if (!r) {
     send(ws, { type: 'error', code: 'no-room', message: 'This room does not exist.' });
     return;
   }
-  if (!ID_RE.test(msg.id || '')) {
+  if (!ID_RE.test(id)) {
     send(ws, { type: 'error', code: 'bad-request', message: 'Invalid participant id' });
     return;
   }
+  const name = cleanName(msg.name);
   // Count the attempt before the (slow) password check, so a burst cannot get past the limit while earlier
   // attempts are still being evaluated. A correct password gives the attempt back. Open rooms cost nothing.
   const reserved = !!r.passwordHash;
@@ -906,7 +935,7 @@ async function handleJoin(ws, msg) {
   }
   let ok = false;
   try {
-    ok = await store.check(roomName, msg.password);
+    ok = await store.check(roomName, password);
   } finally {
     if (reserved && ok) roomLimiter.release(ws.ip);
   }
@@ -927,36 +956,52 @@ async function handleJoin(ws, msg) {
     return;
   }
 
+  // Everything that could fail is done: from here on the socket is moved into the room in one go.
   const key = RoomStore.key(roomName);
   leave(ws);
   let members = live.get(key);
+  const existing = members?.get(id);
+  if (!existing && (members ? members.size : 0) >= MAX_ROOM_SIZE) {
+    send(ws, { type: 'error', code: 'room-full', message: `Room is full (max ${MAX_ROOM_SIZE}).` });
+    return;
+  }
   if (!members) {
     members = new Map();
     live.set(key, members);
   }
-  const existing = members.get(msg.id);
-  if (!existing && members.size >= MAX_ROOM_SIZE) {
-    send(ws, { type: 'error', code: 'room-full', message: `Room is full (max ${MAX_ROOM_SIZE}).` });
-    return;
-  }
   if (existing && existing.ws !== ws) {
     // Same participant reconnecting (e.g. after a network blip): replace the old socket.
     existing.ws.room = null;
-    existing.ws.close(4000, 'replaced');
+    try {
+      existing.ws.close(4000, 'replaced');
+    } catch { /* already gone */ }
   }
+  const peers = [...members.entries()].filter(([pid]) => pid !== id).map(([pid, m]) => ({ id: pid, name: m.name }));
+  members.set(id, { ws, name });
   ws.room = key;
-  ws.id = msg.id;
-  const name = cleanName(msg.name);
-  const peers = [...members.entries()].filter(([pid]) => pid !== msg.id).map(([pid, m]) => ({ id: pid, name: m.name }));
-  members.set(msg.id, { ws, name });
-  // resumed: this join took over the live entry of the same participant (a reconnect).
-  const welcome = { type: 'welcome', id: msg.id, room: room.name, peers, resumed: !!existing };
-  const drive = driveInfo(room);
-  if (drive) welcome.drive = drive;
-  send(ws, welcome);
-  if (!existing) {
-    for (const [pid, m] of members) if (pid !== msg.id) send(m.ws, { type: 'peer-joined', id: msg.id, name });
+  ws.id = id;
+  try {
+    // resumed: this join took over the live entry of the same participant (a reconnect).
+    const welcome = { type: 'welcome', id, room: room.name, peers, resumed: !!existing };
+    const drive = driveInfo(room);
+    if (drive) welcome.drive = drive;
+    send(ws, welcome);
+    if (!existing) {
+      for (const [pid, m] of members) if (pid !== id) send(m.ws, { type: 'peer-joined', id, name });
+    }
+  } catch (err) {
+    leave(ws); // never stay half joined
+    throw err;
   }
+}
+
+// Browsers always send Origin on WebSocket handshakes: refuse pages from other sites (cross-site WebSocket
+// hijacking). A missing Origin (non-browser clients) is allowed.
+// A Host header as hostname and port; null for anything that is not plainly "name", "name:port", "1.2.3.4:port"
+// or "[v6]:port" (no "@", "/", whitespace and the like: such a value is a trick, not a host).
+function parseHost(host) {
+  const m = /^([a-z0-9.-]+|\[[0-9a-f:.]+\])(?::(\d{1,5}))?$/.exec(host);
+  return m ? { hostname: m[1], port: m[2] || '' } : null;
 }
 
 // Browsers always send Origin on WebSocket handshakes: refuse pages from other sites (cross-site WebSocket
@@ -974,12 +1019,15 @@ function originAllowed(req) {
   const host = String(req.headers.host || '').toLowerCase();
   if (host && o.host === host) return true;
   if (TRUSTED_HOPS > 0) {
-    // nginx's "proxy_set_header Host $host" drops the port, so behind a trusted proxy the hostname alone has to match.
-    try {
-      return !!host && o.hostname === new URL(`http://${host}`).hostname;
-    } catch {
-      return false;
-    }
+    // nginx's "proxy_set_header Host $host" drops the port, so behind a trusted proxy the hostname alone may have to
+    // match. Not any scheme or port, though: the scheme must be the one the proxy says it received (https <-> forwarded
+    // proto), and the port the default one for it or the one in Host. Anything else belongs in ALLOWED_ORIGINS.
+    const h = parseHost(host);
+    if (!h || o.hostname !== h.hostname) return false;
+    const https = isHttps(req);
+    if (o.protocol !== (https ? 'https:' : 'http:')) return false;
+    const port = o.port || (https ? '443' : '80'); // URL leaves out a default port
+    return port === (https ? '443' : '80') || port === h.port;
   }
   return false;
 }
@@ -1012,56 +1060,61 @@ wss.on('connection', (ws, req) => {
       return;
     }
     if (isBinary) return;
-    let msg;
+    // Nothing a client sends may take the process down: log it and carry on.
     try {
-      msg = JSON.parse(raw.toString());
-    } catch {
-      return;
-    }
-    if (!msg || typeof msg !== 'object') return;
+      let msg;
+      try {
+        msg = JSON.parse(raw.toString());
+      } catch {
+        return;
+      }
+      if (!msg || typeof msg !== 'object' || Array.isArray(msg) || typeof msg.type !== 'string') return;
 
-    switch (msg.type) {
-      case 'time':
-        // Clock sync: echo client timestamp with server time.
-        send(ws, { type: 'time', c: msg.c, s: Date.now() });
-        break;
+      switch (msg.type) {
+        case 'time':
+          // Clock sync: echo client timestamp with server time.
+          send(ws, { type: 'time', c: msg.c, s: Date.now() });
+          break;
 
-      case 'join':
-        // One join at a time per socket: otherwise a burst of password guesses is evaluated in parallel.
-        if (ws.joining) {
-          send(ws, { type: 'error', code: 'busy', message: 'A join is already in progress.' });
+        case 'join':
+          // One join at a time per socket: otherwise a burst of password guesses is evaluated in parallel.
+          if (ws.joining) {
+            send(ws, { type: 'error', code: 'busy', message: 'A join is already in progress.' });
+            break;
+          }
+          ws.joining = true;
+          handleJoin(ws, msg).catch((err) => {
+            // Always answer: a client waiting for its welcome would otherwise wait forever.
+            console.error('join failed', err);
+            if (!registered(ws)) ws.room = null;
+            send(ws, { type: 'error', code: 'server-error', message: 'The server could not add you to the room. Please try again.' });
+          }).finally(() => { ws.joining = false; });
+          break;
+
+        case 'signal': {
+          // Relay WebRTC signaling to one peer in the same room, but only from a socket that really is a member.
+          if (!registered(ws) || typeof msg.to !== 'string') return;
+          const target = live.get(ws.room)?.get(msg.to);
+          if (target) send(target.ws, { type: 'signal', from: ws.id, data: msg.data });
           break;
         }
-        ws.joining = true;
-        handleJoin(ws, msg).catch((err) => {
-          // Always answer: a client waiting for its welcome would otherwise wait forever.
-          console.error('join failed', err);
-          send(ws, { type: 'error', code: 'server-error', message: 'The server could not add you to the room. Please try again.' });
-        }).finally(() => { ws.joining = false; });
-        break;
 
-      case 'signal': {
-        // Relay WebRTC signaling to one peer in the same room.
-        if (!ws.room || typeof msg.to !== 'string') return;
-        const target = live.get(ws.room)?.get(msg.to);
-        if (target) send(target.ws, { type: 'signal', from: ws.id, data: msg.data });
-        break;
+        case 'rename': {
+          if (!registered(ws)) return;
+          live.get(ws.room).get(ws.id).name = cleanName(msg.name);
+          break;
+        }
+
+        case 'leave':
+          leave(ws);
+          break;
+
+        default:
+          break;
       }
-
-      case 'rename': {
-        if (!ws.room) return;
-        const members = live.get(ws.room);
-        const me = members?.get(ws.id);
-        if (me && me.ws === ws) me.name = cleanName(msg.name);
-        break;
-      }
-
-      case 'leave':
-        leave(ws);
-        break;
-
-      default:
-        break;
+    } catch (err) {
+      console.error('message failed', err);
+      if (!registered(ws)) ws.room = null;
     }
   });
 

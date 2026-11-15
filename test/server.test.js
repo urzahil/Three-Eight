@@ -1133,8 +1133,21 @@ test('Origin vs Host: strict host:port normally, hostname only behind a trusted 
   const open = (s, origin, host) => wsAt(s.base, { Origin: origin, Host: host }).then((ws) => { ws.close(); return true; }, (err) => err.message);
   // nginx "proxy_set_header Host $host": no port, while the browser's Origin has one.
   assert.match(await open(strict, 'https://x.example.com:8443', 'x.example.com'), /403/);
-  assert.strictEqual(await open(trusted, 'https://x.example.com:8443', 'x.example.com'), true);
-  assert.strictEqual(await open(trusted, 'https://x.example.com', 'x.example.com:8443'), true);
+  // Behind a trusted proxy the scheme must match what the proxy forwards, and the port must be the default or Host's.
+  const open2 = (origin, host, proto) => wsAt(trusted.base, { Origin: origin, Host: host, ...(proto && { 'X-Forwarded-Proto': proto }) }).then((ws) => { ws.close(); return true; }, (err) => err.message);
+  assert.strictEqual(await open2('https://x.example.com:8443', 'x.example.com:8443', 'https'), true);
+  assert.strictEqual(await open2('https://x.example.com', 'x.example.com:8443', 'https'), true, 'default port, Host with port');
+  assert.strictEqual(await open2('https://x.example.com', 'x.example.com', 'https'), true);
+  assert.strictEqual(await open2('http://x.example.com', 'x.example.com'), true, 'http page, no forwarded proto');
+  assert.strictEqual(await open2('http://x.example.com', 'x.example.com', 'http'), true);
+  assert.match(await open2('https://x.example.com:8443', 'x.example.com', 'https'), /403/, 'non-default port that Host does not name');
+  assert.match(await open2('https://x.example.com:9999', 'x.example.com:8443', 'https'), /403/, 'a third port');
+  assert.match(await open2('http://x.example.com', 'x.example.com:8443', 'https'), /403/, 'scheme differs from forwarded proto');
+  assert.match(await open2('https://x.example.com', 'x.example.com:8443'), /403/, 'https origin, but the proxy did not say https');
+  assert.match(await open2('http://x.example.com:80', 'x.example.com:8443', 'https'), /403/, 'http origin on an https connection');
+  assert.match(await open2('https://127.0.0.1', 'evil.com@127.0.0.1', 'https'), /403/, 'userinfo trick in Host');
+  assert.match(await open2('https://evil.com', 'evil.com/x', 'https'), /403/, 'slash in Host');
+  assert.match(await open2('https://evil.com', 'evil.com @a', 'https'), /403/, 'whitespace in Host');
   assert.strictEqual(await open(strict, 'https://x.example.com:8443', 'x.example.com:8443'), true, 'exact host:port');
   assert.strictEqual(await open(strict, 'https://x.example.com', 'x.example.com'), true, 'default port');
   assert.match(await open(trusted, 'https://evil.example.net:8443', 'x.example.com'), /403/, 'other hostname');
@@ -1232,4 +1245,195 @@ test('DRIVE_CACHE_MB below the minimum is raised, with a warning', async () => {
   const ok = await spawnServer(env('64'));
   assert.doesNotMatch(ok.out.log, /too small/);
   ok.stop();
+});
+
+// ---- Hostile client JSON ------------------------------------------------------------------------------------------
+const WEIRD = [{ toString: 1 }, ['aaaaaaaa1'], 5, true, { a: 1 }, [], null];
+
+test('limiterKey input: forwarded values that are not IPs fall back to the socket address; ports and brackets are stripped', async () => {
+  const { forwardedAddress } = require('../server/ip');
+  assert.strictEqual(forwardedAddress('1.2.3.4:5555'), '1.2.3.4');
+  assert.strictEqual(forwardedAddress('[2001:db8::1]:443'), '2001:db8::1');
+  assert.strictEqual(forwardedAddress('[2001:db8::1]'), '2001:db8::1');
+  assert.strictEqual(forwardedAddress('2001:db8::1'), '2001:db8::1');
+  for (const bad of ['', 'not-an-ip', 'x'.repeat(16000), '1.2.3.4.5', '999.1.1.1', '1.2.3.4:99999x', '1.2.3.4, 5.6.7.8', '[1.2.3.4]:80x']) assert.strictEqual(forwardedAddress(bad), '', bad.slice(0, 20));
+
+  const s = await spawnServer({ TRUST_PROXY: '1' });
+  const attempt = (xff) => fetch(s.base + '/api/admin/login', { method: 'POST', headers: { 'content-type': 'application/json', 'X-Forwarded-For': xff }, body: JSON.stringify({ password: 'wrong' }) }).then((r) => r.status);
+  // Garbage all counts against the socket's own address (127.0.0.1), whatever the text.
+  for (let i = 0; i < 5; i++) assert.strictEqual(await attempt(`junk-${i}`), 401);
+  for (let i = 0; i < 5; i++) assert.strictEqual(await attempt('z'.repeat(8000 + i)), 401);
+  assert.strictEqual(await attempt('also-junk'), 429, 'one budget for all non-IP values');
+  // A valid IP with a port is that IP.
+  for (let i = 0; i < 10; i++) assert.strictEqual(await attempt(`5.5.5.5:${1000 + i}`), 401);
+  assert.strictEqual(await attempt('5.5.5.5'), 429);
+  assert.strictEqual(await attempt('[2001:db8:7::1]:5000'), 401);
+  s.stop();
+});
+
+test('the failure limiters remember at most 10,000 clients (expired first, then the oldest)', async () => {
+  const s = await spawnServer({ TRUST_PROXY: '1' });
+  const attempt = (xff) => fetch(s.base + '/api/admin/login', { method: 'POST', headers: { 'content-type': 'application/json', 'X-Forwarded-For': xff }, body: JSON.stringify({ password: 'wrong' }) }).then((r) => r.status);
+  for (let i = 0; i < 10; i++) assert.strictEqual(await attempt('9.9.9.9'), 401);
+  assert.strictEqual(await attempt('9.9.9.9'), 429);
+  // 10,000 other clients push the oldest entry (9.9.9.9) out; the map does not grow past its cap.
+  const ips = Array.from({ length: 10000 }, (_, i) => `10.${i >> 8 & 255}.${i & 255}.1`);
+  for (let i = 0; i < ips.length; i += 200) await Promise.all(ips.slice(i, i + 200).map(attempt));
+  assert.strictEqual(await attempt('9.9.9.9'), 401, 'the oldest entry was dropped');
+  assert.strictEqual(await attempt('10.0.0.1'), 401, 'a recent one is still counted (one failure so far, one more now)');
+  s.stop();
+});
+
+test('hostile JSON in WebSocket messages never takes the server down', async () => {
+  const s = await spawnServer({});
+  const ck = await adminCookie(s.base);
+  const post = (body) => fetch(s.base + '/api/admin/rooms', { method: 'POST', headers: { 'content-type': 'application/json', cookie: ck }, body: JSON.stringify(body) });
+  assert.strictEqual((await post({ name: 'hostile' })).status, 201);
+  assert.strictEqual((await post({ name: 'hostile-pw', password: 'right' })).status, 201);
+  const alive = async () => {
+    assert.strictEqual(s.child.exitCode, null, 'server process is still running');
+    const probe = await wsAt(s.base);
+    probe.sendJson({ type: 'time', c: 1 });
+    assert.strictEqual((await probe.next()).c, 1);
+    probe.close();
+  };
+
+  const a = await wsAt(s.base);
+  a.sendJson({ type: 'join', room: 'hostile', id: 'hostilea1', name: 'A' });
+  assert.strictEqual((await a.next()).type, 'welcome');
+  const b = await wsAt(s.base);
+  b.sendJson({ type: 'join', room: 'hostile', id: 'hostileb1', name: 'B' });
+  assert.strictEqual((await b.next()).type, 'welcome');
+  assert.strictEqual((await a.next()).type, 'peer-joined');
+
+  // rename with every odd shape: the name becomes Guest, the server stays up.
+  for (const name of WEIRD) b.sendJson({ type: 'rename', name });
+  b.sendJson({ type: 'time', c: 2 });
+  assert.strictEqual((await b.next()).c, 2);
+  const rooms = async () => (await (await fetch(s.base + '/api/admin/rooms', { headers: { cookie: ck } })).json()).rooms;
+  assert.deepStrictEqual((await rooms()).find((r) => r.name === 'hostile').online, ['A', 'Guest']);
+  b.sendJson({ type: 'rename', name: 'Bob' });
+  b.sendJson({ type: 'time', c: 3 });
+  await b.next();
+  assert.deepStrictEqual((await rooms()).find((r) => r.name === 'hostile').online, ['A', 'Bob']);
+
+  // type, signal.to, and every join field with odd values.
+  for (const v of WEIRD) {
+    b.sendJson({ type: v });
+    b.sendJson({ type: 'signal', to: v, data: 1 });
+    b.sendJson({ type: 'signal', to: 'hostilea1', data: v }); // data is relayed as is
+  }
+  b.sendJson([1, 2, 3]);
+  b.sendJson('text');
+  b.sendJson(null);
+  b.sendJson({ type: 'time', c: 4 });
+  assert.strictEqual((await b.next()).c, 4);
+  let got = 0;
+  for (let i = 0; i < WEIRD.length; i++) { assert.strictEqual((await a.next()).type, 'signal'); got++; }
+  assert.strictEqual(got, WEIRD.length);
+
+  for (const field of ['room', 'id', 'password', 'name', 'type']) {
+    for (const v of WEIRD) {
+      const c = await wsAt(s.base);
+      const msg = { type: 'join', room: 'hostile-pw', id: 'hostilec1', name: 'C', password: 'right', [field]: v };
+      c.sendJson(msg);
+      if (field === 'type') { c.sendJson({ type: 'time', c: 9 }); assert.strictEqual((await c.next()).c, 9); c.close(); continue; } // not a join at all
+      const reply = await c.next();
+      if (field === 'name') assert.strictEqual(reply.type, 'welcome', `${field} ${JSON.stringify(v)} ${JSON.stringify(reply)}`);
+      else assert.strictEqual(reply.type, 'error', `${field} ${JSON.stringify(v)}`);
+      c.close();
+    }
+  }
+  await alive();
+
+  // Admin API bodies.
+  for (const v of WEIRD) {
+    const created = await post({ name: v, password: 'x' });
+    assert.strictEqual(created.status, 400, `create name ${JSON.stringify(v)}`);
+    const pw = await post({ name: 'okname', password: v });
+    assert.strictEqual(pw.status, v === null ? 201 : 400, `create password ${JSON.stringify(v)}`);
+    await fetch(s.base + '/api/admin/rooms/okname', { method: 'DELETE', headers: { cookie: ck } });
+    const put = await fetch(s.base + '/api/admin/rooms/hostile', { method: 'PUT', headers: { 'content-type': 'application/json', cookie: ck }, body: JSON.stringify({ password: v, kick: v }) });
+    assert.notStrictEqual(put.status, 500, `set password ${JSON.stringify(v)}`);
+    const link = await fetch(s.base + '/api/admin/rooms/hostile/drive', { method: 'PUT', headers: { 'content-type': 'application/json', cookie: ck }, body: JSON.stringify({ link: v }) });
+    assert.notStrictEqual(link.status, 500, `drive link ${JSON.stringify(v)}`);
+    const login = await fetch(s.base + '/api/admin/login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password: v }) });
+    assert.strictEqual(login.status, 401, 'login with a non-text password');
+  }
+  assert.strictEqual((await post({ name: 'okname2', password: { toString: 1 } })).status, 400);
+  assert.strictEqual((await post({ name: ['x'] })).status, 400);
+  assert.strictEqual((await fetch(s.base + '/api/admin/rooms/hostile', { method: 'PUT', headers: { 'content-type': 'application/json', cookie: ck }, body: JSON.stringify({ password: { toString: 1 } }) })).status, 400);
+  assert.strictEqual((await fetch(s.base + '/api/admin/rooms/hostile/drive', { method: 'PUT', headers: { 'content-type': 'application/json', cookie: ck }, body: JSON.stringify({ link: {} }) })).status, 400, 'a non-text link does not silently remove the folder');
+  assert.doesNotMatch(s.out.log, /request failed|message failed|join failed/, 'nothing threw');
+  await alive();
+  a.close();
+  b.close();
+  s.stop();
+});
+
+test('a failed join leaves no ghost: it cannot relay signals, is not counted, and kicks reach it', async () => {
+  const s = await spawnServer({ MAX_ROOM_SIZE: '2' });
+  const ck = await adminCookie(s.base);
+  const post = (body) => fetch(s.base + '/api/admin/rooms', { method: 'POST', headers: { 'content-type': 'application/json', cookie: ck }, body: JSON.stringify(body) });
+  await post({ name: 'ghosts' });
+  await post({ name: 'lockedg', password: 'right' });
+  const rooms = async () => (await (await fetch(s.base + '/api/admin/rooms', { headers: { cookie: ck } })).json()).rooms;
+  const online = async (name) => (await rooms()).find((r) => r.name === name).online;
+
+  const a = await wsAt(s.base);
+  a.sendJson({ type: 'join', room: 'ghosts', id: 'ghostmem01', name: 'A' });
+  assert.strictEqual((await a.next()).type, 'welcome');
+
+  // Each failing join (bad id, wrong password, no room, odd fields, full room): the socket still cannot relay into the room.
+  const failing = [
+    { room: 'ghosts', id: 'x', name: 'bad id' },
+    { room: 'ghosts', id: ['ghostbad01'], name: 'array id' },
+    { room: 'ghosts', id: 'ghostbad02', name: 'N', password: { toString: 1 } },
+    { room: 'lockedg', id: 'ghostbad03', name: 'N', password: 'wrong' },
+    { room: 'missing', id: 'ghostbad04', name: 'N' },
+    { room: { toString: 1 }, id: 'ghostbad05', name: 'N' },
+  ];
+  for (const f of failing) {
+    const g = await wsAt(s.base);
+    g.sendJson({ type: 'join', ...f });
+    assert.strictEqual((await g.next()).type, 'error', JSON.stringify(f));
+    g.sendJson({ type: 'signal', to: 'ghostmem01', data: { evil: 1 } });
+    g.sendJson({ type: 'rename', name: 'Ghost' });
+    g.sendJson({ type: 'time', c: 1 });
+    assert.strictEqual((await g.next()).c, 1);
+    g.close();
+  }
+  a.sendJson({ type: 'time', c: 2 });
+  assert.strictEqual((await a.next()).c, 2, 'nothing was relayed to the member');
+  assert.deepStrictEqual(await online('ghosts'), ['A']);
+  assert.deepStrictEqual(await online('lockedg'), [], 'no empty room entry stays behind');
+
+  // A join to a full room fails too: it is not a member afterwards, and the freed-up count is exact.
+  const b = await wsAt(s.base);
+  b.sendJson({ type: 'join', room: 'ghosts', id: 'ghostmem02', name: 'B' });
+  assert.strictEqual((await b.next()).type, 'welcome');
+  assert.strictEqual((await a.next()).type, 'peer-joined');
+  const full = await wsAt(s.base);
+  full.sendJson({ type: 'join', room: 'ghosts', id: 'ghostmem03', name: 'C' });
+  assert.strictEqual((await full.next()).code, 'room-full');
+  full.sendJson({ type: 'signal', to: 'ghostmem01', data: { evil: 1 } });
+  full.sendJson({ type: 'time', c: 3 });
+  await full.next();
+  a.sendJson({ type: 'time', c: 4 });
+  assert.strictEqual((await a.next()).c, 4, 'no signal from the rejected socket');
+
+  // A member whose second join fails still is a member of its first room only through its registration, and a
+  // socket that failed to move cannot sign as someone else.
+  const closes = new Promise((r) => full.on('close', r));
+  assert.deepStrictEqual((await online('ghosts')).sort(), ['A', 'B']);
+  const kick = await fetch(s.base + '/api/admin/rooms/ghosts', { method: 'PUT', headers: { 'content-type': 'application/json', cookie: ck }, body: JSON.stringify({ password: 'newpw', kick: true }) });
+  assert.strictEqual(kick.status, 200);
+  assert.strictEqual((await a.next()).code, 'kicked');
+  assert.strictEqual((await b.next()).code, 'kicked');
+  assert.deepStrictEqual(await online('ghosts'), []);
+  full.close();
+  await closes;
+  a.close();
+  b.close();
+  s.stop();
 });

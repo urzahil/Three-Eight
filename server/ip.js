@@ -37,4 +37,19 @@ function limiterKey(ip) {
   return g.slice(0, 4).map((x) => x.toString(16)).join(':') + '::/64';
 }
 
-module.exports = { limiterKey };
+/**
+ * The IP address in a value taken from a forwarding header, or '' when it is not one. A ":port" after an IPv4
+ * address and the brackets (with optional ":port") around an IPv6 address are removed first. Anything else
+ * (a forged header can hold any text) is refused, so callers fall back to the socket's address.
+ */
+function forwardedAddress(value) {
+  let text = String(value || '').trim();
+  if (text.length > 64) return '';
+  const bracketed = /^\[([^\]]+)\](?::\d{1,5})?$/.exec(text);
+  const v4port = /^(\d{1,3}(?:\.\d{1,3}){3}):\d{1,5}$/.exec(text);
+  if (bracketed) text = bracketed[1];
+  else if (v4port) text = v4port[1];
+  return net.isIP(text) ? text : '';
+}
+
+module.exports = { limiterKey, forwardedAddress };

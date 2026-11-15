@@ -23,11 +23,11 @@ async function hashPassword(password) {
 }
 
 async function verifyPassword(password, stored) {
-  if (!stored) return false;
+  if (typeof password !== 'string' || typeof stored !== 'string' || !stored) return false;
   const [scheme, saltB64, keyB64] = stored.split('$');
   if (scheme !== 'scrypt') return false;
   const expected = Buffer.from(keyB64, 'base64');
-  const key = await scrypt(String(password), Buffer.from(saltB64, 'base64'));
+  const key = await scrypt(password, Buffer.from(saltB64, 'base64'));
   return key.length === expected.length && crypto.timingSafeEqual(key, expected);
 }
 
@@ -39,7 +39,8 @@ const DRIVE_HELP = 'Paste a Google Drive folder link (https://drive.google.com/d
 // `resourcekey` in a link is accepted and ignored: a folder shared directly
 // with the service account needs none.
 function parseDriveFolder(input) {
-  const text = String(input ?? '').trim();
+  if (input != null && typeof input !== 'string') throw new Error('The folder link must be text. ' + DRIVE_HELP);
+  const text = (input ?? '').trim();
   if (!text) return null;
   let folderId = '';
   if (/^https?:\/\//i.test(text)) {
@@ -137,6 +138,7 @@ class RoomStore {
   async create(name, password) {
     if (!RoomStore.validName(name)) throw new RoomError('Room names may contain letters, digits, "-" and "_" (max 64), and cannot be a reserved word.');
     if (this.get(name)) throw new RoomError('A room with that name already exists.');
+    if (typeof password !== 'string') throw new RoomError('The password must be text.');
     const passwordHash = password ? await hashPassword(password) : '';
     // Hashing takes a while: another create for the same name may have finished meanwhile.
     if (this.get(name)) throw new RoomError('A room with that name already exists.');
@@ -148,6 +150,7 @@ class RoomStore {
 
   async setPassword(name, password) {
     if (!this.get(name)) throw new RoomError('No such room.');
+    if (typeof password !== 'string') throw new RoomError('The password must be text.');
     const passwordHash = password ? await hashPassword(password) : '';
     // The room may have been deleted while hashing.
     if (!this.get(name)) throw new RoomError('No such room.');
@@ -179,7 +182,7 @@ class RoomStore {
     const r = this.get(name);
     if (!r) return false;
     if (!r.passwordHash) return true;
-    return verifyPassword(password || '', r.passwordHash);
+    return verifyPassword(typeof password === 'string' ? password : '', r.passwordHash);
   }
 }
 
