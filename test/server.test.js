@@ -1220,6 +1220,9 @@ test('ALLOWED_ORIGINS entries are normalised like browser origins; bad ones are 
   assert.strictEqual(await open('https://other.example.org:8443'), true, 'path dropped, port kept');
   assert.match(await open('https://other.example.org'), /403/, 'a different port is a different origin');
   assert.match(s.out.log, /ALLOWED_ORIGINS: ignoring "nonsense"/);
+  // Older Safari does not match ws:/wss: to 'self', so the allowed origins are listed in connect-src too.
+  const res = await fetch(s.base + '/');
+  assert.match(res.headers.get('content-security-policy'), /connect-src 'self' ws:\/\/127\.0\.0\.1:\d+ wss:\/\/127\.0\.0\.1:\d+ wss:\/\/calls\.example\.com ws:\/\/plain\.example\.com wss:\/\/other\.example\.org:8443;/);
   s.stop();
 });
 

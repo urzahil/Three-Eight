@@ -15,6 +15,7 @@ function* boxes(b, start, end) {
     const type = fourcc(b, o + 4);
     let hdr = 8;
     if (size === 1) {
+      if (o + 16 > end || b.byteOffset + o + 16 > b.buffer.byteLength) return; // truncated 64-bit header
       size = dv.getUint32(8) * 0x100000000 + dv.getUint32(12);
       hdr = 16;
     } else if (size === 0) size = end - o;
@@ -67,9 +68,13 @@ export class Mp4Demuxer {
       const dv = new DataView(h.buffer);
       let size = dv.getUint32(0);
       const type = fourcc(h, 4);
-      if (size === 1) size = dv.getUint32(8) * 0x100000000 + dv.getUint32(12);
-      else if (size === 0) size = this.file.size - pos;
-      if (size < 8) break;
+      let hdr = 8;
+      if (size === 1) {
+        if (h.byteLength < 16) break; // truncated 64-bit header at the end of the file
+        size = dv.getUint32(8) * 0x100000000 + dv.getUint32(12);
+        hdr = 16;
+      } else if (size === 0) size = this.file.size - pos;
+      if (size < hdr) break;
       if (type === 'moov') moov = { pos, size };
       if (type === 'moof') this.fragmented = true;
       pos += size;

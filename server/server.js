@@ -200,7 +200,9 @@ const SECURITY_HEADERS = {
 //  - connect-src lists the WebSocket explicitly (older Safari does not match ws: to 'self').
 function contentSecurityPolicy(req) {
   const host = String(req.headers.host || '');
-  const ws = /^[A-Za-z0-9.:\[\]-]{1,255}$/.test(host) ? ` ws://${host} wss://${host}` : '';
+  let ws = /^[A-Za-z0-9.:\[\]-]{1,255}$/.test(host) ? ` ws://${host} wss://${host}` : '';
+  // The public address may differ from Host (a proxy that rewrites it): it is then listed in ALLOWED_ORIGINS.
+  for (const origin of ALLOWED_ORIGINS) if (/^https?:\/\//.test(origin)) ws += ' ' + origin.replace(/^http/, 'ws');
   return [
     "default-src 'self'",
     "script-src 'self'",
