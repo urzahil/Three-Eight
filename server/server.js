@@ -23,6 +23,7 @@ const crypto = require('crypto');
 const zlib = require('zlib');
 const { WebSocketServer } = require('ws');
 const { RoomStore, RoomError, parseDriveFolder } = require('./store');
+const { limiterKey } = require('./ip');
 const { GoogleDrive, DriveError, ID_RE: DRIVE_ID_RE, FOLDER, kindOf, loadServiceAccount, parseRange, MiB } = require('./drive');
 
 const PORT = parseInt(process.env.PORT || '4567', 10);
@@ -38,11 +39,22 @@ const TRUSTED_HOPS = (() => {
   return /^\d{1,2}$/.test(v) ? parseInt(v, 10) : 0;
 })();
 // Origins (besides the request's own host) that may open a WebSocket, e.g. "https://calls.example.com".
-const ALLOWED_ORIGINS = new Set((process.env.ALLOWED_ORIGINS || '').split(',').map((o) => o.trim().toLowerCase().replace(/\/+$/, '')).filter(Boolean));
+// Entries are normalised like a browser's Origin (default port and trailing slash dropped); unparseable ones are ignored.
+const ALLOWED_ORIGINS = new Set();
+for (const entry of (process.env.ALLOWED_ORIGINS || '').split(',').map((o) => o.trim()).filter(Boolean)) {
+  try {
+    const origin = new URL(entry).origin;
+    if (origin === 'null') throw new Error('no origin');
+    ALLOWED_ORIGINS.add(origin);
+  } catch {
+    console.warn(`ALLOWED_ORIGINS: ignoring "${entry}" (not a valid origin like https://calls.example.com).`);
+  }
+}
 const MAX_MESSAGE_BYTES = 64 * 1024;
 // Per-socket message budget (token bucket): room for ICE candidate bursts and clock-sync pings.
-const MSG_BURST = 200;
-const MSG_REFILL_PER_SEC = 50;
+// A newcomer in a full room sends an offer plus a dozen ICE candidates to each peer, so the burst is generous.
+const MSG_BURST = 1000;
+const MSG_REFILL_PER_SEC = 100;
 const ADMIN_SESSION_MS = 12 * 3600 * 1000;
 
 let ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
@@ -211,6 +223,8 @@ const ENCODE_CACHE_BYTES = 32 * 1024 * 1024;
 /** `${file}\0${size}\0${mtimeMs}\0${encoding}` -> compressed Buffer (insertion order = age) */
 const encodeCache = new Map();
 let encodeCacheBytes = 0;
+/** same key -> Promise of the compressed Buffer, while it is being produced */
+const encodeInFlight = new Map();
 
 /** The best encoding the client accepts and we can produce: 'br', 'gzip' or ''. */
 function pickEncoding(req) {
@@ -227,25 +241,40 @@ function pickEncoding(req) {
   return '';
 }
 
+/** Remembers a finished body; the byte count stays exact when it replaces an entry, and the oldest entries go first. */
+function cacheEncoded(key, out) {
+  const old = encodeCache.get(key);
+  if (old) {
+    encodeCache.delete(key);
+    encodeCacheBytes -= old.length;
+  }
+  encodeCache.set(key, out);
+  encodeCacheBytes += out.length;
+  while (encodeCacheBytes > ENCODE_CACHE_BYTES && encodeCache.size > 1) {
+    const [oldKey, evicted] = encodeCache.entries().next().value;
+    encodeCache.delete(oldKey);
+    encodeCacheBytes -= evicted.length;
+  }
+}
+
 function encodeFile(file, st, encoding) {
   const key = `${file}\0${st.size}\0${st.mtimeMs}\0${encoding}`;
   const hit = encodeCache.get(key);
   if (hit) return Promise.resolve(hit);
-  return fs.promises.readFile(file).then((raw) => new Promise((resolve, reject) => {
+  // Concurrent misses share one compression run.
+  const running = encodeInFlight.get(key);
+  if (running) return running;
+  const job = fs.promises.readFile(file).then((raw) => new Promise((resolve, reject) => {
     const done = (err, out) => {
       if (err) return reject(err);
-      encodeCache.set(key, out);
-      encodeCacheBytes += out.length;
-      while (encodeCacheBytes > ENCODE_CACHE_BYTES && encodeCache.size > 1) {
-        const [oldKey, old] = encodeCache.entries().next().value;
-        encodeCache.delete(oldKey);
-        encodeCacheBytes -= old.length;
-      }
+      cacheEncoded(key, out);
       resolve(out);
     };
     if (encoding === 'br') zlib.brotliCompress(raw, { params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 7, [zlib.constants.BROTLI_PARAM_SIZE_HINT]: raw.length } }, done);
     else zlib.gzip(raw, { level: 9 }, done);
-  }));
+  })).finally(() => encodeInFlight.delete(key));
+  encodeInFlight.set(key, job);
+  return job;
 }
 
 /** Does an If-None-Match header match this ETag (weak comparison, "*" matches anything)? */
@@ -256,56 +285,77 @@ function etagMatches(header, etag) {
   return header.split(',').some((t) => bare(t) === etag);
 }
 
+/** Answer 500 (if nothing was sent yet) and log the failure; the details stay on the server. */
+function internalError(req, res, err) {
+  console.error('request failed:', req.method, String(req.url).slice(0, 200), err);
+  if (res.headersSent) return res.destroy();
+  try {
+    sendJson(res, 500, { error: 'Something went wrong on the server.' });
+  } catch {
+    res.destroy();
+  }
+}
+
 function sendFile(req, res, file) {
-  fs.stat(file, (err, st) => {
-    if (err || !st.isFile()) {
-      sendJson(res, 404, { error: 'Not found' });
-      return;
-    }
-    const ext = path.extname(file);
-    const compressible = COMPRESSIBLE.has(ext);
-    const encoding = compressible && st.size >= MIN_COMPRESS_BYTES ? pickEncoding(req) : '';
-    // The validator differs per representation (a strong ETag must not be shared by gzip and identity bodies).
-    const etag = `"${st.size.toString(16)}-${Math.floor(st.mtimeMs).toString(16)}${encoding ? '-' + encoding : ''}"`;
-    const headers = {
-      ...SECURITY_HEADERS,
-      'Content-Type': MIME[ext] || 'application/octet-stream',
-      'Cache-Control': 'no-cache', // cacheable, but always revalidated (the validators below make that cheap)
-      ETag: etag,
-      'Last-Modified': new Date(Math.floor(st.mtimeMs / 1000) * 1000).toUTCString(),
-    };
-    if (ext === '.html') headers['Content-Security-Policy'] = contentSecurityPolicy(req);
-    if (compressible) headers.Vary = 'Accept-Encoding';
+  // fs.stat throws (instead of calling back) for a path with a NUL byte: refuse it, and never let a throw escape.
+  if (file.includes('\0')) return sendJson(res, 400, { error: 'Bad request' });
+  try {
+    fs.stat(file, (err, st) => {
+      try {
+        if (err || !st.isFile()) {
+          sendJson(res, 404, { error: 'Not found' });
+          return;
+        }
+        const ext = path.extname(file);
+        const compressible = COMPRESSIBLE.has(ext);
+        const encoding = compressible && st.size >= MIN_COMPRESS_BYTES ? pickEncoding(req) : '';
+        // The validator differs per representation (a strong ETag must not be shared by gzip and identity bodies).
+        const etag = `"${st.size.toString(16)}-${Math.floor(st.mtimeMs).toString(16)}${encoding ? '-' + encoding : ''}"`;
+        const headers = {
+          ...SECURITY_HEADERS,
+          'Content-Type': MIME[ext] || 'application/octet-stream',
+          'Cache-Control': 'no-cache', // cacheable, but always revalidated (the validators below make that cheap)
+          ETag: etag,
+          'Last-Modified': new Date(Math.floor(st.mtimeMs / 1000) * 1000).toUTCString(),
+        };
+        if (ext === '.html') headers['Content-Security-Policy'] = contentSecurityPolicy(req);
+        if (compressible) headers.Vary = 'Accept-Encoding';
 
-    const inm = req.headers['if-none-match'];
-    const ims = Date.parse(req.headers['if-modified-since'] || '');
-    if (inm ? etagMatches(inm, etag) : Number.isFinite(ims) && Math.floor(st.mtimeMs / 1000) * 1000 <= ims) {
-      res.writeHead(304, headers);
-      res.end();
-      return;
-    }
+        const inm = req.headers['if-none-match'];
+        const ims = Date.parse(req.headers['if-modified-since'] || '');
+        if (inm ? etagMatches(inm, etag) : Number.isFinite(ims) && Math.floor(st.mtimeMs / 1000) * 1000 <= ims) {
+          res.writeHead(304, headers);
+          res.end();
+          return;
+        }
 
-    const fail = (e) => {
-      if (res.headersSent) return res.destroy();
-      if (e && e.code !== 'ENOENT') console.error('static file failed:', e.message);
-      sendJson(res, e && e.code === 'ENOENT' ? 404 : 500, { error: e && e.code === 'ENOENT' ? 'Not found' : 'Something went wrong on the server.' });
-    };
-    if (encoding) {
-      encodeFile(file, st, encoding).then((body) => {
-        res.writeHead(200, { ...headers, 'Content-Encoding': encoding, 'Content-Length': body.length });
-        res.end(req.method === 'HEAD' ? undefined : body);
-      }, fail);
-      return;
-    }
-    res.writeHead(200, { ...headers, 'Content-Length': st.size });
-    if (req.method === 'HEAD') {
-      res.end();
-      return;
-    }
-    const stream = fs.createReadStream(file);
-    stream.on('error', fail);
-    stream.pipe(res);
-  });
+        const fail = (e) => {
+          if (res.headersSent) return res.destroy();
+          if (e && e.code !== 'ENOENT') console.error('static file failed:', e.message);
+          sendJson(res, e && e.code === 'ENOENT' ? 404 : 500, { error: e && e.code === 'ENOENT' ? 'Not found' : 'Something went wrong on the server.' });
+        };
+        if (encoding) {
+          encodeFile(file, st, encoding).then((body) => {
+            res.writeHead(200, { ...headers, 'Content-Encoding': encoding, 'Content-Length': body.length });
+            res.end(req.method === 'HEAD' ? undefined : body);
+          }).catch(fail);
+          return;
+        }
+        res.writeHead(200, { ...headers, 'Content-Length': st.size });
+        if (req.method === 'HEAD') {
+          res.end();
+          return;
+        }
+        const stream = fs.createReadStream(file);
+        stream.on('error', fail);
+        stream.pipe(res);
+      } catch (e) {
+        internalError(req, res, e);
+      }
+    });
+  } catch (e) {
+    internalError(req, res, e);
+  }
 }
 
 function sendJson(res, status, obj, extraHeaders = {}) {
@@ -365,7 +415,10 @@ function readJson(req, limit = 16 * 1024) {
     });
     req.on('end', () => {
       try {
-        resolve(chunks.length ? JSON.parse(Buffer.concat(chunks).toString('utf8')) : {});
+        const body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString('utf8')) : {};
+        // Handlers read fields from the body: null, numbers, strings and arrays are not a request they can work with.
+        if (body === null || typeof body !== 'object' || Array.isArray(body)) throw new Error('not an object');
+        resolve(body);
       } catch {
         reject(clientError('Invalid JSON'));
       }
@@ -382,7 +435,7 @@ function parseCookies(req) {
     try {
       out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim());
     } catch {
-      throw clientError('Malformed cookie');
+      // Not ours (another app on the same domain may set odd cookies): skip it rather than fail the request.
     }
   }
   return out;
@@ -541,6 +594,9 @@ async function handleDrive(req, res, url, parts) {
   try {
     // Only the room's folder and what is below it: the service account may be able to read much more.
     if (!(await driveApi.inTree(root, id))) return sendJson(res, 404, { error: 'Not found in this room\'s folder.' }, DRIVE_HEADERS);
+    // The room may have changed (password, folder, deleted) while Drive was asked: the token only counts for the room it was issued for.
+    const now = store.get(room.name);
+    if (!now || roomVersion(now) !== roomVersion(room)) return sendJson(res, 401, { error: 'Your Drive session is missing or has expired. Rejoin the room.' }, DRIVE_HEADERS);
     if (!isFiles) {
       const [info, items] = await Promise.all([driveApi.folderInfo(id), driveApi.list(id)]);
       if (info.mimeType !== FOLDER) return sendJson(res, 404, { error: 'That is not a folder.' }, DRIVE_HEADERS);
@@ -628,7 +684,7 @@ async function handleApi(req, res, url) {
   }
 
   if (parts[2] === 'login' && req.method === 'POST') {
-    const ip = clientIp(req);
+    const ip = limiterKey(clientIp(req));
     if (adminLimiter.blocked(ip)) return sendJson(res, 429, { error: 'Too many attempts. Try again later.' });
     const body = await readJson(req);
     if (!safeEqual(body.password || '', ADMIN_PASSWORD)) {
@@ -714,7 +770,16 @@ async function handleApi(req, res, url) {
   return sendJson(res, 404, { error: 'Not found' });
 }
 
+// A throw anywhere while routing must become a 500 and a log line, never an uncaught exception.
 function handleHttp(req, res) {
+  try {
+    route(req, res);
+  } catch (err) {
+    internalError(req, res, err);
+  }
+}
+
+function route(req, res) {
   if (isHttps(req)) res.setHeader('Strict-Transport-Security', 'max-age=31536000');
   let url;
   try {
@@ -752,6 +817,11 @@ function handleHttp(req, res) {
   try {
     rel = decodeURIComponent(url.pathname);
   } catch {
+    res.writeHead(400);
+    res.end();
+    return;
+  }
+  if (rel.includes('\0')) {
     res.writeHead(400);
     res.end();
     return;
@@ -845,6 +915,17 @@ async function handleJoin(ws, msg) {
     return;
   }
   if (ws.readyState !== ws.OPEN) return;
+  // The store replaces room objects when an admin changes them: look again instead of trusting the copy from before the check.
+  const room = store.get(roomName);
+  if (!room) {
+    send(ws, { type: 'error', code: 'no-room', message: 'This room does not exist.' });
+    return;
+  }
+  if (room.passwordHash !== r.passwordHash) {
+    // The password changed while it was being checked: the answer was for the old one.
+    send(ws, { type: 'error', code: 'bad-password', message: 'Wrong room password.' });
+    return;
+  }
 
   const key = RoomStore.key(roomName);
   leave(ws);
@@ -869,8 +950,8 @@ async function handleJoin(ws, msg) {
   const peers = [...members.entries()].filter(([pid]) => pid !== msg.id).map(([pid, m]) => ({ id: pid, name: m.name }));
   members.set(msg.id, { ws, name });
   // resumed: this join took over the live entry of the same participant (a reconnect).
-  const welcome = { type: 'welcome', id: msg.id, room: r.name, peers, resumed: !!existing };
-  const drive = driveInfo(r);
+  const welcome = { type: 'welcome', id: msg.id, room: room.name, peers, resumed: !!existing };
+  const drive = driveInfo(room);
   if (drive) welcome.drive = drive;
   send(ws, welcome);
   if (!existing) {
@@ -883,13 +964,24 @@ async function handleJoin(ws, msg) {
 function originAllowed(req) {
   const origin = req.headers.origin;
   if (origin === undefined) return true;
-  const o = String(origin).toLowerCase().replace(/\/+$/, '');
-  if (ALLOWED_ORIGINS.has(o)) return true;
+  let o;
   try {
-    return new URL(o).host === String(req.headers.host || '').toLowerCase();
+    o = new URL(String(origin));
   } catch {
-    return false;
+    return false; // includes "null"
   }
+  if (ALLOWED_ORIGINS.has(o.origin)) return true;
+  const host = String(req.headers.host || '').toLowerCase();
+  if (host && o.host === host) return true;
+  if (TRUSTED_HOPS > 0) {
+    // nginx's "proxy_set_header Host $host" drops the port, so behind a trusted proxy the hostname alone has to match.
+    try {
+      return !!host && o.hostname === new URL(`http://${host}`).hostname;
+    } catch {
+      return false;
+    }
+  }
+  return false;
 }
 
 const wss = new WebSocketServer({
@@ -901,17 +993,22 @@ const wss = new WebSocketServer({
 
 wss.on('connection', (ws, req) => {
   ws.isAlive = true;
-  ws.ip = clientIp(req);
+  ws.ip = limiterKey(clientIp(req));
   ws.on('pong', () => { ws.isAlive = true; });
   let tokens = MSG_BURST;
   let refilled = Date.now();
+  let limited = false;
 
   ws.on('message', (raw, isBinary) => {
+    if (limited) return; // already cut off: ignore whatever is still in flight
     const now = Date.now();
     tokens = Math.min(MSG_BURST, tokens + ((now - refilled) / 1000) * MSG_REFILL_PER_SEC);
     refilled = now;
     if (--tokens < 0) {
+      limited = true;
       ws.close(1008, 'rate-limited');
+      // A flooding peer will not finish the close handshake: drop the connection shortly after the close frame went out.
+      setTimeout(() => ws.terminate(), 200).unref();
       return;
     }
     if (isBinary) return;

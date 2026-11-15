@@ -55,8 +55,8 @@ export class LocalMedia extends EventTarget {
           audio: this._audioConstraints(),
           video: this.camOn ? this._videoConstraints() : false,
         });
-        this.audioTrack = s.getAudioTracks()[0] || null;
-        this.videoTrack = s.getVideoTracks()[0] || null;
+        this._adopt('audio', s.getAudioTracks()[0]);
+        this._adopt('video', s.getVideoTracks()[0]);
       } catch {
         // Try separately: maybe only one device exists or is allowed.
         await this._acquire('audio');
@@ -76,13 +76,30 @@ export class LocalMedia extends EventTarget {
     this._emit('video');
   }
 
-  async _acquire(kind) {
+  /**
+   * Keep a track that getUserMedia delivered, or stop it. The settings may have changed while the request was
+   * pending (the room's toolbar is live during the permission prompt): after leaving, or with the camera
+   * switched off, the track is dropped; if another request already delivered one, so is the extra (unless
+   * `replace`, which swaps the current track for the new one). Returns the kept track or null.
+   */
+  _adopt(kind, t, replace = false) {
+    if (!t) return null;
+    const prop = kind === 'audio' ? 'audioTrack' : 'videoTrack';
+    if (this.stopped || (kind === 'video' && !this.camOn) || (this[prop] && !replace)) {
+      t.stop();
+      return null;
+    }
+    if (this[prop]) this[prop].stop();
+    this[prop] = t;
+    if (kind === 'audio') t.enabled = this.micOn;
+    return t;
+  }
+
+  async _acquire(kind, replace = false) {
     try {
       const t = await this._get(kind);
       this.errors[kind] = null;
-      if (kind === 'audio') this.audioTrack = t;
-      else this.videoTrack = t;
-      return t;
+      return this._adopt(kind, t, replace);
     } catch (err) {
       this.errors[kind] = err;
       return null;
@@ -110,7 +127,7 @@ export class LocalMedia extends EventTarget {
   async setMic(on) {
     this.micOn = on;
     if (on && !this.audioTrack) await this._acquire('audio');
-    if (this.audioTrack) this.audioTrack.enabled = on;
+    if (this.audioTrack) this.audioTrack.enabled = this.micOn;
     this._watchEnded();
     this._emit('audio');
     return !!this.audioTrack || !on;
@@ -132,18 +149,9 @@ export class LocalMedia extends EventTarget {
 
   async setDevice(kind, deviceId) {
     this.deviceIds[kind] = deviceId;
-    if (kind === 'audio') {
-      const old = this.audioTrack;
-      const t = await this._acquire('audio');
-      if (t) {
-        old?.stop();
-        t.enabled = this.micOn;
-      }
-    } else if (this.camOn) {
-      const old = this.videoTrack;
-      const t = await this._acquire('video');
-      if (t) old?.stop();
-    }
+    // replace: the new track takes over from the current one (which is stopped), if the device could be opened.
+    if (kind === 'audio') await this._acquire('audio', true);
+    else if (this.camOn) await this._acquire('video', true);
     this._watchEnded();
     this._emit(kind);
   }

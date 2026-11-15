@@ -93,6 +93,62 @@ const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'te-lobby-'));
     assert.strictEqual(nav3, 1, 'no navigation (a native form submit)');
     console.log('a prompt that never settles does not block joining');
 
+    // The toolbar is live while the prompt is open: "Stop video" clicked then must still hold when the prompt is granted.
+    const pendingPage = async (name) => {
+      const c = await browser.newContext({ permissions: ['camera', 'microphone'] });
+      const pg = await c.newPage();
+      pg.on('pageerror', (e) => console.log(`[${name} pageerror]`, e.message));
+      await pg.addInitScript(() => {
+        const real = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
+        window.__pending = [];
+        window.__tracks = []; // every track getUserMedia handed out
+        navigator.mediaDevices.getUserMedia = (c) => new Promise((resolve, reject) => window.__pending.push(() => real(c).then((s) => { window.__tracks.push(...s.getTracks()); resolve(s); }, reject)));
+      });
+      await pg.goto(`${BASE}/${ROOM}?debug`);
+      await pg.fill('#lobby-name', name);
+      assert.strictEqual(await pg.evaluate(() => window.__pending.length), 1, 'the permission prompt is open');
+      await pg.click('#lobby-join');
+      await pg.waitForSelector('#room:not([hidden])');
+      return pg;
+    };
+    const dave = await pendingPage('Dave');
+    const daveId = await dave.evaluate(() => room.id);
+    await dave.click('#t-cam'); // "Stop video" while there is no track yet
+    assert.strictEqual(await dave.evaluate(() => room.media.camOn), false);
+    await dave.evaluate(() => window.__pending.splice(0).forEach((f) => f()));
+    await waitFor(dave, () => room.media.audioTrack && window.__tracks.length > 0);
+    await sleep(1500);
+    assert.strictEqual(await dave.evaluate(() => room.media.videoTrack), null, 'no local video track');
+    assert.strictEqual(await dave.evaluate(() => [...room.mesh.peers.values()].every((p) => p.videoTx.sender.track === null) && room.mesh.tracks.video === null), true, 'no video track is sent');
+    assert.strictEqual(await dave.evaluate(() => window.__tracks.filter((t) => t.kind === 'video').every((t) => t.readyState === 'ended')), true, 'the camera was released');
+    assert.strictEqual(await dave.evaluate(() => room.media.audioTrack.enabled && room.media.audioTrack.readyState === 'live'), true, 'the microphone is kept');
+    assert.strictEqual(await bob.evaluate((id) => room.profiles.get(id)?.video, daveId), false, 'the other participant is told there is no video');
+    assert.strictEqual(await bob.evaluate((id) => { const t = [...document.querySelectorAll('.tile:not(.self)')]; return t.some((x) => x.querySelector('video')?.videoWidth > 0 && x.textContent.includes('Dave')); }, daveId), false);
+    console.log('"Stop video" during the permission prompt is honoured: no camera track, none sent');
+
+    // Leaving while the prompt is open: when it is granted afterwards, the devices are released at once.
+    const erin = await pendingPage('Erin');
+    await erin.evaluate(() => room.leave(true));
+    await erin.evaluate(() => window.__pending.splice(0).forEach((f) => f()));
+    await waitFor(erin, () => window.__tracks.length > 0);
+    await waitFor(erin, () => window.__tracks.every((t) => t.readyState === 'ended'));
+    assert.strictEqual(await erin.evaluate(() => room.media.audioTrack === null && room.media.videoTrack === null), true);
+    console.log('leaving during the prompt: the devices that arrive later are stopped');
+
+    // The same for a device request made from the room (camera button, then leave before it is granted).
+    const fay = await pendingPage('Fay');
+    await fay.evaluate(() => window.__pending.splice(0).forEach((f) => f()));
+    await waitFor(fay, () => room.media.audioTrack && room.media.videoTrack);
+    await fay.click('#t-cam'); // off
+    await fay.evaluate(() => { window.__tracks.length = 0; });
+    await fay.click('#t-cam'); // on again: a new request, held pending
+    assert.strictEqual(await fay.evaluate(() => window.__pending.length), 1);
+    await fay.evaluate(() => room.leave(true));
+    await fay.evaluate(() => window.__pending.splice(0).forEach((f) => f()));
+    await waitFor(fay, () => window.__tracks.length > 0);
+    await waitFor(fay, () => window.__tracks.every((t) => t.readyState === 'ended'));
+    console.log('leaving during a camera request: the camera is released');
+
     console.log('LOBBY OK');
   } finally {
     await browser?.close();

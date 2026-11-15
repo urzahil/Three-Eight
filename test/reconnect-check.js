@@ -146,6 +146,39 @@ async function chat(from, to, text) {
     assert.deepStrictEqual(nAfter.slice(nBefore).filter((t) => /left|joined/.test(t)), [], 'no left/joined notices: ' + nAfter);
     console.log('dead data channel: link rebuilt by itself, chat works, no left/joined notices');
 
+    // --- 5. Deadlock after a rebuild: the impolite side (higher id) rebuilds on its fallback timer, but its offer is lost
+    // because the other side's signaling is dead; the other side then comes back, finds the link unhealthy and sends its
+    // own offer. The impolite side sits in have-local-offer and must yield (rebuild) instead of ignoring that offer.
+    // `waitMs`: how long the lost offer has been outstanding when the other offer arrives (old: handled at once;
+    // young: handled by the deferred check).
+    const ids = await Promise.all(people.map((p) => p.evaluate(() => room.mesh.selfId)));
+    const [hi, lo] = ids[0] > ids[1] ? [alice, bob] : [bob, alice];
+    const drop = (p, on) => p.evaluate((d) => {
+      const sig = room.signaling;
+      if (d) sig.signal = () => {}; // outgoing signals vanish (the socket is dead)
+      else delete sig.signal; // back to the prototype method
+    }, on);
+    for (const waitMs of [4000, 0]) {
+      await drop(hi, true);
+      await drop(lo, true);
+      const m = await peerObj(hi);
+      await hi.evaluate(() => [...room.mesh.peers.values()][0].dc.close());
+      // The impolite side rebuilds on its 8 s timer; its offer is lost.
+      await waitFor(hi, (x) => { const peer = [...room.mesh.peers.values()][0]; return peer && peer.__mark !== x && peer.pc.signalingState === 'have-local-offer'; }, m, 30000);
+      await sleep(waitMs);
+      await drop(hi, false);
+      await drop(lo, false);
+      // The other side is back and rebuilds the link, as the 'reconnected' handler does.
+      await lo.evaluate((id) => room.mesh.rebuildPeer(id), await hi.evaluate(() => room.mesh.selfId));
+      for (const p of people) await waitFor(p, linksUp, 1, 30000).catch(async (err) => {
+        console.log('after lost offer:', JSON.stringify(await dump(alice)), JSON.stringify(await dump(bob)));
+        throw err;
+      });
+      await chat(hi, lo, `after lost offer (${waitMs}) 1`);
+      await chat(lo, hi, `after lost offer (${waitMs}) 2`);
+      console.log(`lost offer + rebuild on both sides (offer ${waitMs} ms old): link recovered, chat works`);
+    }
+
     console.log('RECONNECT OK');
   } finally {
     await browser.close();

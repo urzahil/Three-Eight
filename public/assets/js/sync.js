@@ -35,10 +35,16 @@ function cleanMovie(movie) {
   return rest;
 }
 
-const MAX_SEQ = 1e9; // far beyond any real session; keeps `seq + 1` exact and a buggy peer from outrunning everyone
+// `seq + 1` stays exact up to here; a peer cannot get anywhere near it, because a state that jumps more than
+// MAX_SEQ_JUMP ahead of ours is refused (see _onMessage). So our own next commit is always acceptable to the others.
+const MAX_SEQ = Number.MAX_SAFE_INTEGER - 1;
+const MAX_SEQ_JUMP = 1e6;
+const MAX_POS = 1e7; // seconds (about 115 days)
+const MAX_AT = 1e14; // epoch milliseconds (year 5138)
 const MAX_ID = 64; // participant ids are at most 64 characters
 const isNum = (n) => typeof n === 'number' && Number.isFinite(n);
 const short = (v, max) => String(v).slice(0, max);
+const clamp = (n, lo, hi) => (isNum(n) ? Math.min(hi, Math.max(lo, n)) : lo);
 
 /**
  * Validate and normalise a sync-state from a peer. Returns null when its core fields (seq, by, paused,
@@ -48,7 +54,7 @@ export function cleanState(s) {
   if (!s || typeof s !== 'object') return null;
   if (!Number.isSafeInteger(s.seq) || s.seq < 0 || s.seq > MAX_SEQ) return null;
   if (typeof s.by !== 'string' || !s.by || s.by.length > MAX_ID) return null;
-  if (typeof s.paused !== 'boolean' || !isNum(s.pos) || s.pos < 0 || !isNum(s.at)) return null;
+  if (typeof s.paused !== 'boolean' || !isNum(s.pos) || s.pos < 0 || s.pos > MAX_POS || !isNum(s.at) || s.at < 0 || s.at > MAX_AT) return null;
   let movie = null;
   if (s.movie != null) {
     const m = s.movie;
@@ -157,7 +163,10 @@ export class MovieSync extends EventTarget {
 
   // ---- local actions -------------------------------------------------------
   _commit(patch) {
-    const next = { ...this.state, ...patch, seq: this.state.seq + 1, by: this.selfId };
+    // Whatever the patch holds, peers must accept the result: keep every number inside the range cleanState() allows.
+    const next = { ...this.state, ...patch, seq: Math.min(this.state.seq + 1, MAX_SEQ), by: this.selfId };
+    next.pos = clamp(next.pos, 0, MAX_POS);
+    next.at = clamp(next.at, 0, MAX_AT);
     this.state = next;
     this.mesh.broadcast({ type: 'sync-state', state: next });
     this._apply(true);
@@ -352,7 +361,8 @@ export class MovieSync extends EventTarget {
     switch (msg.type) {
       case 'sync-state': {
         const s = cleanState(msg.state);
-        if (!s || !newer(s, this.state)) return;
+        // A state far ahead of ours is a buggy or hostile peer: accepting it would push every later commit out of range.
+        if (!s || s.seq > this.state.seq + MAX_SEQ_JUMP || !newer(s, this.state)) return;
         const prev = this.state;
         this.state = s;
         if (!sameMovie(prev.movie, this.state.movie)) this.useAnyway = false;

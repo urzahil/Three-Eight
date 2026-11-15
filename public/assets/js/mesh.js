@@ -9,6 +9,12 @@ const CHUNK = 12 * 1024;
 const FILM_HIGH = 1024 * 1024;
 const FILM_LOW = 256 * 1024;
 
+// Rebuilding a link: at most MAX_REBUILDS in a row without the channel opening, at least MIN_REBUILD_MS apart.
+const MAX_REBUILDS = 6;
+const MIN_REBUILD_MS = 1000;
+// A local offer that is still unanswered after this long is considered lost (a normal answer takes a round trip).
+const OFFER_STALE_MS = 3000;
+
 // Upload budget per outgoing video stream, by number of remote peers:
 // in a mesh every participant uploads one copy per peer.
 function videoBudget(peerCount, lowPower) {
@@ -96,6 +102,7 @@ class Peer {
       try {
         this.makingOffer = true;
         await pc.setLocalDescription();
+        if (pc.localDescription?.type === 'offer') this.offerSentAt = Date.now();
         mesh.signaling.signal(id, { description: pc.localDescription });
       } catch (err) {
         console.warn('negotiation failed', err);
@@ -290,6 +297,7 @@ class Peer {
     this.closed = true;
     clearTimeout(this._restartTimer);
     clearTimeout(this._watchdog);
+    clearTimeout(this._staleCheck);
     try {
       this.dc.close();
       this.film.close();
@@ -325,9 +333,9 @@ export class Mesh extends EventTarget {
       if (!data || typeof data !== 'object') return;
       let peer = this.peers.get(from);
       if (!peer) peer = this.addPeer(from, this.names.get(from) || '');
-      // A new offer for a link whose data channel is dead: the other side rebuilt its connection, and
-      // only a fresh RTCPeerConnection of ours can get the negotiated channels open again.
-      else if (data.description?.type === 'offer' && peer.dc.readyState === 'closed') peer = this.rebuildPeer(from);
+      // A new offer for a link that cannot take it: the other side rebuilt its connection, and only a fresh
+      // RTCPeerConnection of ours can get the negotiated channels open again.
+      else if (data.description?.type === 'offer' && this._needsFreshPeer(peer)) peer = this._rebuildLimited(from);
       if (peer) peer.handleSignal(data);
     });
     // Our own connection to the server was lost and is back. The server may have told the others that we
@@ -345,6 +353,42 @@ export class Mesh extends EventTarget {
       }
     });
     this._attempts = new Map(); // peerId -> rebuilds since its data channel was last open
+    this._lastRebuild = new Map(); // peerId -> time of the last rebuild
+  }
+
+  /**
+   * Can this peer not take a new offer from the other side? Either its data channel is dead, or we are the
+   * impolite side and our own first offer got no answer for a long time (it was lost, e.g. the other side's
+   * socket was down): we would ignore their offer and nobody would retry, so we yield. Only the impolite side
+   * does this; the polite side already rolls back on a collision, so the two sides cannot both rebuild. A
+   * young unanswered offer may just be a normal collision: the other side's rollback sorts that out, but if it
+   * is still unanswered when it turns stale we rebuild then (our new offer is handled by the polite side).
+   */
+  _needsFreshPeer(peer) {
+    if (peer.dc.readyState === 'closed') return true;
+    const pc = peer.pc;
+    if (peer.open || peer.polite || pc.signalingState !== 'have-local-offer' || pc.remoteDescription) return false;
+    const wait = OFFER_STALE_MS - (Date.now() - (peer.offerSentAt || 0));
+    if (wait <= 0) return true;
+    if (peer._staleCheck) return false; // one pending check is enough
+    peer._staleCheck = setTimeout(() => {
+      peer._staleCheck = null;
+      if (this.peers.get(peer.id) !== peer || peer.closed || peer.open || pc.signalingState !== 'have-local-offer' || pc.remoteDescription) return;
+      this._rebuildLimited(peer.id);
+    }, wait + 50);
+    return false;
+  }
+
+  /**
+   * rebuildPeer() for rebuilds that a timer or the other side asked for: they share one attempt counter (reset
+   * when the channel opens) and keep a minimum distance, so a member that keeps closing its channel and
+   * sending offers cannot make us rebuild without limit. Returns null when it holds back.
+   */
+  _rebuildLimited(id) {
+    const n = this._attempts.get(id) || 0;
+    if (n >= MAX_REBUILDS || Date.now() - (this._lastRebuild.get(id) || 0) < MIN_REBUILD_MS) return null;
+    this._attempts.set(id, n + 1);
+    return this.rebuildPeer(id);
   }
 
   _linkHealthy(peer) {
@@ -362,13 +406,12 @@ export class Mesh extends EventTarget {
   _channelClosed(peer) {
     const id = peer.id;
     const n = this._attempts.get(id) || 0;
-    if (n >= 6) return; // keeps failing: leave it to the user (reload) instead of looping forever
+    if (n >= MAX_REBUILDS) return; // keeps failing: leave it to the user (reload) instead of looping forever
     const delay = (this.selfId < id ? 1000 : 8000) * 2 ** Math.min(n, 3);
     setTimeout(() => {
       if (this.peers.get(id) !== peer || peer.closed || peer.dc.readyState === 'open') return;
       if (!this.signaling.joined) return; // 'reconnected' sorts the peers out once we are back
-      this._attempts.set(id, n + 1);
-      this.rebuildPeer(id);
+      this._rebuildLimited(id);
     }, delay);
   }
 
@@ -392,6 +435,8 @@ export class Mesh extends EventTarget {
 
   removePeer(id) {
     this.names.delete(id);
+    this._attempts.delete(id);
+    this._lastRebuild.delete(id);
     const peer = this.peers.get(id);
     if (!peer) return;
     peer.close();
@@ -409,6 +454,7 @@ export class Mesh extends EventTarget {
     const old = this.peers.get(id);
     if (!old) return this.addPeer(id, name);
     old.close();
+    this._lastRebuild.set(id, Date.now());
     const peer = new Peer(this, id, name || old.name);
     this.peers.set(id, peer);
     this._emit('peer-removed', { peer: old, rebuilding: true });

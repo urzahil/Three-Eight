@@ -11,15 +11,20 @@ test('a well-formed state passes through unchanged', () => {
 
 test('unusable core fields reject the message', () => {
   for (const bad of [
-    { seq: -1 }, { seq: 1.5 }, { seq: '3' }, { seq: Infinity }, { seq: NaN }, { seq: 2 ** 53 }, { seq: 1e12 },
+    { seq: -1 }, { seq: 1.5 }, { seq: '3' }, { seq: Infinity }, { seq: NaN }, { seq: 2 ** 53 }, { seq: Number.MAX_SAFE_INTEGER },
     { by: 5 }, { by: '' }, { by: 'x'.repeat(65) },
     { paused: 'no' }, { paused: undefined },
-    { pos: -1 }, { pos: NaN }, { pos: '1' }, { pos: Infinity },
-    { at: NaN }, { at: Infinity }, { at: '5' },
+    { pos: -1 }, { pos: NaN }, { pos: '1' }, { pos: Infinity }, { pos: 1e7 + 1 }, { pos: 1e300 },
+    { at: NaN }, { at: Infinity }, { at: '5' }, { at: -1 }, { at: 1e14 + 1 }, { at: 1e300 },
     { movie: 'film' }, { movie: [] }, { movie: { size: 5 } }, { movie: { name: 7 } },
   ]) assert.equal(cleanState(good(bad)), null, JSON.stringify(bad));
   assert.equal(cleanState(null), null);
   assert.equal(cleanState('x'), null);
+});
+
+test('pos and at may reach their limits', () => {
+  assert.equal(cleanState(good({ pos: 1e7, at: 1e14 })).pos, 1e7);
+  assert.equal(cleanState(good({ pos: 0, at: 0 })).at, 0);
 });
 
 test('the other fields are clamped', () => {
@@ -65,5 +70,61 @@ test('MovieSync ignores an invalid state and a huge seq can not lock local commi
   sync.pause();
   assert.equal(sync.state.seq, 4);
   assert.deepEqual(Object.keys(emptyState()).sort(), Object.keys(sync.state).sort());
+  sync.destroy();
+});
+
+function makeSync(now = 1700000000000) {
+  const mesh = new EventTarget();
+  const sent = [];
+  mesh.broadcast = (m) => sent.push(m);
+  const player = new EventTarget();
+  player.loaded = false;
+  const sync = new MovieSync({ mesh, signaling: { now: () => now }, player, selfId: 'me-me-me-me' });
+  return { sync, sent };
+}
+const peer = { id: 'peer-aaaaaaaa', send() {} };
+
+test('a state that jumps far ahead of ours is refused, so the room can not be frozen by a huge seq', () => {
+  const { sync, sent } = makeSync();
+  sync._onMessage(peer, { type: 'sync-state', state: good({ seq: 1e9 }) });
+  assert.equal(sync.state.seq, 0, 'the maximum the old cap allowed');
+  sync._onMessage(peer, { type: 'sync-state', state: good({ seq: 1e12 }) });
+  assert.equal(sync.state.seq, 0);
+  sync._onMessage(peer, { type: 'sync-state', state: good({ seq: 1e6 + 1 }) });
+  assert.equal(sync.state.seq, 0);
+  sync._onMessage(peer, { type: 'sync-state', state: good({ seq: 1e6 }) });
+  assert.equal(sync.state.seq, 1e6, 'a jump of exactly the limit is fine');
+  sync._onMessage(peer, { type: 'sync-state', state: good({ seq: 2e6 + 1 }) });
+  assert.equal(sync.state.seq, 1e6, 'measured from our current seq');
+  // Every commit of ours is acceptable to a peer that applies the same rules.
+  sync.pause();
+  assert.equal(sync.state.seq, 1e6 + 1);
+  const mine = cleanState(sent.at(-1).state);
+  assert.ok(mine && mine.seq === 1e6 + 1);
+  sync.destroy();
+});
+
+test('local commits stay inside the ranges peers accept, even with bad inputs', () => {
+  const { sync, sent } = makeSync();
+  sync.state = { ...sync.state, seq: Number.MAX_SAFE_INTEGER - 1 };
+  sync.seek(Infinity);
+  sync.seek(NaN);
+  sync.seek(1e300);
+  sync.seek(-5);
+  assert.equal(sent.length, 4);
+  for (const { state } of sent) assert.ok(cleanState(state), JSON.stringify(state));
+  assert.equal(sync.state.seq, Number.MAX_SAFE_INTEGER - 1, 'never above what cleanState allows');
+  const late = makeSync(Infinity);
+  late.sync.seek(10);
+  assert.ok(cleanState(late.sync.state), 'a broken clock does not produce an invalid state');
+  sync.destroy();
+  late.sync.destroy();
+});
+
+test('expectedPosition is finite for every accepted state', () => {
+  const { sync } = makeSync(1e14);
+  const s = cleanState(good({ paused: false, pos: 1e7, at: 0, rate: 4, movie: null }));
+  assert.ok(s);
+  assert.ok(Number.isFinite(sync.expectedPosition(s)));
   sync.destroy();
 });

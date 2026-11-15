@@ -10,6 +10,7 @@ const path = require('node:path');
 const WebSocket = require('ws');
 const http = require('node:http');
 const { RoomStore, parseDriveFolder } = require('../server/store');
+const { limiterKey } = require('../server/ip');
 const { startFakeGoogle } = require('./fake-google');
 
 // Ports come from the OS (see freePort): a guessed number can already be taken, e.g. by an outgoing connection.
@@ -1015,6 +1016,49 @@ test('static files: ETag/Last-Modified, 304, compression, HEAD', async () => {
   assert.strictEqual(png.status, 200);
 });
 
+test('a NUL byte in a path is a 400 and the server keeps answering', async () => {
+  const s = await spawnServer({});
+  for (const p of ['/assets/a%00b.js', '/assets/js/app.js%00.png', '/some%00room', '/admin%00', '/%00']) {
+    const res = await rawGet(p, {}, 'GET', s.base);
+    assert.strictEqual(res.status, 400, p);
+  }
+  assert.strictEqual((await rawGet('/healthz', {}, 'GET', s.base)).status, 200);
+  assert.strictEqual((await rawGet('/assets/js/app.js', {}, 'GET', s.base)).status, 200);
+  assert.strictEqual((await rawGet('/api/rooms/a%00b', {}, 'GET', s.base)).status, 404);
+  assert.strictEqual(s.child.exitCode, null, 'still running');
+  s.stop();
+});
+
+test('compression cache: concurrent cold requests share one result, and other assets are still served right', async () => {
+  const zlib = require('node:zlib');
+  const s = await spawnServer({});
+  const pub = path.join(__dirname, '..', 'public');
+  const first = '/assets/js/app.js';
+  const others = ['/assets/js/mesh.js', '/assets/js/sync.js', '/assets/js/media.js', '/'];
+  const original = (p) => fs.readFileSync(path.join(pub, p === '/' ? 'index.html' : p));
+  const results = await Promise.all(Array.from({ length: 40 }, () => rawGet(first, { 'Accept-Encoding': 'br' }, 'GET', s.base)));
+  for (const r of results) {
+    assert.strictEqual(r.status, 200);
+    assert.strictEqual(r.headers['content-encoding'], 'br');
+    assert.strictEqual(r.headers.etag, results[0].headers.etag);
+    assert(zlib.brotliDecompressSync(r.body).equals(original(first)));
+  }
+  // Different assets, cold and then warm, with a mix of encodings.
+  for (let round = 0; round < 2; round++) {
+    const batch = await Promise.all(others.flatMap((p) => [rawGet(p, { 'Accept-Encoding': 'br' }, 'GET', s.base), rawGet(p, { 'Accept-Encoding': 'gzip' }, 'GET', s.base)]));
+    batch.forEach((r, i) => {
+      const p = others[i >> 1];
+      assert.strictEqual(r.status, 200, p);
+      const out = i % 2 ? zlib.gunzipSync(r.body) : zlib.brotliDecompressSync(r.body);
+      assert(out.equals(original(p)), `${p} ${i % 2 ? 'gzip' : 'br'}`);
+    });
+  }
+  const again = await rawGet(first, { 'Accept-Encoding': 'br' }, 'GET', s.base);
+  assert.strictEqual(again.headers.etag, results[0].headers.etag);
+  assert(again.body.equals(results[0].body), 'the same cached body');
+  s.stop();
+});
+
 // ---- Error answers -------------------------------------------------------------------------------------------------
 test('bad input is a 400, internal failures are a generic 500 that is logged but not leaked', async () => {
   const s = await spawnServer({});
@@ -1025,8 +1069,20 @@ test('bad input is a 400, internal failures are a generic 500 that is logged but
   assert.deepStrictEqual(await bad.json(), { error: 'Invalid JSON' });
   const big = await call('/api/admin/rooms', { method: 'POST', body: JSON.stringify({ name: 'x'.repeat(40000) }) }).then((r) => r.status, () => 400);
   assert.strictEqual(big, 400);
+  // A malformed cookie (maybe from another app on the domain) is ignored: not logged in, but no error either.
   const cookieRes = await fetch(s.base + '/api/admin/rooms', { headers: { cookie: 'te_admin=%E0%A4%A' } });
-  assert.strictEqual(cookieRes.status, 400);
+  assert.strictEqual(cookieRes.status, 401);
+  const mixed = await fetch(s.base + '/api/admin/rooms', { headers: { cookie: `other=%E0%A4%A; ${ck}; also=%zz` } });
+  assert.strictEqual(mixed.status, 200, 'the valid session cookie still counts');
+  // A body that is valid JSON but not an object is a client error too (also without logging in).
+  for (const raw of ['null', '42', '"text"', '[1,2]', 'true']) {
+    const res = await fetch(s.base + '/api/admin/login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: raw });
+    assert.strictEqual(res.status, 400, raw);
+    assert.deepStrictEqual(await res.json(), { error: 'Invalid JSON' });
+    const authed = await call('/api/admin/rooms', { method: 'POST', body: raw });
+    assert.strictEqual(authed.status, 400, raw);
+  }
+  assert.doesNotMatch(s.out.log, /request failed/, 'no TypeError was logged');
   // Domain errors keep their message
   const dupe = await call('/api/admin/rooms', { method: 'POST', body: JSON.stringify({ name: 'admin' }) });
   assert.strictEqual(dupe.status, 400);
@@ -1060,22 +1116,110 @@ test('WebSocket upgrades from foreign origins are refused', async () => {
   s.stop();
 });
 
+test('ALLOWED_ORIGINS entries are normalised like browser origins; bad ones are ignored with a warning', async () => {
+  const s = await spawnServer({ ALLOWED_ORIGINS: 'https://Calls.Example.com:443/, http://plain.example.com:80, nonsense, https://other.example.org:8443/path' });
+  const open = (origin) => wsAt(s.base, { Origin: origin }).then((ws) => { ws.close(); return true; }, (err) => err.message);
+  assert.strictEqual(await open('https://calls.example.com'), true, 'default port and trailing slash');
+  assert.strictEqual(await open('http://plain.example.com'), true);
+  assert.strictEqual(await open('https://other.example.org:8443'), true, 'path dropped, port kept');
+  assert.match(await open('https://other.example.org'), /403/, 'a different port is a different origin');
+  assert.match(s.out.log, /ALLOWED_ORIGINS: ignoring "nonsense"/);
+  s.stop();
+});
+
+test('Origin vs Host: strict host:port normally, hostname only behind a trusted proxy', async () => {
+  const strict = await spawnServer({});
+  const trusted = await spawnServer({ TRUST_PROXY: '1' });
+  const open = (s, origin, host) => wsAt(s.base, { Origin: origin, Host: host }).then((ws) => { ws.close(); return true; }, (err) => err.message);
+  // nginx "proxy_set_header Host $host": no port, while the browser's Origin has one.
+  assert.match(await open(strict, 'https://x.example.com:8443', 'x.example.com'), /403/);
+  assert.strictEqual(await open(trusted, 'https://x.example.com:8443', 'x.example.com'), true);
+  assert.strictEqual(await open(trusted, 'https://x.example.com', 'x.example.com:8443'), true);
+  assert.strictEqual(await open(strict, 'https://x.example.com:8443', 'x.example.com:8443'), true, 'exact host:port');
+  assert.strictEqual(await open(strict, 'https://x.example.com', 'x.example.com'), true, 'default port');
+  assert.match(await open(trusted, 'https://evil.example.net:8443', 'x.example.com'), /403/, 'other hostname');
+  assert.match(await open(trusted, 'https://x.example.com.evil.net', 'x.example.com'), /403/);
+  assert.match(await open(trusted, 'null', 'x.example.com'), /403/);
+  strict.stop();
+  trusted.stop();
+});
+
+test('limiterKey: IPv4 as is, IPv4-mapped IPv6 as IPv4, other IPv6 by /64', () => {
+  assert.strictEqual(limiterKey('1.2.3.4'), '1.2.3.4');
+  assert.strictEqual(limiterKey('::ffff:1.2.3.4'), '1.2.3.4');
+  assert.strictEqual(limiterKey('::FFFF:0102:0304'), '1.2.3.4');
+  assert.strictEqual(limiterKey('2001:db8:1:2:aaaa::1'), limiterKey('2001:0db8:0001:0002:bbbb:cccc:dddd:eeee'));
+  assert.notStrictEqual(limiterKey('2001:db8:1:2::1'), limiterKey('2001:db8:1:3::1'));
+  assert.strictEqual(limiterKey('[2001:db8::1]'), limiterKey('2001:db8:0:0:5::9'));
+  assert.strictEqual(limiterKey('fe80::1%eth0'), limiterKey('fe80::2'));
+  assert.strictEqual(limiterKey('not-an-ip'), 'not-an-ip');
+  assert.strictEqual(limiterKey(''), '');
+});
+
+test('rate limits count an IPv6 /64 (and an IPv4-mapped address as its IPv4) as one client', async () => {
+  const s = await spawnServer({ TRUST_PROXY: '1' });
+  const attempt = (xff) => fetch(s.base + '/api/admin/login', { method: 'POST', headers: { 'content-type': 'application/json', 'X-Forwarded-For': xff }, body: JSON.stringify({ password: 'wrong' }) }).then((r) => r.status);
+  for (let i = 0; i < 10; i++) assert.strictEqual(await attempt(`2001:db8:5:6:${i}::${i + 1}`), 401);
+  assert.strictEqual(await attempt('2001:db8:5:6:ffff::1'), 429, 'same /64');
+  assert.strictEqual(await attempt('2001:db8:5:7::1'), 401, 'another /64');
+  for (let i = 0; i < 5; i++) assert.strictEqual(await attempt('203.0.113.9'), 401);
+  for (let i = 0; i < 5; i++) assert.strictEqual(await attempt('::ffff:203.0.113.9'), 401);
+  assert.strictEqual(await attempt('203.0.113.9'), 429, 'mapped and plain IPv4 share the budget');
+
+  // The room-password limiter uses the same key.
+  const ck = await adminCookie(s.base);
+  await fetch(s.base + '/api/admin/rooms', { method: 'POST', headers: { 'content-type': 'application/json', cookie: ck }, body: JSON.stringify({ name: 'v6room', password: 'right' }) });
+  const guesses = [];
+  for (let i = 0; i < 25; i++) {
+    const ws = await wsAt(s.base, { 'X-Forwarded-For': `2001:db8:9:9:${i}::1` });
+    ws.sendJson({ type: 'join', room: 'v6room', id: `v6guess${String(i).padStart(4, '0')}`, name: 'G', password: 'bad' });
+    guesses.push((await ws.next()).code);
+    ws.close();
+  }
+  assert.strictEqual(guesses.filter((c) => c === 'bad-password').length, 20);
+  assert.strictEqual(guesses.filter((c) => c === 'rate-limited').length, 5);
+  s.stop();
+});
+
 test('a socket that floods the server is closed with a policy code', async () => {
   const s = await spawnServer({});
-  // A normal burst (ICE candidates, clock pings) is fine.
+  // A normal burst (ICE candidates, clock pings) is fine, even a large one.
   const calm = await wsAt(s.base);
-  for (let i = 0; i < 150; i++) calm.sendJson({ type: 'time', c: i });
-  for (let i = 0; i < 150; i++) assert.strictEqual((await calm.next()).c, i);
+  for (let i = 0; i < 500; i++) calm.sendJson({ type: 'time', c: i });
+  for (let i = 0; i < 500; i++) assert.strictEqual((await calm.next()).c, i);
   // A flood is not.
   const flood = await wsAt(s.base);
   const closed = new Promise((resolve) => flood.on('close', (code) => resolve(code)));
-  for (let i = 0; i < 500; i++) flood.sendJson({ type: 'time', c: i });
+  for (let i = 0; i < 3000; i++) flood.sendJson({ type: 'time', c: i });
   assert.strictEqual(await closed, 1008);
   // It refills: the calm client can still talk after a pause.
   await new Promise((r) => setTimeout(r, 300));
   calm.sendJson({ type: 'time', c: 'again' });
   assert.strictEqual((await calm.next()).c, 'again');
   calm.close();
+  s.stop();
+});
+
+test('a newcomer in a full room can send 400 signals in a burst without being disconnected', async () => {
+  const s = await spawnServer({});
+  const ck = await adminCookie(s.base);
+  await fetch(s.base + '/api/admin/rooms', { method: 'POST', headers: { 'content-type': 'application/json', cookie: ck }, body: JSON.stringify({ name: 'burst-room' }) });
+  const a = await wsAt(s.base);
+  const b = await wsAt(s.base);
+  a.sendJson({ type: 'join', room: 'burst-room', id: 'burstpeerA1', name: 'A' });
+  assert.strictEqual((await a.next()).type, 'welcome');
+  b.sendJson({ type: 'join', room: 'burst-room', id: 'burstpeerB1', name: 'B' });
+  assert.strictEqual((await b.next()).type, 'welcome');
+  assert.strictEqual((await a.next()).type, 'peer-joined');
+  let closedWith = null;
+  b.on('close', (code) => { closedWith = code; });
+  for (let i = 0; i < 400; i++) b.sendJson({ type: 'signal', to: 'burstpeerA1', data: { candidate: i } });
+  for (let i = 0; i < 400; i++) assert.strictEqual((await a.next()).data.candidate, i);
+  assert.strictEqual(closedWith, null);
+  b.sendJson({ type: 'time', c: 1 });
+  assert.strictEqual((await b.next()).c, 1, 'still connected');
+  a.close();
+  b.close();
   s.stop();
 });
 

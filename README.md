@@ -96,7 +96,7 @@ server {
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
-        proxy_set_header Host $host;
+        proxy_set_header Host $http_host;   # keeps a non-default port, so the Host matches the browser's Origin
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_read_timeout 1h;
@@ -106,7 +106,7 @@ server {
 
 With `TRUST_PROXY=true` (the compose default), the server takes the client IP from `X-Forwarded-For`, which is used for login rate limiting. It also marks the admin cookie `Secure` and sends `Strict-Transport-Security`. `true` (or `1`, `yes`) means one trusted proxy: the server uses the last entry of `X-Forwarded-For`, the one your proxy appended, and ignores anything the client put before it. If there are several proxies in a row (say a CDN in front of nginx), set `TRUST_PROXY` to their number, e.g. `TRUST_PROXY=2`: the client address is then the second entry from the right. Setting it higher than the real number of proxies lets clients spoof their address.
 
-Browsers must open the WebSocket from the same host as the page. If the address people use differs from the `Host` header your proxy passes on, list it in `ALLOWED_ORIGINS` (e.g. `https://calls.example.com`). If you publish port 4567 directly to the internet without a proxy, set `TRUST_PROXY=false`, or bind the port to localhost only (`"127.0.0.1:4567:4567"`).
+Browsers must open the WebSocket from the same host as the page: the `Origin` header must match the `Host` header your proxy passes on. Use `proxy_set_header Host $http_host;` (as above): `$host` drops the port, so on a non-default port (say `https://calls.example.com:8443`) the two would differ. As a fallback, while `TRUST_PROXY` is on the server also accepts an Origin whose host name equals the Host header's host name even if the ports differ; without a trusted proxy the comparison is strict (host and port). If the address people use is different from the `Host` header altogether, list it in `ALLOWED_ORIGINS` (e.g. `https://calls.example.com`; a default port or a trailing slash is fine, and entries that are not valid origins are ignored with a warning at startup). If you publish port 4567 directly to the internet without a proxy, set `TRUST_PROXY=false`, or bind the port to localhost only (`"127.0.0.1:4567:4567"`).
 
 **Works on Wi-Fi but not on mobile data?** If the lobby says *Can’t reach the server, retrying…* and then *Could not connect to the server*, the page loaded but the WebSocket (`/ws`) did not get through. Mobile networks (4G/5G) usually connect over IPv6. If your domain has an `AAAA` record, the proxy must forward WebSockets on its IPv6 listener too. Test with `curl -6 -i -N -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' https://three-eight.example.com/ws`, which should answer `101 Switching Protocols`. If you get into the room but a friend's tile stays on *connecting…* / *connection failed*, the problem is the carrier's NAT instead; see [Do I need TURN?](#do-i-need-turn).
 
@@ -214,7 +214,7 @@ Notes:
 | `ADMIN_PASSWORD` | random, printed at start | Password for `/admin` |
 | `DATA_DIR` | `./data` (`/data` in Docker) | Where `rooms.json` is stored |
 | `TRUST_PROXY` | `false` (`true` in compose) | Trust `X-Forwarded-For` / `X-Forwarded-Proto`: `true`/`1`/`yes` for one proxy, a number for that many proxies in a row |
-| `ALLOWED_ORIGINS` | — | Comma-separated extra origins allowed to open the WebSocket (the page's own host is always allowed) |
+| `ALLOWED_ORIGINS` | — | Comma-separated extra origins allowed to open the WebSocket (the page's own host is always allowed); entries are normalised like a browser's Origin, invalid ones are ignored with a warning |
 | `MAX_ROOM_SIZE` | `12` | Max participants per room |
 | `STUN_URLS` | Google + Cloudflare STUN | Comma-separated STUN URLs |
 | `TURN_URLS` | — | Comma-separated TURN URLs (optional) |
