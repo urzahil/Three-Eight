@@ -1,6 +1,7 @@
 // Unit tests for how sync.js accepts a peer's playback state (no DOM needed).
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import './browser-globals.mjs';
 import { cleanState, emptyState, MovieSync } from '../public/assets/js/sync.js';
 
 const good = (over = {}) => ({ seq: 3, by: 'peer-aaaaaaaa', movie: { name: 'A.mkv', size: 100, duration: 60 }, paused: false, pos: 12.5, at: 1700000000000, rate: 1, audio: 1, sub: 'e0', subFiles: [{ id: 'x1', name: 'a.srt' }], ...over });

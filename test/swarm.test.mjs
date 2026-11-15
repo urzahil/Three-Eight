@@ -3,6 +3,7 @@
 // Run with: node --test test/swarm.test.mjs
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import './browser-globals.mjs';
 import { sanitizeCues, MAX_CUES, Swarm, T, DENIED, HEADER, MAX_FRAME, MAX_PAYLOAD, assignFetcher, decodeFrame, encodeFrame, filmKey, keyId, mergeRanges, parseHave, movieKeys } from '../public/assets/js/player/swarm.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
