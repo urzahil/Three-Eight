@@ -390,14 +390,21 @@ export class MkvDemuxer {
       } else if (h.id === ID.SimpleBlock || h.id === ID.BlockGroup) {
         // Peek the track number before loading the whole block.
         await src.ensure(dataStart, Math.min(h.size, 16));
+        // Inside a BlockGroup the children may come in any order: only peek when Block is the first child,
+        // otherwise load the whole group and check the track after parsing.
         let p = dataStart;
+        let peek = true;
         if (h.id === ID.BlockGroup) {
           const inner = readHeader(src.view(p, Math.min(16, src.available(p))), 0);
-          if (inner) p += inner.headerLen;
+          if (inner && inner.id === ID.Block) p += inner.headerLen;
+          else peek = false;
         }
-        const tl = vintLength(src.byte(p));
-        const tn = tl ? readUint(src.view(p, tl), 0, tl) - (0x80 >> (tl - 1)) * Math.pow(256, tl - 1) : -1;
-        if (!trackSet || trackSet.has(tn)) {
+        let tn = -1;
+        if (peek) {
+          const tl = vintLength(src.byte(p));
+          tn = tl ? readUint(src.view(p, tl), 0, tl) - (0x80 >> (tl - 1)) * Math.pow(256, tl - 1) : -1;
+        }
+        if (!trackSet || !peek || trackSet.has(tn)) {
           await src.ensure(dataStart, h.size);
           const data = src.view(dataStart, h.size);
           let blk = null, duration = null, hasRef = false;
@@ -410,7 +417,7 @@ export class MkvDemuxer {
             }
             if (blk) blk.key = !hasRef;
           }
-          if (blk) {
+          if (blk && (!trackSet || trackSet.has(blk.track))) {
             blk.frames = blk.frames.map((f) => f.slice()); // copy out of the window buffer
             yield { track: blk.track, pts: clusterTc + blk.rel, key: blk.key, frames: blk.frames, duration, pos };
           }

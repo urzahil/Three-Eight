@@ -65,3 +65,34 @@ test('cue text is escaped for native WebVTT tracks', () => {
   assert.strictEqual(cueToVtt('<i>Tom & Jerry</i>\n1 < 2 > 0'), '<i>Tom &amp; Jerry</i>\n1 &lt; 2 &gt; 0');
   assert.strictEqual(cueToVtt('<b><u>x</u></b>'), '<b><u>x</u></b>');
 });
+
+test('MKV blocks(): BlockGroup children in any order, filtered by track', async () => {
+  const { MkvDemuxer } = await import('../public/assets/js/player/mkv.js');
+  const el = (id, body) => [...id, 0x80 | body.length, ...body]; // 1-byte sizes are enough here
+  const block = (track, rel, payload) => [0x80 | track, rel >> 8, rel & 0xff, 0x00, ...payload];
+  const cluster = [
+    ...el([0xe7], [0x00]), // Timecode 0
+    ...el([0xa0], [...el([0x9b], [0x05]), ...el([0xa1], block(3, 10, [0x68, 0x69]))]), // BlockDuration before Block
+    ...el([0xa0], [...el([0xfb], [0x01]), ...el([0xa1], block(1, 20, [0x01]))]), // ReferenceBlock before Block, other track
+    ...el([0xa0], [...el([0xa1], block(3, 30, [0x6f])), ...el([0x9b], [0x07])]), // Block first
+    ...el([0xa3], [0x81, 0x00, 40, 0x80, 0x02]), // SimpleBlock (keyframe), other track
+  ];
+  const bytes = new Uint8Array([0x1f, 0x43, 0xb6, 0x75, 0x80 | cluster.length, ...cluster]);
+  const d = new MkvDemuxer(new Blob([bytes]));
+  d.segEnd = bytes.length;
+  const got = [];
+  for await (const b of d.blocks(0, new Set([3]))) got.push({ track: b.track, pts: b.pts, duration: b.duration, text: String.fromCharCode(...b.frames[0]) });
+  assert.deepStrictEqual(got, [
+    { track: 3, pts: 10, duration: 5, text: 'hi' },
+    { track: 3, pts: 30, duration: 7, text: 'o' },
+  ]);
+  const all = [];
+  for await (const b of d.blocks(0, null)) all.push(b.track);
+  assert.deepStrictEqual(all, [3, 1, 3, 1]);
+});
+
+test('MP4: a truncated 64-bit box header at the end of the file is not a RangeError', async () => {
+  const { Mp4Demuxer } = await import('../public/assets/js/player/mp4.js');
+  const bytes = new Uint8Array([0, 0, 0, 1, 0x6d, 0x64, 0x61, 0x74, 0, 0, 0, 0]); // size=1 "mdat", 12 bytes
+  await assert.rejects(Mp4Demuxer.open(new Blob([bytes])), /No moov box found/);
+});
