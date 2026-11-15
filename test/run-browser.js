@@ -113,7 +113,8 @@ async function runOne(s) {
   let status = 'PASS';
   let note = '';
   try {
-    const env = { ADMIN_PASSWORD };
+    // A private TMPDIR: the scripts that start their own server make data dirs (and browsers make profiles) there, removed afterwards.
+    const env = { ADMIN_PASSWORD, TMPDIR: mkTemp('te-browser-tmp-') };
     if (s.kind === 'server') {
       server = await startServer(log);
       env.BASE = server.base;
@@ -167,8 +168,17 @@ async function main() {
   return failed ? 1 : 0;
 }
 
+// On Ctrl-C: ask the scripts to stop first (Playwright closes its browser on SIGTERM; after a SIGKILL the browser would be left
+// running), then kill whatever is left and delete the temp dirs.
+let interrupted = false;
 for (const sig of ['SIGINT', 'SIGTERM']) {
-  process.on(sig, () => { cleanup(); process.exit(130); });
+  process.on(sig, async () => {
+    if (interrupted) return;
+    interrupted = true;
+    await Promise.all([...children].map((c) => stop(c)));
+    cleanup();
+    process.exit(130);
+  });
 }
 process.on('exit', cleanup);
 
