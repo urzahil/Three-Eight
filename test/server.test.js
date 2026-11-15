@@ -721,6 +721,100 @@ test('RoomStore: an unreadable rooms.json stops the server instead of risking an
   }
 });
 
+// ---- Failed writes leave the store untouched ----------------------------------------------------------------------
+test('RoomStore: a failed write of rooms.json changes nothing in memory, and the same call works once writing does', async () => {
+  const { RoomError } = require('../server/store');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'three-eight-store-'));
+  const block = () => fs.mkdirSync(path.join(dir, 'rooms.json.tmp'));
+  const unblock = () => fs.rmdirSync(path.join(dir, 'rooms.json.tmp'));
+  const snapshot = (store) => JSON.stringify({ list: store.list(), rooms: store.rooms });
+  const failsHard = async (fn) => {
+    await assert.rejects(async () => fn(), (err) => !(err instanceof RoomError) && err.code === 'EISDIR');
+  };
+  try {
+    const store = new RoomStore(dir);
+    await store.create('keep', 'secret');
+    store.setDrive('keep', { folderId: FID });
+    const before = snapshot(store);
+    assert.strictEqual(Object.getPrototypeOf(store.rooms), null);
+
+    // create
+    block();
+    await failsHard(() => store.create('newroom', 'pw'));
+    assert.strictEqual(store.get('newroom'), null);
+    assert.strictEqual(snapshot(store), before);
+    unblock();
+    await store.create('newroom', 'pw');
+    assert(new RoomStore(dir).get('newroom'));
+
+    // setPassword
+    const afterCreate = snapshot(store);
+    block();
+    await failsHard(() => store.setPassword('keep', 'changed'));
+    assert.strictEqual(snapshot(store), afterCreate);
+    assert.strictEqual(await store.check('keep', 'secret'), true);
+    assert.strictEqual(await store.check('keep', 'changed'), false);
+    unblock();
+    await store.setPassword('keep', 'changed');
+    const reloaded = new RoomStore(dir);
+    assert.strictEqual(await reloaded.check('keep', 'changed'), true);
+    assert.strictEqual(await reloaded.check('keep', 'secret'), false);
+
+    // setDrive (set a new folder, and remove it)
+    const afterPw = snapshot(store);
+    block();
+    await new Promise((r) => setTimeout(r, 5)); // so a leaked updatedAt would differ
+    const OTHER = '9ZyXwVuTsRqPoNmLkJiHgFeDcBa_-0123';
+    await failsHard(() => store.setDrive('keep', { folderId: OTHER }));
+    assert.strictEqual(snapshot(store), afterPw);
+    assert.strictEqual(store.get('keep').drive.folderId, FID);
+    await failsHard(() => store.setDrive('keep', null));
+    assert.strictEqual(snapshot(store), afterPw);
+    unblock();
+    store.setDrive('keep', { folderId: OTHER });
+    assert.strictEqual(new RoomStore(dir).get('keep').drive.folderId, OTHER);
+    store.setDrive('keep', null);
+    assert.strictEqual(new RoomStore(dir).get('keep').drive, undefined);
+    store.setDrive('keep', { folderId: FID });
+
+    // delete
+    const afterDrive = snapshot(store);
+    block();
+    await failsHard(() => store.delete('newroom'));
+    assert.strictEqual(snapshot(store), afterDrive);
+    assert(store.get('newroom'));
+    assert(store.list().some((r) => r.name === 'newroom'));
+    assert.strictEqual(await store.check('newroom', 'pw'), true);
+    unblock();
+    store.delete('newroom');
+    assert.strictEqual(store.get('newroom'), null);
+    assert.strictEqual(new RoomStore(dir).get('newroom'), null);
+    assert(new RoomStore(dir).get('keep'));
+    assert.strictEqual(Object.getPrototypeOf(store.rooms), null);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('RoomStore: two concurrent creates of one name: one wins, the other is "already exists"', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'three-eight-store-'));
+  try {
+    const store = new RoomStore(dir);
+    const results = await Promise.allSettled([store.create('Same', 'one'), store.create('same', 'two')]);
+    assert.deepStrictEqual(results.map((r) => r.status).sort(), ['fulfilled', 'rejected']);
+    const lost = results.find((r) => r.status === 'rejected');
+    assert.match(lost.reason.message, /already exists/);
+    const winnerPw = results[0].status === 'fulfilled' ? 'one' : 'two';
+    const loserPw = winnerPw === 'one' ? 'two' : 'one';
+    assert.strictEqual(store.list().length, 1);
+    assert.strictEqual(await store.check('same', winnerPw), true, 'the winner is not overwritten');
+    assert.strictEqual(await store.check('same', loserPw), false);
+    assert.strictEqual(await new RoomStore(dir).check('same', winnerPw), true);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // ---- Room password limiter ----------------------------------------------------------------------------
 function wsAt(base, headers = {}, opts = {}) {
   const ws = new WebSocket(base.replace('http', 'ws') + '/ws', { headers, ...opts });
