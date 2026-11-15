@@ -8,7 +8,8 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const WebSocket = require('ws');
-const { parseDriveFolder } = require('../server/store');
+const http = require('node:http');
+const { RoomStore, parseDriveFolder } = require('../server/store');
 const { startFakeGoogle } = require('./fake-google');
 
 const PORT = 45000 + Math.floor(Math.random() * 1000);
@@ -41,7 +42,7 @@ async function spawnServer(env) {
   await waitUp(base);
   const stop = () => { child.kill(); fs.rmSync(dir, { recursive: true, force: true }); };
   extraProcs.push(stop);
-  return { base, out, stop };
+  return { base, out, stop, dir, child };
 }
 
 before(async () => {
@@ -609,4 +610,373 @@ test('drive: an unusable key file disables Drive, with a clear log line that nev
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+
+// ---- Phantom rooms (inherited object properties) ---------------------------------------------------
+const PHANTOMS = ['constructor', '__proto__', 'toString', 'hasOwnProperty', 'valueOf'];
+
+test('names of Object.prototype properties are not rooms', async () => {
+  for (const name of PHANTOMS) {
+    assert.strictEqual((await fetch(`${BASE}/api/rooms/${name}`)).status, 404, name);
+    const ws = await wsClient();
+    ws.sendJson({ type: 'join', room: name, id: 'phantom01', name: 'X' });
+    assert.strictEqual((await ws.next()).code, 'no-room', name);
+    ws.close();
+  }
+  // The admin is not told a room "already exists" when it does not; the name is simply free (or invalid).
+  const created = await json('POST', '/api/admin/rooms', { name: 'constructor', password: '' });
+  assert.strictEqual(created.status, 201);
+  assert.strictEqual((await fetch(`${BASE}/api/rooms/constructor`)).status, 200);
+  const dup = await json('POST', '/api/admin/rooms', { name: 'constructor' });
+  assert.strictEqual(dup.status, 400);
+  assert.match((await dup.json()).error, /already exists/);
+  assert.strictEqual((await json('DELETE', '/api/admin/rooms/constructor', {})).status, 200);
+  assert.strictEqual((await fetch(`${BASE}/api/rooms/constructor`)).status, 404);
+  const proto = await json('POST', '/api/admin/rooms', { name: '__proto__' });
+  assert.strictEqual(proto.status, 400);
+  assert.doesNotMatch((await proto.json()).error, /already exists/);
+  const del = await json('DELETE', '/api/admin/rooms/toString', {});
+  assert.strictEqual(del.status, 404);
+  assert.match((await del.json()).error, /No such room/);
+  const list = (await (await json('GET', '/api/admin/rooms')).json()).rooms.map((r) => r.name);
+  assert(!list.includes('constructor'));
+});
+
+test('RoomStore: own properties only, also for names loaded from rooms.json', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'three-eight-store-'));
+  try {
+    const now = Date.now();
+    fs.writeFileSync(path.join(dir, 'rooms.json'), `{"version":1,"rooms":{"real":{"name":"Real","passwordHash":"","createdAt":${now},"updatedAt":${now}},"__proto__":{"name":"Evil","passwordHash":""}}}`);
+    const store = new RoomStore(dir);
+    for (const name of PHANTOMS.filter((n) => n !== '__proto__')) assert.strictEqual(store.get(name), null, name);
+    assert.strictEqual(store.get('REAL').name, 'Real');
+    assert.deepStrictEqual(store.list().map((r) => r.name).sort(), ['Evil', 'Real'].sort(), 'an own "__proto__" entry from the file is just data');
+    assert.strictEqual(({}).name, undefined, 'Object.prototype was not polluted');
+    assert.throws(() => store.delete('constructor'), /No such room/);
+    assert.strictEqual(store.get('constructor'), null);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---- rooms.json problems --------------------------------------------------------------------------------
+test('RoomStore: an unparseable rooms.json is moved aside, not overwritten', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'three-eight-store-'));
+  const origError = console.error;
+  const logged = [];
+  try {
+    fs.writeFileSync(path.join(dir, 'rooms.json'), '{ "rooms": { "a": ');
+    console.error = (...a) => logged.push(a.join(' '));
+    const store = new RoomStore(dir);
+    console.error = origError;
+    assert.deepStrictEqual(store.list(), []);
+    assert(logged.some((l) => /could not be parsed/.test(l) && /corrupt-/.test(l)), 'says what happened');
+    const aside = fs.readdirSync(dir).filter((f) => f.startsWith('rooms.json.corrupt-'));
+    assert.strictEqual(aside.length, 1);
+    assert.strictEqual(fs.readFileSync(path.join(dir, aside[0]), 'utf8'), '{ "rooms": { "a": ');
+    assert(!fs.existsSync(path.join(dir, 'rooms.json')));
+    await store.create('fresh', '');
+    assert.strictEqual(fs.readFileSync(path.join(dir, aside[0]), 'utf8'), '{ "rooms": { "a": ', 'saving does not touch the saved copy');
+    assert(new RoomStore(dir).get('fresh'));
+  } finally {
+    console.error = origError;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('RoomStore: an unreadable rooms.json stops the server instead of risking an overwrite', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'three-eight-store-'));
+  try {
+    fs.mkdirSync(path.join(dir, 'rooms.json')); // reading it fails with EISDIR (like EACCES: not ENOENT)
+    assert.throws(() => new RoomStore(dir), /Cannot read .*rooms\.json/);
+    const child = spawn(process.execPath, [path.join(__dirname, '..', 'server', 'server.js')], {
+      env: { ...process.env, PORT: String(PORT + 2500), HOST: '127.0.0.1', ADMIN_PASSWORD: 'x', DATA_DIR: dir, GOOGLE_SERVICE_ACCOUNT: '' },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let log = '';
+    child.stdout.on('data', (d) => { log += d; });
+    child.stderr.on('data', (d) => { log += d; });
+    const code = await new Promise((resolve) => child.on('exit', resolve));
+    assert.strictEqual(code, 1);
+    assert.match(log, /Cannot read .*rooms\.json/);
+    assert.doesNotMatch(log, /\n\s+at /, 'a message, not a stack trace');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---- Room password limiter ----------------------------------------------------------------------------
+function wsAt(base, headers = {}, opts = {}) {
+  const ws = new WebSocket(base.replace('http', 'ws') + '/ws', { headers, ...opts });
+  const queue = [];
+  let waiter = null;
+  ws.on('message', (m) => {
+    const msg = JSON.parse(m.toString());
+    if (waiter) { const w = waiter; waiter = null; w(msg); } else queue.push(msg);
+  });
+  ws.next = () => (queue.length ? Promise.resolve(queue.shift()) : new Promise((r) => { waiter = r; }));
+  ws.sendJson = (o) => ws.send(JSON.stringify(o));
+  return new Promise((resolve, reject) => { ws.on('open', () => resolve(ws)); ws.on('error', reject); });
+}
+
+async function adminCookie(base) {
+  const login = await fetch(base + '/api/admin/login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password: 'admin-pw' }) });
+  return login.headers.get('set-cookie').split(';')[0];
+}
+
+test('room password limit: a burst of wrong passwords cannot get past it, and open rooms cost nothing', async () => {
+  const s = await spawnServer({ TRUST_PROXY: '1', MAX_ROOM_SIZE: '100' });
+  const ck = await adminCookie(s.base);
+  const post = (body) => fetch(s.base + '/api/admin/rooms', { method: 'POST', headers: { 'content-type': 'application/json', cookie: ck }, body: JSON.stringify(body) });
+  assert.strictEqual((await post({ name: 'locked', password: 'right' })).status, 201);
+  assert.strictEqual((await post({ name: 'open', password: '' })).status, 201);
+
+  // 60 sockets from one IP, all guessing at once.
+  const sockets = await Promise.all(Array.from({ length: 60 }, () => wsAt(s.base, { 'X-Forwarded-For': '10.1.1.1' })));
+  sockets.forEach((ws, i) => ws.sendJson({ type: 'join', room: 'locked', id: `burst${String(i).padStart(4, '0')}`, name: 'G', password: `guess${i}` }));
+  const codes = (await Promise.all(sockets.map((ws) => ws.next()))).map((m) => m.code);
+  assert.strictEqual(codes.filter((c) => c === 'bad-password').length, 20, 'only the allowed 20 were evaluated');
+  assert.strictEqual(codes.filter((c) => c === 'rate-limited').length, 40);
+  sockets.forEach((ws) => ws.close());
+
+  // Even the right password is refused for that IP now, but a fresh IP works.
+  const same = await wsAt(s.base, { 'X-Forwarded-For': '10.1.1.1' });
+  same.sendJson({ type: 'join', room: 'locked', id: 'sameip001', name: 'A', password: 'right' });
+  assert.strictEqual((await same.next()).code, 'rate-limited');
+  const fresh = await wsAt(s.base, { 'X-Forwarded-For': '10.2.2.2' });
+  fresh.sendJson({ type: 'join', room: 'locked', id: 'freship01', name: 'B', password: 'right' });
+  assert.strictEqual((await fresh.next()).type, 'welcome');
+
+  // One join in flight per socket: the others are answered (busy), not dropped or evaluated.
+  const one = await wsAt(s.base, { 'X-Forwarded-For': '10.3.3.3' });
+  for (let i = 0; i < 30; i++) one.sendJson({ type: 'join', room: 'locked', id: 'onesock001', name: 'C', password: `bad${i}` });
+  const answers = [];
+  for (let i = 0; i < 30; i++) answers.push((await one.next()).code);
+  assert.strictEqual(answers.filter((c) => c === 'bad-password').length, 1, 'one evaluated');
+  assert.strictEqual(answers.filter((c) => c === 'busy').length, 29);
+
+  // Correct passwords give the attempt back, and open rooms never use any: 25 joins do not lock the IP out.
+  const ip = { 'X-Forwarded-For': '10.4.4.4' };
+  for (let i = 0; i < 25; i++) {
+    const ws = await wsAt(s.base, ip);
+    ws.sendJson({ type: 'join', room: i % 2 ? 'open' : 'locked', id: 'reuse00001', name: 'D', password: i % 2 ? '' : 'right' });
+    assert.strictEqual((await ws.next()).type, 'welcome', `join ${i}`);
+    ws.close();
+  }
+  for (const ws of [same, fresh, one]) ws.close();
+  s.stop();
+});
+
+// ---- Client IP behind proxies ------------------------------------------------------------------------------
+test('TRUST_PROXY counts X-Forwarded-For from the right (number of trusted hops)', async () => {
+  const attempt = (base, xff) => fetch(base + '/api/admin/login', { method: 'POST', headers: { 'content-type': 'application/json', 'X-Forwarded-For': xff }, body: JSON.stringify({ password: 'wrong' }) }).then((r) => r.status);
+  // One hop (true): the last entry is the client; spoofed entries before it do not matter.
+  const one = await spawnServer({ TRUST_PROXY: 'true' });
+  for (let i = 0; i < 10; i++) assert.strictEqual(await attempt(one.base, `spoofed-${i}, 7.7.7.7`), 401);
+  assert.strictEqual(await attempt(one.base, 'another-spoof, 7.7.7.7'), 429, 'same client, however the header starts');
+  assert.strictEqual(await attempt(one.base, '7.7.7.7, 8.8.8.8'), 401, 'a different last entry is a different client');
+  one.stop();
+  // Two hops: the second entry from the right.
+  const two = await spawnServer({ TRUST_PROXY: '2' });
+  for (let i = 0; i < 10; i++) assert.strictEqual(await attempt(two.base, `spoofed-${i}, 9.9.9.9, 10.0.0.1`), 401);
+  assert.strictEqual(await attempt(two.base, 'x, 9.9.9.9, 10.0.0.2'), 429);
+  assert.strictEqual(await attempt(two.base, 'x, 6.6.6.6, 10.0.0.1'), 401);
+  two.stop();
+  // Off: the header is ignored altogether.
+  const off = await spawnServer({ TRUST_PROXY: '' });
+  for (let i = 0; i < 10; i++) assert.strictEqual(await attempt(off.base, `spoofed-${i}`), 401);
+  assert.strictEqual(await attempt(off.base, 'yet-another'), 429);
+  off.stop();
+});
+
+// ---- welcome.resumed ----------------------------------------------------------------------------------------------
+test('welcome says whether the join resumed the previous connection', async () => {
+  assert.strictEqual((await json('POST', '/api/admin/rooms', { name: 'resume-room', password: '' })).status, 201);
+  const a = await wsClient();
+  a.sendJson({ type: 'join', room: 'resume-room', id: 'resumer001', name: 'A' });
+  const first = await a.next();
+  assert.strictEqual(first.resumed, false);
+  const b = await wsClient();
+  b.sendJson({ type: 'join', room: 'resume-room', id: 'resumer001', name: 'A' });
+  const second = await b.next();
+  assert.strictEqual(second.resumed, true, 'took over the live entry of the same id');
+  const other = await wsClient();
+  other.sendJson({ type: 'join', room: 'resume-room', id: 'resumer002', name: 'B' });
+  assert.strictEqual((await other.next()).resumed, false);
+  // After a clean leave there is nothing to resume.
+  b.sendJson({ type: 'leave' });
+  await other.next(); // peer-left
+  const c = await wsClient();
+  c.sendJson({ type: 'join', room: 'resume-room', id: 'resumer001', name: 'A' });
+  assert.strictEqual((await c.next()).resumed, false);
+  for (const ws of [a, b, c, other]) ws.close();
+});
+
+// ---- Headers, caching, compression ---------------------------------------------------------------------------------
+function rawGet(p, headers = {}, method = 'GET', base = BASE) {
+  return new Promise((resolve, reject) => {
+    const req = http.request(base + p, { method, headers }, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks) }));
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+test('HTML pages carry a Content-Security-Policy; HSTS only for HTTPS requests', async () => {
+  for (const p of ['/', '/admin', '/SomeRoom']) {
+    const res = await rawGet(p, { Host: 'calls.example.com' });
+    const csp = res.headers['content-security-policy'];
+    assert.match(csp, /default-src 'self'/);
+    assert.match(csp, /script-src 'self'(;|$)/, 'no inline scripts');
+    assert.match(csp, /frame-ancestors 'none'/);
+    assert.match(csp, /connect-src 'self' ws:\/\/calls\.example\.com wss:\/\/calls\.example\.com/);
+    assert.match(csp, /media-src 'self' blob:/);
+    assert.match(csp, /worker-src 'self' blob:/);
+    assert.strictEqual(res.headers['strict-transport-security'], undefined, 'plain HTTP');
+  }
+  assert.strictEqual((await rawGet('/assets/js/app.js')).headers['content-security-policy'], undefined, 'only pages');
+  const s = await spawnServer({ TRUST_PROXY: '1' });
+  const https = await rawGet('/healthz', { 'X-Forwarded-Proto': 'https' }, 'GET', s.base);
+  assert.match(https.headers['strict-transport-security'], /^max-age=\d+$/);
+  assert.strictEqual((await rawGet('/healthz', {}, 'GET', s.base)).headers['strict-transport-security'], undefined);
+  s.stop();
+});
+
+test('static files: ETag/Last-Modified, 304, compression, HEAD', async () => {
+  const p = '/assets/js/app.js';
+  const plain = await rawGet(p, { 'Accept-Encoding': 'identity' });
+  assert.strictEqual(plain.status, 200);
+  assert.strictEqual(plain.headers['content-encoding'], undefined);
+  assert.strictEqual(plain.headers.vary, 'Accept-Encoding');
+  assert.strictEqual(plain.headers['cache-control'], 'no-cache');
+  assert(plain.headers.etag && plain.headers['last-modified']);
+  assert.strictEqual(plain.headers['content-length'], String(plain.body.length));
+  const original = fs.readFileSync(path.join(__dirname, '..', 'public', p));
+  assert(plain.body.equals(original));
+
+  // Conditional requests
+  const again = await rawGet(p, { 'Accept-Encoding': 'identity', 'If-None-Match': plain.headers.etag });
+  assert.strictEqual(again.status, 304);
+  assert.strictEqual(again.body.length, 0);
+  assert.strictEqual(again.headers.etag, plain.headers.etag);
+  assert.strictEqual((await rawGet(p, { 'Accept-Encoding': 'identity', 'If-None-Match': `W/${plain.headers.etag}, "other"` })).status, 304);
+  assert.strictEqual((await rawGet(p, { 'Accept-Encoding': 'identity', 'If-None-Match': '"nope"' })).status, 200);
+  assert.strictEqual((await rawGet(p, { 'Accept-Encoding': 'identity', 'If-Modified-Since': plain.headers['last-modified'] })).status, 304);
+  assert.strictEqual((await rawGet(p, { 'Accept-Encoding': 'identity', 'If-Modified-Since': new Date(0).toUTCString() })).status, 200);
+  assert.strictEqual((await rawGet(p, { 'Accept-Encoding': 'identity', 'If-None-Match': '"nope"', 'If-Modified-Since': plain.headers['last-modified'] })).status, 200, 'If-None-Match wins');
+
+  // Compression
+  const zlib = require('node:zlib');
+  const gz = await rawGet(p, { 'Accept-Encoding': 'gzip' });
+  assert.strictEqual(gz.headers['content-encoding'], 'gzip');
+  assert.strictEqual(gz.headers.vary, 'Accept-Encoding');
+  assert.notStrictEqual(gz.headers.etag, plain.headers.etag, 'one validator per representation');
+  assert(gz.body.length < original.length / 2);
+  assert(zlib.gunzipSync(gz.body).equals(original));
+  assert.strictEqual(gz.headers['content-length'], String(gz.body.length));
+  const br = await rawGet(p, { 'Accept-Encoding': 'gzip, br' });
+  assert.strictEqual(br.headers['content-encoding'], 'br');
+  assert(zlib.brotliDecompressSync(br.body).equals(original));
+  assert.strictEqual((await rawGet(p, { 'Accept-Encoding': 'br;q=0, gzip' })).headers['content-encoding'], 'gzip');
+  assert.strictEqual((await rawGet(p, { 'Accept-Encoding': 'gzip', 'If-None-Match': gz.headers.etag })).status, 304);
+  assert.strictEqual((await rawGet(p, { 'Accept-Encoding': 'gzip', 'If-None-Match': br.headers.etag })).status, 200);
+  assert.strictEqual((await rawGet(p)).headers['content-encoding'], undefined, 'no Accept-Encoding, no compression');
+  const html = await rawGet('/', { 'Accept-Encoding': 'gzip' });
+  assert.strictEqual(html.headers['content-encoding'], 'gzip');
+  assert(html.headers['content-security-policy']);
+  assert(zlib.gunzipSync(html.body).equals(fs.readFileSync(path.join(__dirname, '..', 'public', 'index.html'))));
+
+  // HEAD: same headers, no body
+  const head = await rawGet(p, { 'Accept-Encoding': 'gzip' }, 'HEAD');
+  assert.strictEqual(head.status, 200);
+  assert.strictEqual(head.body.length, 0);
+  assert.strictEqual(head.headers['content-encoding'], 'gzip');
+  assert.strictEqual(head.headers['content-length'], gz.headers['content-length']);
+  assert.strictEqual(head.headers.etag, gz.headers.etag);
+  const headPlain = await rawGet(p, { 'Accept-Encoding': 'identity' }, 'HEAD');
+  assert.strictEqual(headPlain.headers['content-length'], String(original.length));
+  assert.strictEqual(headPlain.body.length, 0);
+
+  // Images are not compressed
+  const png = await rawGet('/assets/icon.svg', { 'Accept-Encoding': 'gzip' });
+  assert.strictEqual(png.status, 200);
+});
+
+// ---- Error answers -------------------------------------------------------------------------------------------------
+test('bad input is a 400, internal failures are a generic 500 that is logged but not leaked', async () => {
+  const s = await spawnServer({});
+  const ck = await adminCookie(s.base);
+  const call = (p, init) => fetch(s.base + p, { headers: { 'content-type': 'application/json', cookie: ck }, ...init });
+  const bad = await call('/api/admin/rooms', { method: 'POST', body: '{nope' });
+  assert.strictEqual(bad.status, 400);
+  assert.deepStrictEqual(await bad.json(), { error: 'Invalid JSON' });
+  const big = await call('/api/admin/rooms', { method: 'POST', body: JSON.stringify({ name: 'x'.repeat(40000) }) }).then((r) => r.status, () => 400);
+  assert.strictEqual(big, 400);
+  const cookieRes = await fetch(s.base + '/api/admin/rooms', { headers: { cookie: 'te_admin=%E0%A4%A' } });
+  assert.strictEqual(cookieRes.status, 400);
+  // Domain errors keep their message
+  const dupe = await call('/api/admin/rooms', { method: 'POST', body: JSON.stringify({ name: 'admin' }) });
+  assert.strictEqual(dupe.status, 400);
+
+  // Make writing rooms.json fail: a directory is in the way of the temp file.
+  fs.mkdirSync(path.join(s.dir, 'rooms.json.tmp'));
+  const res = await call('/api/admin/rooms', { method: 'POST', body: JSON.stringify({ name: 'wontsave' }) });
+  assert.strictEqual(res.status, 500);
+  const body = await res.json();
+  assert.deepStrictEqual(Object.keys(body), ['error']);
+  assert.doesNotMatch(JSON.stringify(body), /rooms\.json|EISDIR|\//, 'no path or errno in the answer');
+  await new Promise((r) => setTimeout(r, 100));
+  assert.match(s.out.log, /request failed:.*EISDIR/s, 'logged on the server');
+  s.stop();
+});
+
+// ---- WebSocket hardening ------------------------------------------------------------------------------------------
+test('WebSocket upgrades from foreign origins are refused', async () => {
+  const s = await spawnServer({ ALLOWED_ORIGINS: 'https://calls.example.com/, https://other.example.org' });
+  const host = new URL(s.base).host;
+  const open = (origin) => wsAt(s.base, origin === undefined ? {} : { Origin: origin }).then((ws) => { ws.close(); return true; }, (err) => err.message);
+  assert.strictEqual(await open(undefined), true, 'no Origin (non-browser client)');
+  assert.strictEqual(await open(`http://${host}`), true, 'same host');
+  assert.strictEqual(await open(`http://${host.toUpperCase()}`), true, 'host is case-insensitive');
+  assert.strictEqual(await open('https://calls.example.com'), true, 'ALLOWED_ORIGINS');
+  assert.strictEqual(await open('https://other.example.org'), true);
+  assert.match(await open('https://evil.example.net'), /403/);
+  assert.match(await open(`http://${host}.evil.net`), /403/, 'a host that merely starts the same');
+  assert.match(await open('null'), /403/);
+  assert.match(await open('not a url'), /403/);
+  s.stop();
+});
+
+test('a socket that floods the server is closed with a policy code', async () => {
+  const s = await spawnServer({});
+  // A normal burst (ICE candidates, clock pings) is fine.
+  const calm = await wsAt(s.base);
+  for (let i = 0; i < 150; i++) calm.sendJson({ type: 'time', c: i });
+  for (let i = 0; i < 150; i++) assert.strictEqual((await calm.next()).c, i);
+  // A flood is not.
+  const flood = await wsAt(s.base);
+  const closed = new Promise((resolve) => flood.on('close', (code) => resolve(code)));
+  for (let i = 0; i < 500; i++) flood.sendJson({ type: 'time', c: i });
+  assert.strictEqual(await closed, 1008);
+  // It refills: the calm client can still talk after a pause.
+  await new Promise((r) => setTimeout(r, 300));
+  calm.sendJson({ type: 'time', c: 'again' });
+  assert.strictEqual((await calm.next()).c, 'again');
+  calm.close();
+  s.stop();
+});
+
+// ---- Drive cache setting ---------------------------------------------------------------------------------------------
+test('DRIVE_CACHE_MB below the minimum is raised, with a warning', async () => {
+  const env = (mb) => ({ GOOGLE_SERVICE_ACCOUNT: google.writeAccount(keyDir), GOOGLE_API_BASE: google.url, DRIVE_CACHE_MB: mb });
+  const low = await spawnServer(env('0'));
+  assert.match(low.out.log, /DRIVE_CACHE_MB=0 is too small: using the minimum of 32 MB/);
+  low.stop();
+  const ok = await spawnServer(env('64'));
+  assert.doesNotMatch(ok.out.log, /too small/);
+  ok.stop();
 });

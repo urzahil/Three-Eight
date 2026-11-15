@@ -104,7 +104,9 @@ server {
 }
 ```
 
-With `TRUST_PROXY=true` (the compose default), the server takes the client IP from `X-Forwarded-For`, which is used for login rate limiting. It also marks the admin cookie `Secure`. If you publish port 4567 directly to the internet without a proxy, set `TRUST_PROXY=false`, or bind the port to localhost only (`"127.0.0.1:4567:4567"`).
+With `TRUST_PROXY=true` (the compose default), the server takes the client IP from `X-Forwarded-For`, which is used for login rate limiting. It also marks the admin cookie `Secure` and sends `Strict-Transport-Security`. `true` (or `1`, `yes`) means one trusted proxy: the server uses the last entry of `X-Forwarded-For`, the one your proxy appended, and ignores anything the client put before it. If there are several proxies in a row (say a CDN in front of nginx), set `TRUST_PROXY` to their number, e.g. `TRUST_PROXY=2`: the client address is then the second entry from the right. Setting it higher than the real number of proxies lets clients spoof their address.
+
+Browsers must open the WebSocket from the same host as the page. If the address people use differs from the `Host` header your proxy passes on, list it in `ALLOWED_ORIGINS` (e.g. `https://calls.example.com`). If you publish port 4567 directly to the internet without a proxy, set `TRUST_PROXY=false`, or bind the port to localhost only (`"127.0.0.1:4567:4567"`).
 
 **Works on Wi-Fi but not on mobile data?** If the lobby says *Can’t reach the server, retrying…* and then *Could not connect to the server*, the page loaded but the WebSocket (`/ws`) did not get through. Mobile networks (4G/5G) usually connect over IPv6. If your domain has an `AAAA` record, the proxy must forward WebSockets on its IPv6 listener too. Test with `curl -6 -i -N -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' https://three-eight.example.com/ws`, which should answer `101 Switching Protocols`. If you get into the room but a friend's tile stays on *connecting…* / *connection failed*, the problem is the carrier's NAT instead; see [Do I need TURN?](#do-i-need-turn).
 
@@ -211,14 +213,15 @@ Notes:
 | `PORT` | `4567` | HTTP port |
 | `ADMIN_PASSWORD` | random, printed at start | Password for `/admin` |
 | `DATA_DIR` | `./data` (`/data` in Docker) | Where `rooms.json` is stored |
-| `TRUST_PROXY` | `false` (`true` in compose) | Trust `X-Forwarded-For` / `X-Forwarded-Proto` |
+| `TRUST_PROXY` | `false` (`true` in compose) | Trust `X-Forwarded-For` / `X-Forwarded-Proto`: `true`/`1`/`yes` for one proxy, a number for that many proxies in a row |
+| `ALLOWED_ORIGINS` | — | Comma-separated extra origins allowed to open the WebSocket (the page's own host is always allowed) |
 | `MAX_ROOM_SIZE` | `12` | Max participants per room |
 | `STUN_URLS` | Google + Cloudflare STUN | Comma-separated STUN URLs |
 | `TURN_URLS` | — | Comma-separated TURN URLs (optional) |
 | `TURN_SECRET` | — | coturn `static-auth-secret` (ephemeral credentials) |
 | `TURN_USERNAME` / `TURN_PASSWORD` | — | Static TURN credentials (alternative to the secret) |
 | `GOOGLE_SERVICE_ACCOUNT` | — | Path to a Google service account JSON key, for room Drive folders (optional, see above) |
-| `DRIVE_CACHE_MB` | `256` | Memory for the movie cache while streaming from Drive |
+| `DRIVE_CACHE_MB` | `256` | Memory for the movie cache while streaming from Drive (minimum `32`; lower values are raised) |
 | `TLS_CERT` / `TLS_KEY` | — | Serve HTTPS directly instead of using a proxy |
 
 ### Do I need TURN?

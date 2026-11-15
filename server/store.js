@@ -62,17 +62,36 @@ function parseDriveFolder(input) {
   return { folderId };
 }
 
+// Errors the admin can act on (bad name, no such room): safe to show. Anything else is an internal failure.
+class RoomError extends Error {}
+
 class RoomStore {
   constructor(dataDir) {
     this.file = path.join(dataDir, 'rooms.json');
     fs.mkdirSync(dataDir, { recursive: true });
+    // No prototype: lookups like get('constructor') or get('__proto__') must not find inherited properties.
     /** @type {Record<string, {passwordHash: string, createdAt: number, updatedAt: number}>} */
-    this.rooms = {};
+    this.rooms = Object.create(null);
+    let text = null;
     try {
-      const parsed = JSON.parse(fs.readFileSync(this.file, 'utf8'));
-      if (parsed && typeof parsed.rooms === 'object') this.rooms = parsed.rooms;
+      text = fs.readFileSync(this.file, 'utf8');
     } catch (err) {
-      if (err.code !== 'ENOENT') console.error('Could not read rooms file:', err.message);
+      // A missing file is normal (first start). Anything else (e.g. EACCES) must not lead to the file being overwritten.
+      if (err.code !== 'ENOENT') throw new Error(`Cannot read ${this.file}: ${err.message}. Fix the file's permissions or move it away, then start again.`);
+    }
+    if (text !== null) {
+      let parsed = null;
+      try {
+        parsed = JSON.parse(text);
+      } catch { /* handled below */ }
+      if (parsed && typeof parsed.rooms === 'object' && parsed.rooms !== null && !Array.isArray(parsed.rooms)) {
+        for (const [key, room] of Object.entries(parsed.rooms)) if (room && typeof room === 'object') this.rooms[key] = room;
+      } else {
+        // Keep the unreadable file for the operator instead of overwriting it with the next save.
+        const aside = `${this.file}.corrupt-${Date.now()}`;
+        fs.renameSync(this.file, aside);
+        console.error(`${this.file} could not be parsed. It was moved to ${aside} and the server starts with no rooms.`);
+      }
     }
   }
 
@@ -103,8 +122,8 @@ class RoomStore {
   }
 
   async create(name, password) {
-    if (!RoomStore.validName(name)) throw new Error('Room names may contain letters, digits, "-" and "_" (max 64), and cannot be a reserved word.');
-    if (this.get(name)) throw new Error('A room with that name already exists.');
+    if (!RoomStore.validName(name)) throw new RoomError('Room names may contain letters, digits, "-" and "_" (max 64), and cannot be a reserved word.');
+    if (this.get(name)) throw new RoomError('A room with that name already exists.');
     const now = Date.now();
     this.rooms[RoomStore.key(name)] = {
       name,
@@ -117,7 +136,7 @@ class RoomStore {
 
   async setPassword(name, password) {
     const r = this.get(name);
-    if (!r) throw new Error('No such room.');
+    if (!r) throw new RoomError('No such room.');
     r.passwordHash = password ? await hashPassword(password) : '';
     r.updatedAt = Date.now();
     this._save();
@@ -125,7 +144,7 @@ class RoomStore {
 
   setDrive(name, drive) {
     const r = this.get(name);
-    if (!r) throw new Error('No such room.');
+    if (!r) throw new RoomError('No such room.');
     if (drive) r.drive = { folderId: drive.folderId };
     else delete r.drive;
     r.updatedAt = Date.now();
@@ -133,7 +152,7 @@ class RoomStore {
   }
 
   delete(name) {
-    if (!this.get(name)) throw new Error('No such room.');
+    if (!this.get(name)) throw new RoomError('No such room.');
     delete this.rooms[RoomStore.key(name)];
     this._save();
   }
@@ -146,4 +165,4 @@ class RoomStore {
   }
 }
 
-module.exports = { RoomStore, parseDriveFolder, hashPassword, verifyPassword };
+module.exports = { RoomStore, RoomError, parseDriveFolder, hashPassword, verifyPassword };

@@ -20,8 +20,9 @@ const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const zlib = require('zlib');
 const { WebSocketServer } = require('ws');
-const { RoomStore, parseDriveFolder } = require('./store');
+const { RoomStore, RoomError, parseDriveFolder } = require('./store');
 const { GoogleDrive, DriveError, ID_RE: DRIVE_ID_RE, FOLDER, kindOf, loadServiceAccount, parseRange, MiB } = require('./drive');
 
 const PORT = parseInt(process.env.PORT || '4567', 10);
@@ -29,8 +30,19 @@ const HOST = process.env.HOST || '0.0.0.0';
 const PUBLIC_DIR = path.resolve(__dirname, '..', 'public');
 const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(__dirname, '..', 'data'));
 const MAX_ROOM_SIZE = parseInt(process.env.MAX_ROOM_SIZE || '12', 10);
-const TRUST_PROXY = /^(1|true|yes)$/i.test(process.env.TRUST_PROXY || '');
+// Number of trusted reverse proxies in front of the server (0 = none, use the socket's address).
+// TRUST_PROXY=true/1/yes means one hop; a larger number (e.g. 2 for CDN + proxy) means that many.
+const TRUSTED_HOPS = (() => {
+  const v = (process.env.TRUST_PROXY || '').trim();
+  if (/^(true|yes)$/i.test(v)) return 1;
+  return /^\d{1,2}$/.test(v) ? parseInt(v, 10) : 0;
+})();
+// Origins (besides the request's own host) that may open a WebSocket, e.g. "https://calls.example.com".
+const ALLOWED_ORIGINS = new Set((process.env.ALLOWED_ORIGINS || '').split(',').map((o) => o.trim().toLowerCase().replace(/\/+$/, '')).filter(Boolean));
 const MAX_MESSAGE_BYTES = 64 * 1024;
+// Per-socket message budget (token bucket): room for ICE candidate bursts and clock-sync pings.
+const MSG_BURST = 200;
+const MSG_REFILL_PER_SEC = 50;
 const ADMIN_SESSION_MS = 12 * 3600 * 1000;
 
 let ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
@@ -39,24 +51,38 @@ if (!ADMIN_PASSWORD) {
   console.warn(`ADMIN_PASSWORD is not set. Generated a temporary admin password for this run: ${ADMIN_PASSWORD}`);
 }
 
-const store = new RoomStore(DATA_DIR);
+let store;
+try {
+  store = new RoomStore(DATA_DIR);
+} catch (err) {
+  // E.g. rooms.json exists but cannot be read: stop rather than risk overwriting it.
+  console.error(err.message);
+  process.exit(1);
+}
 
 // ---- Google Drive (service account) ----------------------------------------
 // GOOGLE_SERVICE_ACCOUNT: path to the service account's JSON key. If it is set but unusable,
 // the server runs with Drive disabled (and says why, without printing anything secret).
 /** @type {GoogleDrive|null} */
 let driveApi = null;
+const MIN_DRIVE_CACHE_MB = 32;
 {
   const keyFile = (process.env.GOOGLE_SERVICE_ACCOUNT || '').trim();
   if (keyFile) {
     try {
       const account = loadServiceAccount(keyFile);
       const mbSetting = (process.env.DRIVE_CACHE_MB || '').trim();
-      const mb = mbSetting === '' ? 256 : Number(mbSetting);
+      let mb = mbSetting === '' ? 256 : Number(mbSetting);
+      if (!Number.isFinite(mb) || mb < 0) mb = 256;
+      // The reader assumes blocks it just fetched stay cached for a moment: a tiny cache makes it refetch the same bytes.
+      if (mb < MIN_DRIVE_CACHE_MB) {
+        console.warn(`DRIVE_CACHE_MB=${mbSetting} is too small: using the minimum of ${MIN_DRIVE_CACHE_MB} MB.`);
+        mb = MIN_DRIVE_CACHE_MB;
+      }
       driveApi = new GoogleDrive({
         account,
         apiBase: (process.env.GOOGLE_API_BASE || 'https://www.googleapis.com').trim(),
-        cacheBytes: (Number.isFinite(mb) && mb >= 0 ? mb : 256) * MiB,
+        cacheBytes: mb * MiB,
       });
       console.log(`Google Drive enabled (service account ${account.email})`);
     } catch (err) {
@@ -153,20 +179,132 @@ const SECURITY_HEADERS = {
   'Permissions-Policy': 'camera=(self), microphone=(self), fullscreen=(self), display-capture=(self)',
 };
 
+// Content-Security-Policy for the HTML pages. They load only same-origin ES modules and stylesheets.
+//  - style-src needs 'unsafe-inline': index.html has an inline style="" attribute (on the SVG sprite).
+//    (element.style.x = ... from scripts is not affected by CSP.)
+//  - media-src blob: and img-src blob:/data: are for MediaSource / object URLs of local movie files and subtitles.
+//  - worker-src blob: is for the Picture-in-Picture worker, which is created from a Blob.
+//  - connect-src lists the WebSocket explicitly (older Safari does not match ws: to 'self').
+function contentSecurityPolicy(req) {
+  const host = String(req.headers.host || '');
+  const ws = /^[A-Za-z0-9.:\[\]-]{1,255}$/.test(host) ? ` ws://${host} wss://${host}` : '';
+  return [
+    "default-src 'self'",
+    "script-src 'self'",
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' data: blob:",
+    "media-src 'self' blob:",
+    `connect-src 'self'${ws}`,
+    "worker-src 'self' blob:",
+    "font-src 'self'",
+    "manifest-src 'self'",
+    "object-src 'none'",
+    "base-uri 'self'",
+    "form-action 'self'",
+    "frame-ancestors 'none'",
+  ].join('; ');
+}
+
+const COMPRESSIBLE = new Set(['.html', '.js', '.css', '.json', '.svg', '.webmanifest']);
+const MIN_COMPRESS_BYTES = 256;
+const ENCODE_CACHE_BYTES = 32 * 1024 * 1024;
+/** `${file}\0${size}\0${mtimeMs}\0${encoding}` -> compressed Buffer (insertion order = age) */
+const encodeCache = new Map();
+let encodeCacheBytes = 0;
+
+/** The best encoding the client accepts and we can produce: 'br', 'gzip' or ''. */
+function pickEncoding(req) {
+  const accepted = new Map();
+  for (const part of String(req.headers['accept-encoding'] || '').split(',')) {
+    const [name, ...params] = part.trim().toLowerCase().split(';');
+    if (!name) continue;
+    const q = params.map((x) => /^\s*q=([\d.]+)\s*$/.exec(x)).find(Boolean);
+    accepted.set(name, q ? parseFloat(q[1]) : 1);
+  }
+  const ok = (n) => (accepted.has(n) ? accepted.get(n) : accepted.get('*') ?? 0) > 0;
+  if (ok('br')) return 'br';
+  if (ok('gzip')) return 'gzip';
+  return '';
+}
+
+function encodeFile(file, st, encoding) {
+  const key = `${file}\0${st.size}\0${st.mtimeMs}\0${encoding}`;
+  const hit = encodeCache.get(key);
+  if (hit) return Promise.resolve(hit);
+  return fs.promises.readFile(file).then((raw) => new Promise((resolve, reject) => {
+    const done = (err, out) => {
+      if (err) return reject(err);
+      encodeCache.set(key, out);
+      encodeCacheBytes += out.length;
+      while (encodeCacheBytes > ENCODE_CACHE_BYTES && encodeCache.size > 1) {
+        const [oldKey, old] = encodeCache.entries().next().value;
+        encodeCache.delete(oldKey);
+        encodeCacheBytes -= old.length;
+      }
+      resolve(out);
+    };
+    if (encoding === 'br') zlib.brotliCompress(raw, { params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 7, [zlib.constants.BROTLI_PARAM_SIZE_HINT]: raw.length } }, done);
+    else zlib.gzip(raw, { level: 9 }, done);
+  }));
+}
+
+/** Does an If-None-Match header match this ETag (weak comparison, "*" matches anything)? */
+function etagMatches(header, etag) {
+  if (!header) return false;
+  if (header.trim() === '*') return true;
+  const bare = (t) => t.trim().replace(/^W\//, '');
+  return header.split(',').some((t) => bare(t) === etag);
+}
+
 function sendFile(req, res, file) {
   fs.stat(file, (err, st) => {
     if (err || !st.isFile()) {
       sendJson(res, 404, { error: 'Not found' });
       return;
     }
-    res.writeHead(200, {
+    const ext = path.extname(file);
+    const compressible = COMPRESSIBLE.has(ext);
+    const encoding = compressible && st.size >= MIN_COMPRESS_BYTES ? pickEncoding(req) : '';
+    // The validator differs per representation (a strong ETag must not be shared by gzip and identity bodies).
+    const etag = `"${st.size.toString(16)}-${Math.floor(st.mtimeMs).toString(16)}${encoding ? '-' + encoding : ''}"`;
+    const headers = {
       ...SECURITY_HEADERS,
-      'Content-Type': MIME[path.extname(file)] || 'application/octet-stream',
-      'Content-Length': st.size,
-      'Cache-Control': 'no-cache',
-    });
-    if (req.method === 'HEAD') res.end();
-    else fs.createReadStream(file).pipe(res);
+      'Content-Type': MIME[ext] || 'application/octet-stream',
+      'Cache-Control': 'no-cache', // cacheable, but always revalidated (the validators below make that cheap)
+      ETag: etag,
+      'Last-Modified': new Date(Math.floor(st.mtimeMs / 1000) * 1000).toUTCString(),
+    };
+    if (ext === '.html') headers['Content-Security-Policy'] = contentSecurityPolicy(req);
+    if (compressible) headers.Vary = 'Accept-Encoding';
+
+    const inm = req.headers['if-none-match'];
+    const ims = Date.parse(req.headers['if-modified-since'] || '');
+    if (inm ? etagMatches(inm, etag) : Number.isFinite(ims) && Math.floor(st.mtimeMs / 1000) * 1000 <= ims) {
+      res.writeHead(304, headers);
+      res.end();
+      return;
+    }
+
+    const fail = (e) => {
+      if (res.headersSent) return res.destroy();
+      if (e && e.code !== 'ENOENT') console.error('static file failed:', e.message);
+      sendJson(res, e && e.code === 'ENOENT' ? 404 : 500, { error: e && e.code === 'ENOENT' ? 'Not found' : 'Something went wrong on the server.' });
+    };
+    if (encoding) {
+      encodeFile(file, st, encoding).then((body) => {
+        res.writeHead(200, { ...headers, 'Content-Encoding': encoding, 'Content-Length': body.length });
+        res.end(req.method === 'HEAD' ? undefined : body);
+      }, fail);
+      return;
+    }
+    res.writeHead(200, { ...headers, 'Content-Length': st.size });
+    if (req.method === 'HEAD') {
+      res.end();
+      return;
+    }
+    const stream = fs.createReadStream(file);
+    stream.on('error', fail);
+    stream.pipe(res);
   });
 }
 
@@ -181,17 +319,35 @@ function sendJson(res, status, obj, extraHeaders = {}) {
   res.end(body);
 }
 
+/**
+ * The value a trusted proxy appended to a comma-separated forwarding header. Each trusted proxy appends the
+ * address it saw, so the client's own entry is the TRUSTED_HOPS-th from the right; anything to its left was
+ * supplied by the client and must not be believed. With fewer entries than hops, the first one is used.
+ */
+function forwardedValue(req, header) {
+  const raw = req.headers[header];
+  if (!raw) return '';
+  const parts = String(raw).split(',').map((x) => x.trim()).filter(Boolean);
+  if (!parts.length) return '';
+  return parts[Math.max(0, parts.length - TRUSTED_HOPS)];
+}
+
 function clientIp(req) {
-  if (TRUST_PROXY) {
-    const fwd = req.headers['x-forwarded-for'];
-    if (fwd) return String(fwd).split(',')[0].trim();
+  if (TRUSTED_HOPS > 0) {
+    const fwd = forwardedValue(req, 'x-forwarded-for');
+    if (fwd) return fwd;
   }
   return req.socket.remoteAddress || '';
 }
 
 function isHttps(req) {
   if (req.socket.encrypted) return true;
-  return TRUST_PROXY && String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim() === 'https';
+  return TRUSTED_HOPS > 0 && forwardedValue(req, 'x-forwarded-proto') === 'https';
+}
+
+// Errors caused by bad client input: answered with 400 and their message. Everything else is a 500.
+function clientError(message) {
+  return Object.assign(new Error(message), { clientError: true });
 }
 
 function readJson(req, limit = 16 * 1024) {
@@ -201,7 +357,7 @@ function readJson(req, limit = 16 * 1024) {
     req.on('data', (c) => {
       size += c.length;
       if (size > limit) {
-        reject(new Error('Body too large'));
+        reject(clientError('Body too large'));
         req.destroy();
         return;
       }
@@ -211,18 +367,23 @@ function readJson(req, limit = 16 * 1024) {
       try {
         resolve(chunks.length ? JSON.parse(Buffer.concat(chunks).toString('utf8')) : {});
       } catch {
-        reject(new Error('Invalid JSON'));
+        reject(clientError('Invalid JSON'));
       }
     });
-    req.on('error', reject);
+    req.on('error', (err) => reject(Object.assign(err, { clientError: true }))); // e.g. the client went away
   });
 }
 
 function parseCookies(req) {
-  const out = {};
+  const out = Object.create(null);
   for (const part of String(req.headers.cookie || '').split(';')) {
     const i = part.indexOf('=');
-    if (i > 0) out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim());
+    if (i <= 0) continue;
+    try {
+      out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim());
+    } catch {
+      throw clientError('Malformed cookie');
+    }
   }
   return out;
 }
@@ -242,6 +403,18 @@ class FailLimiter {
       return false;
     }
     return e.count >= this.max;
+  }
+  /** Count an attempt before its outcome is known. False (and not counted) when the limit is already reached. */
+  reserve(key) {
+    if (this.blocked(key)) return false;
+    this.fail(key);
+    return true;
+  }
+  /** Give back a reserved attempt that turned out fine. */
+  release(key) {
+    const e = this.map.get(key);
+    if (!e) return;
+    if (--e.count <= 0) this.map.delete(key);
   }
   fail(key) {
     const now = Date.now();
@@ -491,6 +664,7 @@ async function handleApi(req, res, url) {
       try {
         await store.create(String(body.name || '').trim(), String(body.password || ''));
       } catch (err) {
+        if (!(err instanceof RoomError)) throw err;
         return sendJson(res, 400, { error: err.message });
       }
       return sendJson(res, 201, { ok: true });
@@ -506,6 +680,7 @@ async function handleApi(req, res, url) {
       try {
         store.setDrive(name, drive);
       } catch (err) {
+        if (!(err instanceof RoomError)) throw err;
         return sendJson(res, 404, { error: err.message });
       }
       pushDrive(name);
@@ -518,6 +693,7 @@ async function handleApi(req, res, url) {
       try {
         await store.setPassword(name, String(body.password || ''));
       } catch (err) {
+        if (!(err instanceof RoomError)) throw err;
         return sendJson(res, 400, { error: err.message });
       }
       if (body.kick) kickRoom(name, 'kicked', 'The room password was changed. Please rejoin.');
@@ -528,6 +704,7 @@ async function handleApi(req, res, url) {
       try {
         store.delete(name);
       } catch (err) {
+        if (!(err instanceof RoomError)) throw err;
         return sendJson(res, 404, { error: err.message });
       }
       kickRoom(name, 'room-deleted', 'This room has been deleted.');
@@ -538,6 +715,7 @@ async function handleApi(req, res, url) {
 }
 
 function handleHttp(req, res) {
+  if (isHttps(req)) res.setHeader('Strict-Transport-Security', 'max-age=31536000');
   let url;
   try {
     url = new URL(req.url, 'http://localhost');
@@ -549,7 +727,11 @@ function handleHttp(req, res) {
 
   if (url.pathname.startsWith('/api/')) {
     handleApi(req, res, url).catch((err) => {
-      if (!res.headersSent) sendJson(res, 400, { error: err.message || 'Bad request' });
+      if (res.headersSent) return res.destroy();
+      if (err && err.clientError) return sendJson(res, 400, { error: err.message || 'Bad request' });
+      // Internal failure: log it here, but do not tell the client (messages can contain file paths).
+      console.error('request failed:', req.method, url.pathname, err);
+      sendJson(res, 500, { error: 'Something went wrong on the server.' });
     });
     return;
   }
@@ -645,13 +827,20 @@ async function handleJoin(ws, msg) {
     send(ws, { type: 'error', code: 'bad-request', message: 'Invalid participant id' });
     return;
   }
-  if (roomLimiter.blocked(ws.ip)) {
+  // Count the attempt before the (slow) password check, so a burst cannot get past the limit while earlier
+  // attempts are still being evaluated. A correct password gives the attempt back. Open rooms cost nothing.
+  const reserved = !!r.passwordHash;
+  if (reserved && !roomLimiter.reserve(ws.ip)) {
     send(ws, { type: 'error', code: 'rate-limited', message: 'Too many wrong passwords. Try again in a few minutes.' });
     return;
   }
-  const ok = await store.check(roomName, msg.password);
+  let ok = false;
+  try {
+    ok = await store.check(roomName, msg.password);
+  } finally {
+    if (reserved && ok) roomLimiter.release(ws.ip);
+  }
   if (!ok) {
-    roomLimiter.fail(ws.ip);
     send(ws, { type: 'error', code: 'bad-password', message: 'Wrong room password.' });
     return;
   }
@@ -679,7 +868,8 @@ async function handleJoin(ws, msg) {
   const name = cleanName(msg.name);
   const peers = [...members.entries()].filter(([pid]) => pid !== msg.id).map(([pid, m]) => ({ id: pid, name: m.name }));
   members.set(msg.id, { ws, name });
-  const welcome = { type: 'welcome', id: msg.id, room: r.name, peers };
+  // resumed: this join took over the live entry of the same participant (a reconnect).
+  const welcome = { type: 'welcome', id: msg.id, room: r.name, peers, resumed: !!existing };
   const drive = driveInfo(r);
   if (drive) welcome.drive = drive;
   send(ws, welcome);
@@ -688,14 +878,42 @@ async function handleJoin(ws, msg) {
   }
 }
 
-const wss = new WebSocketServer({ server, path: '/ws', maxPayload: MAX_MESSAGE_BYTES });
+// Browsers always send Origin on WebSocket handshakes: refuse pages from other sites (cross-site WebSocket
+// hijacking). A missing Origin (non-browser clients) is allowed.
+function originAllowed(req) {
+  const origin = req.headers.origin;
+  if (origin === undefined) return true;
+  const o = String(origin).toLowerCase().replace(/\/+$/, '');
+  if (ALLOWED_ORIGINS.has(o)) return true;
+  try {
+    return new URL(o).host === String(req.headers.host || '').toLowerCase();
+  } catch {
+    return false;
+  }
+}
+
+const wss = new WebSocketServer({
+  server,
+  path: '/ws',
+  maxPayload: MAX_MESSAGE_BYTES,
+  verifyClient: ({ req }, done) => (originAllowed(req) ? done(true) : done(false, 403, 'Forbidden origin')),
+});
 
 wss.on('connection', (ws, req) => {
   ws.isAlive = true;
   ws.ip = clientIp(req);
   ws.on('pong', () => { ws.isAlive = true; });
+  let tokens = MSG_BURST;
+  let refilled = Date.now();
 
   ws.on('message', (raw, isBinary) => {
+    const now = Date.now();
+    tokens = Math.min(MSG_BURST, tokens + ((now - refilled) / 1000) * MSG_REFILL_PER_SEC);
+    refilled = now;
+    if (--tokens < 0) {
+      ws.close(1008, 'rate-limited');
+      return;
+    }
     if (isBinary) return;
     let msg;
     try {
@@ -712,11 +930,17 @@ wss.on('connection', (ws, req) => {
         break;
 
       case 'join':
+        // One join at a time per socket: otherwise a burst of password guesses is evaluated in parallel.
+        if (ws.joining) {
+          send(ws, { type: 'error', code: 'busy', message: 'A join is already in progress.' });
+          break;
+        }
+        ws.joining = true;
         handleJoin(ws, msg).catch((err) => {
           // Always answer: a client waiting for its welcome would otherwise wait forever.
           console.error('join failed', err);
           send(ws, { type: 'error', code: 'server-error', message: 'The server could not add you to the room. Please try again.' });
-        });
+        }).finally(() => { ws.joining = false; });
         break;
 
       case 'signal': {
