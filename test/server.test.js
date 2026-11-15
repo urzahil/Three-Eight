@@ -12,13 +12,26 @@ const http = require('node:http');
 const { RoomStore, parseDriveFolder } = require('../server/store');
 const { startFakeGoogle } = require('./fake-google');
 
-const PORT = 45000 + Math.floor(Math.random() * 1000);
-const BASE = `http://127.0.0.1:${PORT}`;
+// Ports come from the OS (see freePort): a guessed number can already be taken, e.g. by an outgoing connection.
+let PORT = 0;
+let BASE = '';
 let proc, dataDir, cookie = '', google, keyDir;
 const extraProcs = [];
 
+/** A port nobody is listening on right now. */
+function freePort() {
+  return new Promise((resolve, reject) => {
+    const srv = http.createServer();
+    srv.once('error', reject);
+    srv.listen(0, '127.0.0.1', () => {
+      const { port } = srv.address();
+      srv.close(() => resolve(port));
+    });
+  });
+}
+
 async function waitUp(base) {
-  for (let i = 0; i < 50; i++) {
+  for (let i = 0; i < 150; i++) { // up to 15 s: a loaded CI machine starts slowly
     try {
       if ((await fetch(base + '/healthz')).ok) return;
     } catch { /* not up yet */ }
@@ -29,7 +42,7 @@ async function waitUp(base) {
 
 /** Another server instance (own data dir), e.g. without a service account. Returns { base, log, stop }. */
 async function spawnServer(env) {
-  const port = PORT + 1000 + Math.floor(Math.random() * 1000);
+  const port = await freePort();
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'three-eight-x-'));
   const child = spawn(process.execPath, [path.join(__dirname, '..', 'server', 'server.js')], {
     env: { ...process.env, PORT: String(port), HOST: '127.0.0.1', ADMIN_PASSWORD: 'admin-pw', DATA_DIR: dir, GOOGLE_SERVICE_ACCOUNT: '', ...env },
@@ -49,6 +62,8 @@ before(async () => {
   dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'three-eight-'));
   keyDir = fs.mkdtempSync(path.join(os.tmpdir(), 'three-eight-key-'));
   google = await startFakeGoogle();
+  PORT = await freePort();
+  BASE = `http://127.0.0.1:${PORT}`;
   proc = spawn(process.execPath, [path.join(__dirname, '..', 'server', 'server.js')], {
     env: {
       ...process.env, PORT: String(PORT), HOST: '127.0.0.1', ADMIN_PASSWORD: 'admin-pw', DATA_DIR: dataDir,
@@ -691,7 +706,7 @@ test('RoomStore: an unreadable rooms.json stops the server instead of risking an
     fs.mkdirSync(path.join(dir, 'rooms.json')); // reading it fails with EISDIR (like EACCES: not ENOENT)
     assert.throws(() => new RoomStore(dir), /Cannot read .*rooms\.json/);
     const child = spawn(process.execPath, [path.join(__dirname, '..', 'server', 'server.js')], {
-      env: { ...process.env, PORT: String(PORT + 2500), HOST: '127.0.0.1', ADMIN_PASSWORD: 'x', DATA_DIR: dir, GOOGLE_SERVICE_ACCOUNT: '' },
+      env: { ...process.env, PORT: String(await freePort()), HOST: '127.0.0.1', ADMIN_PASSWORD: 'x', DATA_DIR: dir, GOOGLE_SERVICE_ACCOUNT: '' },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let log = '';

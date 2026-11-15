@@ -35,6 +35,51 @@ function cleanMovie(movie) {
   return rest;
 }
 
+const MAX_SEQ = 1e9; // far beyond any real session; keeps `seq + 1` exact and a buggy peer from outrunning everyone
+const MAX_ID = 64; // participant ids are at most 64 characters
+const isNum = (n) => typeof n === 'number' && Number.isFinite(n);
+const short = (v, max) => String(v).slice(0, max);
+
+/**
+ * Validate and normalise a sync-state from a peer. Returns null when its core fields (seq, by, paused,
+ * pos, at) are unusable or the movie is malformed; the other fields are clamped to sane values.
+ */
+export function cleanState(s) {
+  if (!s || typeof s !== 'object') return null;
+  if (!Number.isSafeInteger(s.seq) || s.seq < 0 || s.seq > MAX_SEQ) return null;
+  if (typeof s.by !== 'string' || !s.by || s.by.length > MAX_ID) return null;
+  if (typeof s.paused !== 'boolean' || !isNum(s.pos) || s.pos < 0 || !isNum(s.at)) return null;
+  let movie = null;
+  if (s.movie != null) {
+    const m = s.movie;
+    if (typeof m !== 'object' || Array.isArray(m) || typeof m.name !== 'string') return null;
+    movie = cleanMovie({
+      name: short(m.name, 300),
+      size: isNum(m.size) && m.size >= 0 ? m.size : 0,
+      duration: isNum(m.duration) && m.duration >= 0 ? m.duration : 0,
+      ...(m.drive !== undefined && { drive: m.drive }),
+    });
+  }
+  const subFiles = [];
+  if (Array.isArray(s.subFiles)) {
+    for (const f of s.subFiles.slice(0, 50)) {
+      if (f && typeof f.id === 'string' && f.id && typeof f.name === 'string') subFiles.push({ id: short(f.id, 100), name: short(f.name, 120) });
+    }
+  }
+  return {
+    seq: s.seq,
+    by: s.by,
+    movie,
+    paused: s.paused,
+    pos: s.pos,
+    at: s.at,
+    rate: isNum(s.rate) ? Math.min(4, Math.max(0.25, s.rate)) : 1,
+    audio: Number.isSafeInteger(s.audio) ? Math.min(64, Math.max(0, s.audio)) : 0,
+    sub: typeof s.sub === 'string' && s.sub ? short(s.sub, 100) : null,
+    subFiles,
+  };
+}
+
 export function sameMovie(a, b) {
   if (!a || !b) return false;
   if (a.size && b.size && a.size === b.size) return true;
@@ -306,15 +351,14 @@ export class MovieSync extends EventTarget {
   _onMessage(peer, msg) {
     switch (msg.type) {
       case 'sync-state': {
-        const s = msg.state;
-        if (!s || typeof s.seq !== 'number' || typeof s.by !== 'string') return;
-        if (!newer(s, this.state)) return;
+        const s = cleanState(msg.state);
+        if (!s || !newer(s, this.state)) return;
         const prev = this.state;
-        this.state = { ...emptyState(), ...s, movie: cleanMovie(s.movie) ?? null, subFiles: Array.isArray(s.subFiles) ? s.subFiles.slice(0, 50) : [] };
+        this.state = s;
         if (!sameMovie(prev.movie, this.state.movie)) this.useAnyway = false;
         // Fetch any shared subtitle file we don't have yet.
         for (const f of this.state.subFiles) {
-          if (f && typeof f.id === 'string' && !this.subTexts.has(f.id)) peer.send({ type: 'sub-request', id: f.id });
+          if (!this.subTexts.has(f.id)) peer.send({ type: 'sub-request', id: f.id });
         }
         this._emit('remote-change', { peer, prev, state: this.state });
         this._apply(true);

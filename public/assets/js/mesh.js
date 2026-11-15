@@ -34,6 +34,7 @@ class Peer {
     this.chunks = new Map();
     this.pendingCandidates = [];
     this.open = false;
+    this.closed = false; // set by close()
 
     const pc = new RTCPeerConnection({ iceServers: mesh.iceServers, bundlePolicy: 'max-bundle' });
     this.pc = pc;
@@ -50,10 +51,13 @@ class Peer {
     this.dc.onopen = () => {
       this.open = true;
       this.mesh._applyBitrates();
+      this.mesh._attempts.delete(this.id); // the link works: forget earlier rebuild attempts
       this.mesh._emit('channel-open', { peer: this });
     };
     this.dc.onclose = () => {
       this.open = false;
+      // Closed by the other side (or the network), not by us: a negotiated channel never reopens.
+      if (!this.closed) this.mesh._channelClosed(this);
     };
     this.dc.onmessage = (ev) => this._onData(ev.data);
 
@@ -73,7 +77,8 @@ class Peer {
       this.filmOpen = false;
       this.filmQueue = [];
       this.filmQueued = 0;
-      if (was) this.mesh._emit('film-close', { peer: this });
+      // A peer we closed ourselves is reported by 'peer-removed'; a stale one must not disturb its replacement.
+      if (was && !this.closed) this.mesh._emit('film-close', { peer: this });
     };
     this.film.onbufferedamountlow = () => this._pumpFilm();
     this.film.onmessage = (ev) => {
@@ -282,6 +287,7 @@ class Peer {
   }
 
   close() {
+    this.closed = true;
     clearTimeout(this._restartTimer);
     clearTimeout(this._watchdog);
     try {
@@ -319,15 +325,51 @@ export class Mesh extends EventTarget {
       if (!data || typeof data !== 'object') return;
       let peer = this.peers.get(from);
       if (!peer) peer = this.addPeer(from, this.names.get(from) || '');
+      // A new offer for a link whose data channel is dead: the other side rebuilt its connection, and
+      // only a fresh RTCPeerConnection of ours can get the negotiated channels open again.
+      else if (data.description?.type === 'offer' && peer.dc.readyState === 'closed') peer = this.rebuildPeer(from);
       if (peer) peer.handleSignal(data);
     });
+    // Our own connection to the server was lost and is back. The server may have told the others that we
+    // left (they then closed their side of our links) or not (it restarted, or it was a short blip).
+    // Which one it was is visible in the links themselves, so judge each peer by its link state.
     signaling.addEventListener('reconnected', (e) => {
       const ids = new Set(e.detail.peers.map((p) => p.id));
-      for (const p of e.detail.peers) if (!this.peers.has(p.id)) this.addPeer(p.id, p.name);
+      for (const p of e.detail.peers) {
+        const have = this.peers.get(p.id);
+        if (!have) this.addPeer(p.id, p.name);
+        else if (!this._linkHealthy(have)) this.rebuildPeer(p.id, p.name); // we initiate, as a newcomer does
+      }
       for (const [id, peer] of this.peers) {
         if (!ids.has(id) && peer.pc.connectionState !== 'connected') this.removePeer(id);
       }
     });
+    this._attempts = new Map(); // peerId -> rebuilds since its data channel was last open
+  }
+
+  _linkHealthy(peer) {
+    const s = peer.pc.connectionState;
+    return peer.dc.readyState === 'open' && s !== 'closed' && s !== 'failed';
+  }
+
+  /**
+   * The data channel of a peer closed while we still consider the person a member: rebuild the connection.
+   * Only one side may start it, or both would offer at once and keep replacing each other's connections.
+   * The side with the lower id goes first (soon). The other side normally gets that offer and rebuilds when it
+   * arrives (see the 'signal' handler); it only acts on its own after a long wait, in case the other side
+   * does not know that the link is dead (e.g. it still holds a stale half-open channel).
+   */
+  _channelClosed(peer) {
+    const id = peer.id;
+    const n = this._attempts.get(id) || 0;
+    if (n >= 6) return; // keeps failing: leave it to the user (reload) instead of looping forever
+    const delay = (this.selfId < id ? 1000 : 8000) * 2 ** Math.min(n, 3);
+    setTimeout(() => {
+      if (this.peers.get(id) !== peer || peer.closed || peer.dc.readyState === 'open') return;
+      if (!this.signaling.joined) return; // 'reconnected' sorts the peers out once we are back
+      this._attempts.set(id, n + 1);
+      this.rebuildPeer(id);
+    }, delay);
   }
 
   _emit(type, detail) {
@@ -356,6 +398,23 @@ export class Mesh extends EventTarget {
     this.peers.delete(id);
     this._emit('peer-removed', { peer });
     this._applyBitrates();
+  }
+
+  /**
+   * Replace the connection to a member with a fresh one (same person). 'peer-removed' / 'peer-added' carry
+   * `rebuilding` / `rebuilt`, so listeners reset what they know about the link but keep what they know about
+   * the person (tile, profile) and don't announce a leave and a join.
+   */
+  rebuildPeer(id, name) {
+    const old = this.peers.get(id);
+    if (!old) return this.addPeer(id, name);
+    old.close();
+    const peer = new Peer(this, id, name || old.name);
+    this.peers.set(id, peer);
+    this._emit('peer-removed', { peer: old, rebuilding: true });
+    this._emit('peer-added', { peer, rebuilt: true });
+    this._applyBitrates();
+    return peer;
   }
 
   /** Set (or clear) the outgoing audio/video track for every peer. */

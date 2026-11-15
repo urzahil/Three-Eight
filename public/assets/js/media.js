@@ -65,6 +65,11 @@ export class LocalMedia extends EventTarget {
     } else {
       await this._acquire('audio');
     }
+    // The page may have been left while the permission prompt was open: don't keep the devices then.
+    if (this.stopped) {
+      this.stop();
+      return;
+    }
     if (this.audioTrack) this.audioTrack.enabled = this.micOn;
     this._watchEnded();
     this._emit('audio');
@@ -172,6 +177,7 @@ export class LocalMedia extends EventTarget {
   }
 
   stop() {
+    this.stopped = true;
     this.audioTrack?.stop();
     this.videoTrack?.stop();
     this.audioTrack = null;
