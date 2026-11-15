@@ -13,7 +13,8 @@ const FILM_LOW = 256 * 1024;
 const MAX_REBUILDS = 6;
 const MIN_REBUILD_MS = 1000;
 // The attempt counter decays: when the last rebuild of a peer is older than this, it starts from zero again.
-const REBUILD_DECAY_MS = 60 * 1000;
+// Longer than the longest backoff delay (8000 * 2**3 = 64 s on the higher-id side), or that side would reset before the cap.
+const REBUILD_DECAY_MS = 5 * 60 * 1000;
 // A local offer that is still unanswered after this long is considered lost (a normal answer takes a round trip).
 const OFFER_STALE_MS = 3000;
 

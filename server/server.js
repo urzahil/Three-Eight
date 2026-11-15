@@ -443,7 +443,7 @@ function parseCookies(req) {
 }
 
 // Simple sliding-window limiter for failed password attempts.
-// At most MAX_LIMITER_KEYS clients are remembered per limiter: when it is full, expired entries go first, then the oldest.
+// At most MAX_LIMITER_KEYS clients are remembered per limiter: when it is full, expired entries go first, then the oldest one that is not blocked (the oldest overall only if all are).
 const MAX_LIMITER_KEYS = 10000;
 class FailLimiter {
   constructor(max, windowMs, maxKeys = MAX_LIMITER_KEYS) {
@@ -482,7 +482,15 @@ class FailLimiter {
     }
     this.map.delete(key); // a new window: re-insert at the end, so the map stays ordered oldest first
     if (this.map.size >= this.maxKeys) this.sweep();
-    if (this.map.size >= this.maxKeys) this.map.delete(this.map.keys().next().value);
+    if (this.map.size >= this.maxKeys) {
+      // Still full: drop the oldest entry that is not blocked, so flooding with other keys cannot reset a blocked
+      // client's count. Only when every entry is blocked does the oldest one go.
+      let victim;
+      for (const [k, e] of this.map) {
+        if (e.count < this.max) { victim = k; break; }
+      }
+      this.map.delete(victim === undefined ? this.map.keys().next().value : victim);
+    }
     this.map.set(key, { first: now, count: 1 });
   }
   sweep() {
@@ -995,13 +1003,20 @@ async function handleJoin(ws, msg) {
   }
 }
 
-// Browsers always send Origin on WebSocket handshakes: refuse pages from other sites (cross-site WebSocket
-// hijacking). A missing Origin (non-browser clients) is allowed.
 // A Host header as hostname and port; null for anything that is not plainly "name", "name:port", "1.2.3.4:port"
 // or "[v6]:port" (no "@", "/", whitespace and the like: such a value is a trick, not a host).
 function parseHost(host) {
   const m = /^([a-z0-9.-]+|\[[0-9a-f:.]+\])(?::(\d{1,5}))?$/.exec(host);
   return m ? { hostname: m[1], port: m[2] || '' } : null;
+}
+
+// One log line per failing message, at most once per socket per 10 seconds: a client must not be able to flood the log.
+const BAD_MESSAGE_LOG_MS = 10 * 1000;
+function logBadMessage(ws, type, err) {
+  const now = Date.now();
+  if (ws.lastBadLog && now - ws.lastBadLog < BAD_MESSAGE_LOG_MS) return;
+  ws.lastBadLog = now;
+  console.error(`message failed${type ? ` (${String(type).slice(0, 32)})` : ''}: ${String(err && err.message).slice(0, 200)}`);
 }
 
 // Browsers always send Origin on WebSocket handshakes: refuse pages from other sites (cross-site WebSocket
@@ -1061,8 +1076,8 @@ wss.on('connection', (ws, req) => {
     }
     if (isBinary) return;
     // Nothing a client sends may take the process down: log it and carry on.
+    let msg;
     try {
-      let msg;
       try {
         msg = JSON.parse(raw.toString());
       } catch {
@@ -1085,7 +1100,7 @@ wss.on('connection', (ws, req) => {
           ws.joining = true;
           handleJoin(ws, msg).catch((err) => {
             // Always answer: a client waiting for its welcome would otherwise wait forever.
-            console.error('join failed', err);
+            logBadMessage(ws, 'join', err);
             if (!registered(ws)) ws.room = null;
             send(ws, { type: 'error', code: 'server-error', message: 'The server could not add you to the room. Please try again.' });
           }).finally(() => { ws.joining = false; });
@@ -1113,7 +1128,7 @@ wss.on('connection', (ws, req) => {
           break;
       }
     } catch (err) {
-      console.error('message failed', err);
+      logBadMessage(ws, typeof msg?.type === 'string' ? msg.type : undefined, err);
       if (!registered(ws)) ws.room = null;
     }
   });

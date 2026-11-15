@@ -74,13 +74,13 @@ test('MovieSync ignores an invalid state and a huge seq can not lock local commi
   sync.destroy();
 });
 
-function makeSync(now = 1700000000000) {
+function makeSync(now = 1700000000000, selfId = 'me-me-me-me') {
   const mesh = new EventTarget();
   const sent = [];
   mesh.broadcast = (m) => sent.push(m);
   const player = new EventTarget();
   player.loaded = false;
-  const sync = new MovieSync({ mesh, signaling: { now: () => now }, player, selfId: 'me-me-me-me' });
+  const sync = new MovieSync({ mesh, signaling: { now: () => now }, player, selfId });
   return { sync, sent };
 }
 const peer = { id: 'peer-aaaaaaaa', send() {} };
@@ -115,7 +115,7 @@ test('a commit at the cap does not exceed it and peers accept it', () => {
   sync.destroy();
 });
 
-test('Mesh rebuild attempts decay after a minute without a rebuild', async () => {
+test('Mesh rebuild attempts decay after five minutes without a rebuild', async () => {
   const { Mesh } = await import('../public/assets/js/mesh.js');
   const realNow = Date.now;
   let t = 1e12;
@@ -126,9 +126,9 @@ test('Mesh rebuild attempts decay after a minute without a rebuild', async () =>
     const limited = () => Mesh.prototype._rebuildLimited.call(fake, 'p');
     for (let i = 0; i < 6; i++) { assert.ok(limited()); t += 1500; }
     assert.equal(limited(), null, 'capped');
-    t += 30_000;
-    assert.equal(limited(), null, 'still capped within a minute');
-    t += 31_000;
+    t += 150_000;
+    assert.equal(limited(), null, 'still capped within five minutes');
+    t += 151_000;
     assert.ok(limited(), 'allowed again after the counter decayed');
     assert.equal(fake._attempts.get('p'), 1);
     assert.equal(limited(), null, 'the 1 s minimum interval still applies');
@@ -160,4 +160,40 @@ test('expectedPosition is finite for every accepted state', () => {
   assert.ok(s);
   assert.ok(Number.isFinite(sync.expectedPosition(s)));
   sync.destroy();
+});
+
+test('at the seq cap the arriving state wins: honest peers accept each other in both id orders', () => {
+  const CAP = Number.MAX_SAFE_INTEGER - 1;
+  for (const [low, high] of [['aaaa-low-id', 'zzzz-high-id'], ['zzzz-high-id', 'aaaa-low-id']]) {
+    const a = makeSync(1700000000000, low);
+    const b = makeSync(1700000000000, high);
+    a.sync.state = { ...a.sync.state, seq: CAP, by: low };
+    b.sync.state = { ...b.sync.state, seq: CAP, by: high };
+    a.sync.seek(10);
+    assert.equal(a.sync.state.seq, CAP);
+    b.sync._onMessage({ id: low, send() {} }, a.sent.at(-1));
+    assert.equal(b.sync.state.by, low);
+    assert.equal(b.sync.state.pos, 10);
+    b.sync.seek(20);
+    assert.equal(b.sync.state.seq, CAP);
+    a.sync._onMessage({ id: high, send() {} }, b.sent.at(-1));
+    assert.equal(a.sync.state.by, high);
+    assert.equal(a.sync.state.pos, 20);
+    a.sync.destroy();
+    b.sync.destroy();
+  }
+});
+
+test('a hostile state at the cap with the highest possible id does not freeze the room', () => {
+  const CAP = Number.MAX_SAFE_INTEGER - 1;
+  const members = ['aaaa-peer-one', 'bbbb-peer-two'].map((id) => makeSync(1700000000000, id));
+  const hostile = good({ seq: CAP, by: '\uffff'.repeat(64) });
+  for (const m of members) m.sync._onMessage({ id: 'evil', send() {} }, { type: 'sync-state', state: hostile });
+  for (const m of members) assert.equal(m.sync.state.by, hostile.by);
+  members[0].sync.seek(42);
+  assert.equal(members[0].sync.state.seq, CAP);
+  members[1].sync._onMessage({ id: 'aaaa-peer-one', send() {} }, members[0].sent.at(-1));
+  assert.equal(members[1].sync.state.by, 'aaaa-peer-one');
+  assert.equal(members[1].sync.state.pos, 42);
+  for (const m of members) m.sync.destroy();
 });

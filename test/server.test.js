@@ -1271,16 +1271,16 @@ test('limiterKey input: forwarded values that are not IPs fall back to the socke
   s.stop();
 });
 
-test('the failure limiters remember at most 10,000 clients (expired first, then the oldest)', async () => {
+test('the failure limiters remember at most 10,000 clients (expired first, then the oldest unblocked one)', async () => {
   const s = await spawnServer({ TRUST_PROXY: '1' });
   const attempt = (xff) => fetch(s.base + '/api/admin/login', { method: 'POST', headers: { 'content-type': 'application/json', 'X-Forwarded-For': xff }, body: JSON.stringify({ password: 'wrong' }) }).then((r) => r.status);
   for (let i = 0; i < 10; i++) assert.strictEqual(await attempt('9.9.9.9'), 401);
   assert.strictEqual(await attempt('9.9.9.9'), 429);
-  // 10,000 other clients push the oldest entry (9.9.9.9) out; the map does not grow past its cap.
+  // 10,000 other clients (one failure each) fill the map past its cap; the oldest unblocked entries go, a blocked one stays.
   const ips = Array.from({ length: 10000 }, (_, i) => `10.${i >> 8 & 255}.${i & 255}.1`);
   for (let i = 0; i < ips.length; i += 200) await Promise.all(ips.slice(i, i + 200).map(attempt));
-  assert.strictEqual(await attempt('9.9.9.9'), 401, 'the oldest entry was dropped');
-  assert.strictEqual(await attempt('10.0.0.1'), 401, 'a recent one is still counted (one failure so far, one more now)');
+  assert.strictEqual(await attempt('9.9.9.9'), 429, 'a blocked client stays blocked however many others are added');
+  assert.strictEqual(await attempt('10.39.15.1'), 401, 'a recent one is still counted (one failure so far, one more now)');
   s.stop();
 });
 

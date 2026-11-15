@@ -16,6 +16,10 @@ export function emptyState() {
 
 function newer(a, b) {
   if (a.seq !== b.seq) return a.seq > b.seq;
+  // At the cap _commit() cannot go higher, so the tie-break by `by` could freeze the room (a hostile peer sending
+  // `by: '\uffff'.repeat(64)` would win every tie) or split it (the committer has the lower id). There the arriving
+  // state wins: last writer wins by arrival. Harmless: a received state is never re-broadcast, so nothing loops.
+  if (a.seq === MAX_SEQ) return true;
   return a.by > b.by;
 }
 
@@ -37,8 +41,8 @@ function cleanMovie(movie) {
 
 // Absolute cap on seq (`seq + 1` stays exact up to here); cleanState() rejects anything above it. A peer can
 // still send a seq at the cap. Then _commit() cannot go higher: it clamps to MAX_SEQ, which is still a value
-// peers accept, and against the peer's state the tie is decided by `by` like any other tie (so our commit may
-// lose until the peer commits again). Nothing throws and nothing is sent that peers would reject.
+// peers accept, and at the cap newer() lets the arriving state win (see there), so every commit is accepted by
+// the others. Nothing throws and nothing is sent that peers would reject.
 const MAX_SEQ = Number.MAX_SAFE_INTEGER - 1;
 const MAX_POS = 1e7; // seconds (about 115 days)
 const MAX_AT = 1e14; // epoch milliseconds (year 5138)
