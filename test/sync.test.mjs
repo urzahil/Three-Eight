@@ -84,24 +84,56 @@ function makeSync(now = 1700000000000) {
 }
 const peer = { id: 'peer-aaaaaaaa', send() {} };
 
-test('a state that jumps far ahead of ours is refused, so the room can not be frozen by a huge seq', () => {
-  const { sync, sent } = makeSync();
-  sync._onMessage(peer, { type: 'sync-state', state: good({ seq: 1e9 }) });
-  assert.equal(sync.state.seq, 0, 'the maximum the old cap allowed');
+test('a newcomer at seq 0 accepts any state up to the absolute cap, however far ahead', () => {
+  const { sync } = makeSync();
+  sync._onMessage(peer, { type: 'sync-state', state: good({ seq: 5_000_000 }) });
+  assert.equal(sync.state.seq, 5_000_000);
   sync._onMessage(peer, { type: 'sync-state', state: good({ seq: 1e12 }) });
-  assert.equal(sync.state.seq, 0);
-  sync._onMessage(peer, { type: 'sync-state', state: good({ seq: 1e6 + 1 }) });
-  assert.equal(sync.state.seq, 0);
-  sync._onMessage(peer, { type: 'sync-state', state: good({ seq: 1e6 }) });
-  assert.equal(sync.state.seq, 1e6, 'a jump of exactly the limit is fine');
-  sync._onMessage(peer, { type: 'sync-state', state: good({ seq: 2e6 + 1 }) });
-  assert.equal(sync.state.seq, 1e6, 'measured from our current seq');
-  // Every commit of ours is acceptable to a peer that applies the same rules.
-  sync.pause();
-  assert.equal(sync.state.seq, 1e6 + 1);
-  const mine = cleanState(sent.at(-1).state);
-  assert.ok(mine && mine.seq === 1e6 + 1);
+  assert.equal(sync.state.seq, 1e12);
   sync.destroy();
+});
+
+test('states above the absolute cap are rejected', () => {
+  const { sync } = makeSync();
+  sync._onMessage(peer, { type: 'sync-state', state: good({ seq: Number.MAX_SAFE_INTEGER }) });
+  assert.equal(sync.state.seq, 0);
+  sync._onMessage(peer, { type: 'sync-state', state: good({ seq: 2 ** 60 }) });
+  assert.equal(sync.state.seq, 0);
+  sync._onMessage(peer, { type: 'sync-state', state: good({ seq: Number.MAX_SAFE_INTEGER - 1 }) });
+  assert.equal(sync.state.seq, Number.MAX_SAFE_INTEGER - 1, 'the cap itself is accepted');
+  sync.destroy();
+});
+
+test('a commit at the cap does not exceed it and peers accept it', () => {
+  const { sync, sent } = makeSync();
+  sync._onMessage(peer, { type: 'sync-state', state: good({ seq: Number.MAX_SAFE_INTEGER - 1 }) });
+  sync.pause();
+  assert.equal(sync.state.seq, Number.MAX_SAFE_INTEGER - 1);
+  assert.equal(sync.state.by, 'me-me-me-me');
+  assert.ok(cleanState(sent.at(-1).state));
+  sync.destroy();
+});
+
+test('Mesh rebuild attempts decay after a minute without a rebuild', async () => {
+  const { Mesh } = await import('../public/assets/js/mesh.js');
+  const realNow = Date.now;
+  let t = 1e12;
+  Date.now = () => t;
+  try {
+    const fake = { _attempts: new Map(), _lastRebuild: new Map(), rebuilt: 0, rebuildPeer() { this.rebuilt++; this._lastRebuild.set('p', t); return {}; } };
+    fake._attemptCount = Mesh.prototype._attemptCount;
+    const limited = () => Mesh.prototype._rebuildLimited.call(fake, 'p');
+    for (let i = 0; i < 6; i++) { assert.ok(limited()); t += 1500; }
+    assert.equal(limited(), null, 'capped');
+    t += 30_000;
+    assert.equal(limited(), null, 'still capped within a minute');
+    t += 31_000;
+    assert.ok(limited(), 'allowed again after the counter decayed');
+    assert.equal(fake._attempts.get('p'), 1);
+    assert.equal(limited(), null, 'the 1 s minimum interval still applies');
+  } finally {
+    Date.now = realNow;
+  }
 });
 
 test('local commits stay inside the ranges peers accept, even with bad inputs', () => {

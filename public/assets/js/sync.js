@@ -35,10 +35,11 @@ function cleanMovie(movie) {
   return rest;
 }
 
-// `seq + 1` stays exact up to here; a peer cannot get anywhere near it, because a state that jumps more than
-// MAX_SEQ_JUMP ahead of ours is refused (see _onMessage). So our own next commit is always acceptable to the others.
+// Absolute cap on seq (`seq + 1` stays exact up to here); cleanState() rejects anything above it. A peer can
+// still send a seq at the cap. Then _commit() cannot go higher: it clamps to MAX_SEQ, which is still a value
+// peers accept, and against the peer's state the tie is decided by `by` like any other tie (so our commit may
+// lose until the peer commits again). Nothing throws and nothing is sent that peers would reject.
 const MAX_SEQ = Number.MAX_SAFE_INTEGER - 1;
-const MAX_SEQ_JUMP = 1e6;
 const MAX_POS = 1e7; // seconds (about 115 days)
 const MAX_AT = 1e14; // epoch milliseconds (year 5138)
 const MAX_ID = 64; // participant ids are at most 64 characters
@@ -361,8 +362,7 @@ export class MovieSync extends EventTarget {
     switch (msg.type) {
       case 'sync-state': {
         const s = cleanState(msg.state);
-        // A state far ahead of ours is a buggy or hostile peer: accepting it would push every later commit out of range.
-        if (!s || s.seq > this.state.seq + MAX_SEQ_JUMP || !newer(s, this.state)) return;
+        if (!s || !newer(s, this.state)) return;
         const prev = this.state;
         this.state = s;
         if (!sameMovie(prev.movie, this.state.movie)) this.useAnyway = false;

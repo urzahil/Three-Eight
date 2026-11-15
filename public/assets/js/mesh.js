@@ -12,6 +12,8 @@ const FILM_LOW = 256 * 1024;
 // Rebuilding a link: at most MAX_REBUILDS in a row without the channel opening, at least MIN_REBUILD_MS apart.
 const MAX_REBUILDS = 6;
 const MIN_REBUILD_MS = 1000;
+// The attempt counter decays: when the last rebuild of a peer is older than this, it starts from zero again.
+const REBUILD_DECAY_MS = 60 * 1000;
 // A local offer that is still unanswered after this long is considered lost (a normal answer takes a round trip).
 const OFFER_STALE_MS = 3000;
 
@@ -381,14 +383,21 @@ export class Mesh extends EventTarget {
 
   /**
    * rebuildPeer() for rebuilds that a timer or the other side asked for: they share one attempt counter (reset
-   * when the channel opens) and keep a minimum distance, so a member that keeps closing its channel and
-   * sending offers cannot make us rebuild without limit. Returns null when it holds back.
+   * when the channel opens, or when the last rebuild is over a minute old) and keep a minimum distance, so a
+   * member that keeps closing its channel and sending offers cannot make us rebuild without limit. Returns
+   * null when it holds back.
    */
   _rebuildLimited(id) {
-    const n = this._attempts.get(id) || 0;
+    const n = this._attemptCount(id);
     if (n >= MAX_REBUILDS || Date.now() - (this._lastRebuild.get(id) || 0) < MIN_REBUILD_MS) return null;
     this._attempts.set(id, n + 1);
     return this.rebuildPeer(id);
+  }
+
+  /** Rebuilds since the channel last opened; forgotten when the last one is over REBUILD_DECAY_MS ago. */
+  _attemptCount(id) {
+    if (Date.now() - (this._lastRebuild.get(id) || 0) > REBUILD_DECAY_MS) this._attempts.delete(id);
+    return this._attempts.get(id) || 0;
   }
 
   _linkHealthy(peer) {
@@ -405,7 +414,7 @@ export class Mesh extends EventTarget {
    */
   _channelClosed(peer) {
     const id = peer.id;
-    const n = this._attempts.get(id) || 0;
+    const n = this._attemptCount(id);
     if (n >= MAX_REBUILDS) return; // keeps failing: leave it to the user (reload) instead of looping forever
     const delay = (this.selfId < id ? 1000 : 8000) * 2 ** Math.min(n, 3);
     setTimeout(() => {
