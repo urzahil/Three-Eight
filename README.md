@@ -291,6 +291,15 @@ node test/drive-check.js
 node test/share-check.js
 ```
 
+To run all of the browser checks in one go (it generates the fixtures if they are missing, starts a server for each script that needs one, and prints one PASS/FAIL line per script):
+
+```bash
+npx playwright install chromium   # once
+npm run test:browser              # or name some: npm run test:browser -- e2e lobby-check
+```
+
+It needs ffmpeg and Playwright's Chromium. Each script gets 5 minutes before it counts as failed. CI runs the same command in the `browser` job.
+
 `drive-check.js` starts its own server as a service account against a fake Google (`test/fake-google.js`): browsing a folder and its subfolders, streaming a movie through the remuxer and natively (without MSE), room sync while streaming, subtitles from the folder, a download quota error, two viewers sharing one fetch from Google, three viewers sharing a film (it counts the bytes our server sends, which should be about one copy; one viewer then freezes and leaves, and the others keep playing), a token refresh on reconnect, live changes to the room's folder, and a check that the browser never contacts Google. `share-check.js` tests a room without Drive: one person opens a file, a friend streams it from their copy, with sync, seeking and audio changes, and the Settings opt-out. `npm test` also runs unit tests for the sharing protocol (`test/swarm.test.mjs`). `player-check.js` tests the in-browser player on its own: native or remux mode, audio track switching, seeking and subtitles. `e2e.js` tests the whole flow: the admin creates a room, a wrong password is rejected, two people join with fake cameras, video flows peer to peer, mute and camera state and chat arrive on the other side, and the movie syncs. The movie part covers play, pause, seeking, audio and subtitle changes, a shared subtitle file, and a late joiner. Finally the admin deletes the room and everyone is disconnected. `pip-check.js` tests picture-in-picture: the Document PiP window (the movie box moves there, subtitles still render, controls inside it drive the other person, and closing it brings the player back), the native-PiP fallback (the subtitles are mirrored into a caption track, and a pause made directly on the `<video>` reaches the room), and the compact style (chosen in Settings: the canvas stream is in native PiP, the subtitles and video are drawn on the canvas, a pause on the PiP element reaches the room, and leaving PiP cleans up).
 
 ## License
