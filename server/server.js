@@ -555,6 +555,40 @@ function kickRoom(name, code, message) {
 }
 
 // ---- Google Drive endpoints --------------------------------------------------------
+// Open Drive file responses per room (roomKey -> Set of { version, abort }). A token is checked once, before a
+// response starts; when the room's access changes (deleted, password, folder) the responses still streaming under the
+// old version are cut, so a client that asked for a whole film in one request cannot keep downloading it.
+/** @type {Map<string, Set<{version: string, abort: () => void}>>} */
+const driveStreams = new Map();
+
+/**
+ * Register a streaming response of `room` (the room object its token was verified against). Returns the function that
+ * unregisters it, or null when the room is gone or changed since the token was checked (nothing is registered then).
+ */
+function trackDriveStream(room, abort) {
+  const now = store.get(room.name);
+  const version = roomVersion(room);
+  if (!now || roomVersion(now) !== version) return null;
+  const key = RoomStore.key(room.name);
+  let set = driveStreams.get(key);
+  if (!set) driveStreams.set(key, (set = new Set()));
+  const entry = { version, abort };
+  set.add(entry);
+  return () => {
+    set.delete(entry);
+    if (set.size === 0 && driveStreams.get(key) === set) driveStreams.delete(key);
+  };
+}
+
+/** Cut the room's open Drive file responses whose token is no longer valid. Call after the room changed or was removed. */
+function dropDriveStreams(name) {
+  const set = driveStreams.get(RoomStore.key(name));
+  if (!set) return;
+  const now = store.get(name);
+  const version = now ? roomVersion(now) : null;
+  for (const entry of [...set]) if (entry.version !== version) entry.abort();
+}
+
 const DRIVE_HEADERS = { 'Cache-Control': 'private, no-store' };
 
 /** After the admin attaches a folder: can the service account read it? */
@@ -621,13 +655,13 @@ async function handleDrive(req, res, url, parts) {
       driveApi.markInTree(root, items.map((f) => f.id));
       return sendJson(res, 200, { id, name: info.name, items }, DRIVE_HEADERS);
     }
-    await serveFile(req, res, id);
+    await serveFile(req, res, id, room);
   } catch (err) {
     driveFail(res, err);
   }
 }
 
-async function serveFile(req, res, id) {
+async function serveFile(req, res, id, room) {
   const meta = await driveApi.fileMeta(id);
   const kind = kindOf(meta);
   if (meta.trashed || (kind !== 'video' && kind !== 'subtitle') || !Number.isSafeInteger(meta.size) || meta.size < 0) {
@@ -657,7 +691,16 @@ async function serveFile(req, res, id) {
 
   // Stop upstream work when the client goes away.
   const ctrl = new AbortController();
-  res.on('close', () => ctrl.abort());
+  // Registered once streaming is about to start; fileMeta above was awaited, so the room may have changed since handleDrive checked the token.
+  const untrack = trackDriveStream(room, () => {
+    ctrl.abort();
+    res.destroy(); // the client sees the connection cut, not a clean end
+  });
+  if (!untrack) return sendJson(res, 401, { error: 'Your Drive session is missing or has expired. Rejoin the room.' }, DRIVE_HEADERS);
+  res.on('close', () => {
+    untrack();
+    ctrl.abort();
+  });
   const gen = driveApi.read(id, size, start, end, ctrl.signal);
   try {
     // The first block is fetched before any header is sent, so a Google error still becomes a proper error response.
@@ -671,6 +714,7 @@ async function serveFile(req, res, id) {
     }
     res.end();
   } finally {
+    untrack();
     await gen.return().catch(() => {});
   }
 }
@@ -759,6 +803,7 @@ async function handleApi(req, res, url) {
         if (!(err instanceof RoomError)) throw err;
         return sendJson(res, 404, { error: err.message });
       }
+      dropDriveStreams(name);
       pushDrive(name);
       const out = { ok: true, drive };
       if (drive && driveApi) out.check = await checkFolder(drive.folderId);
@@ -774,6 +819,7 @@ async function handleApi(req, res, url) {
         if (!(err instanceof RoomError)) throw err;
         return sendJson(res, 400, { error: err.message });
       }
+      dropDriveStreams(name);
       if (body.kick === true) kickRoom(name, 'kicked', 'The room password was changed. Please rejoin.');
       else pushDrive(name); // everyone's old Drive token just stopped working: hand out the new one
       return sendJson(res, 200, { ok: true });
@@ -785,6 +831,7 @@ async function handleApi(req, res, url) {
         if (!(err instanceof RoomError)) throw err;
         return sendJson(res, 404, { error: err.message });
       }
+      dropDriveStreams(name);
       kickRoom(name, 'room-deleted', 'This room has been deleted.');
       return sendJson(res, 200, { ok: true });
     }

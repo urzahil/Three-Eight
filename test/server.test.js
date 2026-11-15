@@ -582,6 +582,66 @@ test('drive: changing the folder or the password invalidates old tokens and push
   a.ws.close();
 });
 
+// A whole-file download that is still streaming when the room's access changes must be cut. The client stops reading
+// right after the headers, so the server is held up by backpressure (the file is far bigger than the socket buffers).
+function slowDownload(room, id, token) {
+  return new Promise((resolve, reject) => {
+    const req = http.get(BASE + files(room, id), { headers: { Authorization: `Bearer ${token}` } }, (res) => {
+      res.pause();
+      let got = 0;
+      let finish;
+      const done = new Promise((r) => { finish = r; });
+      res.on('data', (c) => { got += c.length; });
+      res.on('end', () => finish({ clean: true, got }));
+      for (const ev of ['error', 'aborted', 'close']) res.on(ev, () => finish({ clean: res.complete, got }));
+      resolve({ status: res.statusCode, total: Number(res.headers['content-length']), resume: () => res.resume(), done });
+    });
+    req.on('error', reject);
+  });
+}
+
+test('drive: a file response still streaming is cut when the room is deleted, its password or its folder changes', async () => {
+  const F1 = 'CUT_FOLDER_000001', F2 = 'CUT_FOLDER_000002', BIG1 = 'CUT_BIG_FILE_0001', BIG2 = 'CUT_BIG_FILE_0002';
+  const big = bytes(48 * MiB);
+  google.addFolder(F1, 'Cut folder 1');
+  google.addFolder(F2, 'Cut folder 2');
+  google.addFile(BIG1, 'big1.mp4', F1, big, 'video/mp4');
+  google.addFile(BIG2, 'big2.mp4', F2, big, 'video/mp4');
+  const setup = async (room, folder) => {
+    assert.strictEqual((await json('POST', '/api/admin/rooms', { name: room, password: 'pw' })).status, 201);
+    assert.strictEqual((await json('PUT', `/api/admin/rooms/${room}/drive`, { link: folder })).status, 200);
+    return join(room, 'pw', 'cccccccc' + room.slice(-1), 'Carol');
+  };
+  const keep = await setup('cut-keep', F2);
+  const cases = [
+    ['room deleted', 'cut-1', (r) => json('DELETE', `/api/admin/rooms/${r}`, {})],
+    ['password changed', 'cut-2', (r) => json('PUT', `/api/admin/rooms/${r}`, { password: 'new' })],
+    ['password changed, members kicked', 'cut-3', (r) => json('PUT', `/api/admin/rooms/${r}`, { password: 'new', kick: true })],
+    ['folder removed', 'cut-4', (r) => json('PUT', `/api/admin/rooms/${r}/drive`, { link: '' })],
+    ['folder changed', 'cut-5', (r) => json('PUT', `/api/admin/rooms/${r}/drive`, { link: F2 })],
+  ];
+  for (const [label, room, change] of cases) {
+    const m = await setup(room, F1);
+    const victim = await slowDownload(room, BIG1, m.welcome.drive.token);
+    const other = await slowDownload('cut-keep', BIG2, keep.welcome.drive.token);
+    assert.deepStrictEqual([victim.status, other.status, victim.total, other.total], [200, 200, big.length, big.length], label);
+    await new Promise((r) => setTimeout(r, 300)); // streaming is under way, held up by the paused clients
+    assert.strictEqual((await change(room)).status, 200, label);
+    victim.resume();
+    const cut = await Promise.race([victim.done, new Promise((r) => setTimeout(() => r({ timeout: true }), 5000))]);
+    assert(!cut.timeout, `${label}: the response ended promptly`);
+    assert(!cut.clean && cut.got < victim.total, `${label}: cut short (${cut.got} of ${victim.total} bytes), not a clean end`);
+    other.resume();
+    const kept = await other.done;
+    assert(kept.clean && kept.got === other.total, `${label}: the other room's download is not affected`);
+    m.ws.close();
+  }
+  keep.ws.close();
+  // Nothing is left behind: the server keeps serving new downloads (and a new one starts and ends normally).
+  const again = await api(files('cut-keep', BIG2), keep.welcome.drive.token, { headers: { Authorization: `Bearer ${keep.welcome.drive.token}`, Range: 'bytes=0-99' } });
+  assert.strictEqual((await again.arrayBuffer()).byteLength, 100);
+});
+
 test('drive: without a service account there is no drive field and no endpoint', async () => {
   const s = await spawnServer({});
   const login = await fetch(s.base + '/api/admin/login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password: 'admin-pw' }) });

@@ -533,6 +533,15 @@ async function adminApi(base) {
       await seekAll(20);
       t = await settle([va, vb], 20.5, 0.5, 20); // within 10 s: a gap in the buffer once left a viewer stuck for good
       assert(t.every((x) => !x.paused && x.time > 20.5 && x.time < 40) && Math.abs(t[0].time - t[1].time) < 0.5, 'still playing after she left: ' + JSON.stringify(t.map((x) => x.time)));
+      // The admin changes the room password without kicking while the film plays: every Drive token (and any response still
+      // streaming under it) is void, the members get a fresh token, and playback goes on, also into a part nobody has yet.
+      const oldTokens = await Promise.all([va, vb].map((p) => p.evaluate(() => room.drive.token)));
+      assert.equal((await api('PUT', `/api/admin/rooms/${SWARM}`, { password: 'secret2' })).status, 200);
+      await Promise.all([va, vb].map((p, i) => waitFor(p, (old) => room.drive && room.drive.token !== old, oldTokens[i])));
+      await seekAll(130);
+      t = await settle([va, vb], 130.5, 0.5, 30);
+      assert(t.every((x) => !x.paused && x.time > 130.5) && Math.abs(t[0].time - t[1].time) < 0.5, 'still playing after the password changed: ' + JSON.stringify(t.map((x) => x.time)));
+      console.log('password changed without kick: members got a fresh token and playback continued', JSON.stringify(t.map((x) => x.time)));
       for (const v of viewers.slice(0, 2)) await v.ctx.close();
       console.log('three viewers share the film; a frozen and a departed viewer did not stop the others');
     }
