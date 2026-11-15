@@ -1,8 +1,15 @@
 name: Test
 
+# Pushes to main, and pull requests: a branch with an open pull request is tested once, not twice.
 on:
   push:
+    branches: [main]
   pull_request:
+
+# A newer push to the same branch or pull request replaces the run in progress.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
