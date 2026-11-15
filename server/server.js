@@ -50,6 +50,7 @@ for (const entry of (process.env.ALLOWED_ORIGINS || '').split(',').map((o) => o.
     console.warn(`ALLOWED_ORIGINS: ignoring "${entry}" (not a valid origin like https://calls.example.com).`);
   }
 }
+const DRIVE_DEBUG = process.env.DRIVE_DEBUG === '1';
 const MAX_MESSAGE_BYTES = 64 * 1024;
 // Per-socket message budget (token bucket): room for ICE candidate bursts and clock-sync pings.
 // A newcomer in a full room sends an offer plus a dozen ICE candidates to each peer, so the burst is generous.
@@ -618,6 +619,8 @@ function driveFail(res, err) {
 }
 
 const waitDrain = (res) => new Promise((resolve) => {
+  // A response that is already gone never emits 'drain' or 'close' again: do not wait for it.
+  if (res.destroyed || res.writableEnded) return resolve();
   const done = () => { res.off('drain', done); res.off('close', done); resolve(); };
   res.once('drain', done);
   res.once('close', done);
@@ -647,6 +650,7 @@ async function handleDrive(req, res, url, parts) {
     // Only the room's folder and what is below it: the service account may be able to read much more.
     if (!(await driveApi.inTree(root, id))) return sendJson(res, 404, { error: 'Not found in this room\'s folder.' }, DRIVE_HEADERS);
     // The room may have changed (password, folder, deleted) while Drive was asked: the token only counts for the room it was issued for.
+    if (res.destroyed) return; // the client went away while Drive was asked: nothing to do
     const now = store.get(room.name);
     if (!now || roomVersion(now) !== roomVersion(room)) return sendJson(res, 401, { error: 'Your Drive session is missing or has expired. Rejoin the room.' }, DRIVE_HEADERS);
     if (!isFiles) {
@@ -689,6 +693,8 @@ async function serveFile(req, res, id, room) {
     return res.end();
   }
 
+  // The client may have gone away while the metadata was fetched: its 'close' has fired and a listener added now would never run.
+  if (res.destroyed) return;
   // Stop upstream work when the client goes away.
   const ctrl = new AbortController();
   // Registered once streaming is about to start; fileMeta above was awaited, so the room may have changed since handleDrive checked the token.
@@ -735,6 +741,13 @@ async function handleApi(req, res, url) {
 
   if (parts[1] === 'config' && req.method === 'GET') {
     return sendJson(res, 200, { iceServers: iceServers(), maxRoomSize: MAX_ROOM_SIZE });
+  }
+
+  // Tests only (needs DRIVE_DEBUG=1): how many Drive file responses the server still tracks.
+  if (DRIVE_DEBUG && parts[1] === 'debug' && parts[2] === 'drive-streams' && req.method === 'GET') {
+    let streams = 0;
+    for (const set of driveStreams.values()) streams += set.size;
+    return sendJson(res, 200, { rooms: driveStreams.size, streams });
   }
 
   if (parts[1] !== 'admin') return sendJson(res, 404, { error: 'Not found' });
@@ -803,8 +816,8 @@ async function handleApi(req, res, url) {
         if (!(err instanceof RoomError)) throw err;
         return sendJson(res, 404, { error: err.message });
       }
+      pushDrive(name); // the fresh token is on its way before the old responses are cut
       dropDriveStreams(name);
-      pushDrive(name);
       const out = { ok: true, drive };
       if (drive && driveApi) out.check = await checkFolder(drive.folderId);
       return sendJson(res, 200, out);
@@ -819,9 +832,9 @@ async function handleApi(req, res, url) {
         if (!(err instanceof RoomError)) throw err;
         return sendJson(res, 400, { error: err.message });
       }
-      dropDriveStreams(name);
       if (body.kick === true) kickRoom(name, 'kicked', 'The room password was changed. Please rejoin.');
       else pushDrive(name); // everyone's old Drive token just stopped working: hand out the new one
+      dropDriveStreams(name);
       return sendJson(res, 200, { ok: true });
     }
     if (name && req.method === 'DELETE') {
@@ -831,8 +844,8 @@ async function handleApi(req, res, url) {
         if (!(err instanceof RoomError)) throw err;
         return sendJson(res, 404, { error: err.message });
       }
-      dropDriveStreams(name);
       kickRoom(name, 'room-deleted', 'This room has been deleted.');
+      dropDriveStreams(name);
       return sendJson(res, 200, { ok: true });
     }
   }

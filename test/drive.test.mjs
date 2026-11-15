@@ -119,3 +119,25 @@ test('pickSubtitle understands space-separated tags and language names', () => {
   assert.equal(pick('Film.mkv', ['Film ENG.srt', 'Film ITA.srt'], 'it'), 'Film ITA.srt');
   assert.equal(pick('Film.mkv', ['Film ENG.srt', 'Film.srt'], 'en'), 'Film.srt');
 });
+
+test('DriveClient: a range request that gets a 401 (token just replaced) is retried with the new token', async () => {
+  const realFetch = globalThis.fetch;
+  const d = new DriveClient({ room: 'r', token: 'old', folder: 'ROOTFOLDER_0001' });
+  const f = d.remoteFile({ id: 'FILEID_00000001', name: 'a.mkv', size: 10 });
+  f.backoff = 1;
+  const auth = [];
+  globalThis.fetch = async (url, init) => {
+    auth.push(init.headers.Authorization);
+    if (init.headers.Authorization === 'Bearer old') {
+      d.setToken('new'); // the fresh token arrives over the WebSocket meanwhile
+      return new Response(JSON.stringify({ error: 'Your Drive session is missing or has expired. Rejoin the room.' }), { status: 401 });
+    }
+    return new Response(new Uint8Array(10), { status: 206 });
+  };
+  try {
+    assert.equal((await f.slice(0, 10).arrayBuffer()).byteLength, 10);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  assert.deepEqual(auth, ['Bearer old', 'Bearer new']);
+});

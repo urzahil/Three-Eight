@@ -22,7 +22,12 @@ async function serverError(res) {
     /* not JSON */
   }
   const message = typeof body?.error === 'string' && body.error ? body.error : `The server answered with an error (${res.status}).`;
-  return Object.assign(new Error(message), { remote: true, status: res.status, permanent: body?.permanent === true ? true : undefined });
+  return Object.assign(new Error(message), {
+    remote: true,
+    status: res.status,
+    // A 401 is a token that was just replaced (password or folder change): the new one arrives over the WebSocket, so retrying can help.
+    permanent: body?.permanent === true ? true : res.status === 401 ? false : undefined,
+  });
 }
 
 export const networkError = (cause) => Object.assign(new Error(NETWORK_MESSAGE), { remote: true, cause });

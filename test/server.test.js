@@ -9,6 +9,7 @@ const os = require('node:os');
 const path = require('node:path');
 const WebSocket = require('ws');
 const http = require('node:http');
+const net = require('node:net');
 const { RoomStore, parseDriveFolder } = require('../server/store');
 const { limiterKey } = require('../server/ip');
 const { startFakeGoogle } = require('./fake-google');
@@ -68,7 +69,7 @@ before(async () => {
   proc = spawn(process.execPath, [path.join(__dirname, '..', 'server', 'server.js')], {
     env: {
       ...process.env, PORT: String(PORT), HOST: '127.0.0.1', ADMIN_PASSWORD: 'admin-pw', DATA_DIR: dataDir,
-      GOOGLE_SERVICE_ACCOUNT: google.writeAccount(keyDir), GOOGLE_API_BASE: google.url,
+      GOOGLE_SERVICE_ACCOUNT: google.writeAccount(keyDir), GOOGLE_API_BASE: google.url, DRIVE_DEBUG: '1',
     },
     stdio: 'ignore',
   });
@@ -640,6 +641,41 @@ test('drive: a file response still streaming is cut when the room is deleted, it
   // Nothing is left behind: the server keeps serving new downloads (and a new one starts and ends normally).
   const again = await api(files('cut-keep', BIG2), keep.welcome.drive.token, { headers: { Authorization: `Bearer ${keep.welcome.drive.token}`, Range: 'bytes=0-99' } });
   assert.strictEqual((await again.arrayBuffer()).byteLength, 100);
+});
+
+test('drive: clients that disconnect right after sending a file request leave nothing behind', async () => {
+  const F = 'LEAK_FOLDER_00001', FILE = 'LEAK_FILE_0000001';
+  google.addFolder(F, 'Leak folder');
+  google.addFile(FILE, 'leak.mp4', F, bytes(3 * MiB), 'video/mp4');
+  assert.strictEqual((await json('POST', '/api/admin/rooms', { name: 'leak-room', password: 'pw' })).status, 201);
+  assert.strictEqual((await json('PUT', '/api/admin/rooms/leak-room/drive', { link: F })).status, 200);
+  const m = await join('leak-room', 'pw', 'llllllll1', 'Lena');
+  const token = m.welcome.drive.token;
+  const registry = async () => (await fetch(BASE + '/api/debug/drive-streams')).json(); // DRIVE_DEBUG=1 test hook
+  const request = `GET ${files('leak-room', FILE)} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer ${token}\r\n\r\n`;
+  await Promise.all(Array.from({ length: 50 }, (_, i) => new Promise((resolve) => {
+    const sock = net.connect(PORT, '127.0.0.1', () => {
+      sock.write(request);
+      // gone before the first byte; some right away, some while the server is still asking Google
+      setTimeout(() => sock.destroy(), i % 5);
+    });
+    sock.on('error', () => {});
+    sock.on('close', resolve);
+  })));
+  let left;
+  for (let i = 0; i < 50; i++) {
+    left = await registry();
+    if (left.streams === 0 && left.rooms === 0) break;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  assert.deepStrictEqual(left, { rooms: 0, streams: 0 }, 'no stream stays registered');
+  assert(mediaCalls(FILE).length <= 1, 'one shared upstream fetch at most, not one per client: ' + mediaCalls(FILE).length);
+  // The room still works: an admin change and a normal download.
+  assert.strictEqual((await json('PUT', '/api/admin/rooms/leak-room', { password: 'pw2' })).status, 200);
+  const fresh = (await m.ws.next()).drive.token;
+  assert((await (await api(files('leak-room', FILE), fresh)).arrayBuffer()).byteLength === 3 * MiB);
+  assert.deepStrictEqual(await registry(), { rooms: 0, streams: 0 });
+  m.ws.close();
 });
 
 test('drive: without a service account there is no drive field and no endpoint', async () => {
