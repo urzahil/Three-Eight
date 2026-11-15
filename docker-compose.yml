@@ -11,6 +11,7 @@ services:
       # Password for https://<your-host>/admin (required).
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Set ADMIN_PASSWORD in .env}
       # The app runs behind a TLS reverse proxy (needed for camera/mic access).
+      # (A number instead of "true" means that many proxies in a row, e.g. "2" for CDN + reverse proxy.)
       TRUST_PROXY: "true"
       # Max participants per room (default 12). Each person sends video to everyone else, so >8 gets heavy.
       MAX_ROOM_SIZE: ${MAX_ROOM_SIZE:-12}
@@ -23,13 +24,13 @@ services:
       # inside the container. Uncomment the volume below and set
       # GOOGLE_SERVICE_ACCOUNT=/run/secrets/google-service-account.json in .env.
       GOOGLE_SERVICE_ACCOUNT: ${GOOGLE_SERVICE_ACCOUNT:-}
-      # Memory for the server's movie cache while streaming from Drive, in MB.
+      # Memory for the server's movie cache while streaming from Drive, in MB (minimum 32).
       DRIVE_CACHE_MB: ${DRIVE_CACHE_MB:-256}
     volumes:
       - three-eight-data:/data
       # The service account key file downloaded from Google Cloud, mounted read-only. Keep it private:
       # it can read whatever is shared with that service account.
-      - ./google-service-account.json:/run/secrets/google-service-account.json:ro
+      # - ./google-service-account.json:/run/secrets/google-service-account.json:ro
 
   # Optional TURN relay (coturn) for friends whose network blocks direct connections, typically mobile
   # data (4G/5G) and some corporate networks. To use it:

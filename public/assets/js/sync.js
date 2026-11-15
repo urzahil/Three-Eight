@@ -16,6 +16,10 @@ export function emptyState() {
 
 function newer(a, b) {
   if (a.seq !== b.seq) return a.seq > b.seq;
+  // At the cap _commit() cannot go higher, so the tie-break by `by` could freeze the room (a hostile peer sending
+  // `by: '\uffff'.repeat(64)` would win every tie) or split it (the committer has the lower id). There the arriving
+  // state wins: last writer wins by arrival. Harmless: a received state is never re-broadcast, so nothing loops.
+  if (a.seq === MAX_SEQ) return true;
   return a.by > b.by;
 }
 
@@ -33,6 +37,58 @@ function cleanMovie(movie) {
     if (typeof d.folder === 'string' && DRIVE_ID.test(d.folder)) rest.drive.folder = d.folder;
   }
   return rest;
+}
+
+// Absolute cap on seq (`seq + 1` stays exact up to here); cleanState() rejects anything above it. A peer can
+// still send a seq at the cap. Then _commit() cannot go higher: it clamps to MAX_SEQ, which is still a value
+// peers accept, and at the cap newer() lets the arriving state win (see there), so every commit is accepted by
+// the others. Nothing throws and nothing is sent that peers would reject.
+const MAX_SEQ = Number.MAX_SAFE_INTEGER - 1;
+const MAX_POS = 1e7; // seconds (about 115 days)
+const MAX_AT = 1e14; // epoch milliseconds (year 5138)
+const MAX_ID = 64; // participant ids are at most 64 characters
+const isNum = (n) => typeof n === 'number' && Number.isFinite(n);
+const short = (v, max) => String(v).slice(0, max);
+const clamp = (n, lo, hi) => (isNum(n) ? Math.min(hi, Math.max(lo, n)) : lo);
+
+/**
+ * Validate and normalise a sync-state from a peer. Returns null when its core fields (seq, by, paused,
+ * pos, at) are unusable or the movie is malformed; the other fields are clamped to sane values.
+ */
+export function cleanState(s) {
+  if (!s || typeof s !== 'object') return null;
+  if (!Number.isSafeInteger(s.seq) || s.seq < 0 || s.seq > MAX_SEQ) return null;
+  if (typeof s.by !== 'string' || !s.by || s.by.length > MAX_ID) return null;
+  if (typeof s.paused !== 'boolean' || !isNum(s.pos) || s.pos < 0 || s.pos > MAX_POS || !isNum(s.at) || s.at < 0 || s.at > MAX_AT) return null;
+  let movie = null;
+  if (s.movie != null) {
+    const m = s.movie;
+    if (typeof m !== 'object' || Array.isArray(m) || typeof m.name !== 'string') return null;
+    movie = cleanMovie({
+      name: short(m.name, 300),
+      size: isNum(m.size) && m.size >= 0 ? m.size : 0,
+      duration: isNum(m.duration) && m.duration >= 0 ? m.duration : 0,
+      ...(m.drive !== undefined && { drive: m.drive }),
+    });
+  }
+  const subFiles = [];
+  if (Array.isArray(s.subFiles)) {
+    for (const f of s.subFiles.slice(0, 50)) {
+      if (f && typeof f.id === 'string' && f.id && typeof f.name === 'string') subFiles.push({ id: short(f.id, 100), name: short(f.name, 120) });
+    }
+  }
+  return {
+    seq: s.seq,
+    by: s.by,
+    movie,
+    paused: s.paused,
+    pos: s.pos,
+    at: s.at,
+    rate: isNum(s.rate) ? Math.min(4, Math.max(0.25, s.rate)) : 1,
+    audio: Number.isSafeInteger(s.audio) ? Math.min(64, Math.max(0, s.audio)) : 0,
+    sub: typeof s.sub === 'string' && s.sub ? short(s.sub, 100) : null,
+    subFiles,
+  };
 }
 
 export function sameMovie(a, b) {
@@ -112,7 +168,10 @@ export class MovieSync extends EventTarget {
 
   // ---- local actions -------------------------------------------------------
   _commit(patch) {
-    const next = { ...this.state, ...patch, seq: this.state.seq + 1, by: this.selfId };
+    // Whatever the patch holds, peers must accept the result: keep every number inside the range cleanState() allows.
+    const next = { ...this.state, ...patch, seq: Math.min(this.state.seq + 1, MAX_SEQ), by: this.selfId };
+    next.pos = clamp(next.pos, 0, MAX_POS);
+    next.at = clamp(next.at, 0, MAX_AT);
     this.state = next;
     this.mesh.broadcast({ type: 'sync-state', state: next });
     this._apply(true);
@@ -306,15 +365,14 @@ export class MovieSync extends EventTarget {
   _onMessage(peer, msg) {
     switch (msg.type) {
       case 'sync-state': {
-        const s = msg.state;
-        if (!s || typeof s.seq !== 'number' || typeof s.by !== 'string') return;
-        if (!newer(s, this.state)) return;
+        const s = cleanState(msg.state);
+        if (!s || !newer(s, this.state)) return;
         const prev = this.state;
-        this.state = { ...emptyState(), ...s, movie: cleanMovie(s.movie) ?? null, subFiles: Array.isArray(s.subFiles) ? s.subFiles.slice(0, 50) : [] };
+        this.state = s;
         if (!sameMovie(prev.movie, this.state.movie)) this.useAnyway = false;
         // Fetch any shared subtitle file we don't have yet.
         for (const f of this.state.subFiles) {
-          if (f && typeof f.id === 'string' && !this.subTexts.has(f.id)) peer.send({ type: 'sub-request', id: f.id });
+          if (!this.subTexts.has(f.id)) peer.send({ type: 'sub-request', id: f.id });
         }
         this._emit('remote-change', { peer, prev, state: this.state });
         this._apply(true);

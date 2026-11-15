@@ -96,7 +96,7 @@ server {
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
-        proxy_set_header Host $host;
+        proxy_set_header Host $http_host;   # keeps a non-default port, so the Host matches the browser's Origin
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_read_timeout 1h;
@@ -104,7 +104,9 @@ server {
 }
 ```
 
-With `TRUST_PROXY=true` (the compose default), the server takes the client IP from `X-Forwarded-For`, which is used for login rate limiting. It also marks the admin cookie `Secure`. If you publish port 4567 directly to the internet without a proxy, set `TRUST_PROXY=false`, or bind the port to localhost only (`"127.0.0.1:4567:4567"`).
+With `TRUST_PROXY=true` (the compose default), the server takes the client IP from `X-Forwarded-For`, which is used for login rate limiting. It also marks the admin cookie `Secure` and sends `Strict-Transport-Security`. `true` (or `1`, `yes`) means one trusted proxy: the server uses the last entry of `X-Forwarded-For`, the one your proxy appended, and ignores anything the client put before it. If there are several proxies in a row (say a CDN in front of nginx), set `TRUST_PROXY` to their number, e.g. `TRUST_PROXY=2`: the client address is then the second entry from the right. Setting it higher than the real number of proxies lets clients spoof their address.
+
+Browsers must open the WebSocket from the same host as the page: the `Origin` header must match the `Host` header your proxy passes on. Use `proxy_set_header Host $http_host;` (as above): `$host` drops the port, so on a non-default port (say `https://calls.example.com:8443`) the two would differ. As a fallback, while `TRUST_PROXY` is on the server also accepts an Origin whose host name equals the Host header's host name, provided the Origin's scheme matches the one the proxy forwards (`X-Forwarded-Proto: https` for an `https://` page) and its port is the default one for that scheme or the one in the Host header; a Host header that is not a plain `name[:port]` is never trusted. Without a trusted proxy the comparison is strict (host and port). Anything else, such as a non-default port while the proxy drops the port from Host, has to be listed in `ALLOWED_ORIGINS`. If the address people use is different from the `Host` header altogether, list it in `ALLOWED_ORIGINS` (e.g. `https://calls.example.com`; a default port or a trailing slash is fine, and entries that are not valid origins are ignored with a warning at startup). If you publish port 4567 directly to the internet without a proxy, set `TRUST_PROXY=false`, or bind the port to localhost only (`"127.0.0.1:4567:4567"`).
 
 **Works on Wi-Fi but not on mobile data?** If the lobby says *Can’t reach the server, retrying…* and then *Could not connect to the server*, the page loaded but the WebSocket (`/ws`) did not get through. Mobile networks (4G/5G) usually connect over IPv6. If your domain has an `AAAA` record, the proxy must forward WebSockets on its IPv6 listener too. Test with `curl -6 -i -N -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' https://three-eight.example.com/ws`, which should answer `101 Switching Protocols`. If you get into the room but a friend's tile stays on *connecting…* / *connection failed*, the problem is the carrier's NAT instead; see [Do I need TURN?](#do-i-need-turn).
 
@@ -211,14 +213,15 @@ Notes:
 | `PORT` | `4567` | HTTP port |
 | `ADMIN_PASSWORD` | random, printed at start | Password for `/admin` |
 | `DATA_DIR` | `./data` (`/data` in Docker) | Where `rooms.json` is stored |
-| `TRUST_PROXY` | `false` (`true` in compose) | Trust `X-Forwarded-For` / `X-Forwarded-Proto` |
+| `TRUST_PROXY` | `false` (`true` in compose) | Trust `X-Forwarded-For` / `X-Forwarded-Proto`: `true`/`1`/`yes` for one proxy, a number for that many proxies in a row |
+| `ALLOWED_ORIGINS` | — | Comma-separated extra origins allowed to open the WebSocket (the page's own host is always allowed); entries are normalised like a browser's Origin, invalid ones are ignored with a warning |
 | `MAX_ROOM_SIZE` | `12` | Max participants per room |
 | `STUN_URLS` | Google + Cloudflare STUN | Comma-separated STUN URLs |
 | `TURN_URLS` | — | Comma-separated TURN URLs (optional) |
 | `TURN_SECRET` | — | coturn `static-auth-secret` (ephemeral credentials) |
 | `TURN_USERNAME` / `TURN_PASSWORD` | — | Static TURN credentials (alternative to the secret) |
 | `GOOGLE_SERVICE_ACCOUNT` | — | Path to a Google service account JSON key, for room Drive folders (optional, see above) |
-| `DRIVE_CACHE_MB` | `256` | Memory for the movie cache while streaming from Drive |
+| `DRIVE_CACHE_MB` | `256` | Memory for the movie cache while streaming from Drive (minimum `32`; lower values are raised) |
 | `TLS_CERT` / `TLS_KEY` | — | Serve HTTPS directly instead of using a proxy |
 
 ### Do I need TURN?
@@ -287,6 +290,15 @@ node test/drive-check.js
 ```bash
 node test/share-check.js
 ```
+
+To run all of the browser checks in one go (it generates the fixtures if they are missing, starts a server for each script that needs one, and prints one PASS/FAIL line per script):
+
+```bash
+npx playwright install chromium   # once
+npm run test:browser              # or name some: npm run test:browser -- e2e lobby-check
+```
+
+It needs ffmpeg and Playwright's Chromium. Each script gets 5 minutes before it counts as failed. CI runs the same command in the `browser` job.
 
 `drive-check.js` starts its own server as a service account against a fake Google (`test/fake-google.js`): browsing a folder and its subfolders, streaming a movie through the remuxer and natively (without MSE), room sync while streaming, subtitles from the folder, a download quota error, two viewers sharing one fetch from Google, three viewers sharing a film (it counts the bytes our server sends, which should be about one copy; one viewer then freezes and leaves, and the others keep playing), a token refresh on reconnect, live changes to the room's folder, and a check that the browser never contacts Google. `share-check.js` tests a room without Drive: one person opens a file, a friend streams it from their copy, with sync, seeking and audio changes, and the Settings opt-out. `npm test` also runs unit tests for the sharing protocol (`test/swarm.test.mjs`). `player-check.js` tests the in-browser player on its own: native or remux mode, audio track switching, seeking and subtitles. `e2e.js` tests the whole flow: the admin creates a room, a wrong password is rejected, two people join with fake cameras, video flows peer to peer, mute and camera state and chat arrive on the other side, and the movie syncs. The movie part covers play, pause, seeking, audio and subtitle changes, a shared subtitle file, and a late joiner. Finally the admin deletes the room and everyone is disconnected. `pip-check.js` tests picture-in-picture: the Document PiP window (the movie box moves there, subtitles still render, controls inside it drive the other person, and closing it brings the player back), the native-PiP fallback (the subtitles are mirrored into a caption track, and a pause made directly on the `<video>` reaches the room), and the compact style (chosen in Settings: the canvas stream is in native PiP, the subtitles and video are drawn on the canvas, a pause on the PiP element reaches the room, and leaving PiP cleans up).
 

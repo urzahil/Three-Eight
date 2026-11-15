@@ -6,7 +6,8 @@
   "private": true,
   "scripts": {
     "start": "node server/server.js",
-    "test": "node --test test/server.test.js test/parsers.test.mjs test/remotefile.test.mjs test/drive.test.mjs test/swarm.test.mjs"
+    "test": "node --test test/server.test.js test/parsers.test.mjs test/remotefile.test.mjs test/drive.test.mjs test/swarm.test.mjs test/sync.test.mjs",
+    "test:browser": "node test/run-browser.js"
   },
   "engines": {
     "node": ">=18"
@@ -14,5 +15,8 @@
   "license": "GPL-3.0",
   "dependencies": {
     "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "playwright": "1.63.0"
   }
 }
