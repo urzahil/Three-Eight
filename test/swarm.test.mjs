@@ -3,8 +3,9 @@
 // Run with: node --test test/swarm.test.mjs
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import nodeCrypto from 'node:crypto';
 import './browser-globals.mjs';
-import { sanitizeCues, MAX_CUES, Swarm, T, DENIED, HEADER, MAX_FRAME, MAX_PAYLOAD, assignFetcher, decodeFrame, encodeFrame, filmKey, keyId, mergeRanges, parseHave, movieKeys } from '../public/assets/js/player/swarm.js';
+import { sanitizeCues, MAX_CUES, Swarm, T, DENIED, HEADER, MAX_FRAME, MAX_PAYLOAD, assignFetcher, decodeFrame, encodeFrame, filmKey, keyId, mergeRanges, parseHave, movieKeys, computeFingerprint, fingerprintRanges, sizeKey, FP_RE } from '../public/assets/js/player/swarm.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const P = 256 * 1024; // piece size used here (the real one is 1 MiB)
@@ -15,6 +16,18 @@ function makeData(n) {
   for (let i = 0; i < n; i++) b[i] = (i * 131 + (i >> 9) * 7) & 255;
   return b;
 }
+
+/** The fingerprint computed independently with node's crypto (the swarm uses crypto.subtle): same bytes, same value. */
+function fpSync(data) {
+  const h = nodeCrypto.createHash('sha256');
+  const head = Buffer.alloc(8);
+  head.writeUInt32BE(Math.floor(data.length / 2 ** 32), 0);
+  head.writeUInt32BE(data.length >>> 0, 4);
+  h.update(head);
+  for (const [a, b] of fingerprintRanges(data.length)) h.update(data.subarray(a, b));
+  return h.digest('hex').slice(0, 32);
+}
+const keyOf = (data) => `s:${data.length}:${fpSync(data)}`;
 
 // ---- a tiny network of fake meshes ----------------------------------------------------------------------------
 class FakeMesh extends EventTarget {
@@ -93,10 +106,12 @@ class Net {
 
 /** A server serving `data` with Range, counting requests. `delay` makes it slow; aborting is observable. */
 function makeServer(data, { delay = 0 } = {}) {
-  const calls = [];
+  const calls = []; // reads of film data
+  const fpCalls = []; // the small reads a Drive film makes to fingerprint itself
+  const fpRanges = new Set(fingerprintRanges(data.length).map(([a, b]) => `${a}-${b - 1}`));
   const fn = async (start, end, signal) => {
     const call = { start, end, aborted: false };
-    calls.push(call);
+    (fpRanges.has(`${start}-${end}`) ? fpCalls : calls).push(call);
     signal?.addEventListener('abort', () => { call.aborted = true; });
     if (delay) {
       await new Promise((resolve, reject) => {
@@ -107,11 +122,12 @@ function makeServer(data, { delay = 0 } = {}) {
     return new Response(data.subarray(start, end + 1), { status: 206 });
   };
   fn.calls = calls;
+  fn.fpCalls = fpCalls;
   return fn;
 }
 
 const driveFile = (swarm, data, server, o = {}) => swarm.openRemote({ name: 'm.mkv', size: data.length, drive: { id: 'DRIVEFILE_0001' }, server, blockSize: BS, readAhead: false, minRequest: BS, retries: 0, ...o });
-const peerFile = (swarm, data, o = {}) => swarm.openRemote({ name: 'm.mkv', size: data.length, blockSize: BS, readAhead: false, minRequest: BS, retries: 0, networkRetryDelay: 1, ...o });
+const peerFile = (swarm, data, o = {}) => swarm.openRemote({ name: 'm.mkv', size: data.length, fp: fpSync(data), blockSize: BS, readAhead: false, minRequest: BS, retries: 0, networkRetryDelay: 1, ...o });
 const read = async (rf, a, b) => Buffer.from(await rf.slice(a, b).arrayBuffer());
 
 // ---- pure functions ----------------------------------------------------------------------------------------------
@@ -202,8 +218,8 @@ test('peer with a whole copy: pieces are requested from it and spread over the h
   const rf = peerFile(a.swarm, data);
   rf.swarm.activate();
   await sleep(30);
-  assert.deepEqual(a.swarm.holders({ size: data.length }), ['h1', 'h2']);
-  assert.deepEqual(a.swarm.holders({ size: data.length + 1 }), [], 'a movie of another size has no holders');
+  assert.deepEqual(a.swarm.holders({ size: data.length, fp: fpSync(data) }), ['h1', 'h2']);
+  assert.deepEqual(a.swarm.holders({ size: data.length + 1, fp: fpSync(data) }), [], 'a movie of another size has no holders');
   assert((await read(rf, 0, data.length)).equals(data), 'whole file, read through the swarm, is intact');
   const asked = (id) => a.mesh.out(T.WANT).filter((x) => x.to === id).map((x) => x.f.piece).sort();
   assert.deepEqual(asked('h1'), [0, 2, 4], 'sorted holders [h1, h2]: piece mod 2');
@@ -250,10 +266,10 @@ test('a holder that turned sharing off denies; the next holder is tried, and a f
   assert.deepEqual(h1.mesh.out(T.DENY).map((x) => x.f.flags), [DENIED.UNAVAILABLE]);
   h1.swarm.setShare(false); // now it tells everybody
   await sleep(20);
-  assert.deepEqual(a.swarm.holders({ size: data.length }), ['h2'], 'h1 now advertises nothing');
+  assert.deepEqual(a.swarm.holders({ size: data.length, fp: fpSync(data) }), ['h2'], 'h1 now advertises nothing');
   h2.swarm.setShare(false);
   await sleep(20);
-  assert.deepEqual(a.swarm.holders({ size: data.length }), []);
+  assert.deepEqual(a.swarm.holders({ size: data.length, fp: fpSync(data) }), []);
   await assert.rejects(read(rf, P, 2 * P), /Nobody is sharing/);
   net.closeAll();
 });
@@ -581,14 +597,14 @@ test('advertising: sent to new peers, on change (throttled), and cleared when th
   b.mesh.addEventListener('message', (e) => seen.push(e.detail.msg));
   a.swarm.openLocal(new Blob([data]));
   await sleep(120);
-  assert.deepEqual(seen.map((m) => [m.key, m.local]), [[`s:${data.length}`, true]]);
-  assert.deepEqual(b.swarm.holders({ size: data.length }), ['a']);
+  assert.deepEqual(seen.map((m) => [m.key, m.local]), [[keyOf(data), true]]);
+  assert.deepEqual(b.swarm.holders({ size: data.length, fp: fpSync(data) }), ['a']);
   // a new peer gets it as soon as its channel opens
   const c = net.node('c');
   net.connect('a', 'b', 'c');
   a.mesh.dispatchEvent(new CustomEvent('channel-open', { detail: { peer: { id: 'c' } } }));
   await sleep(20);
-  assert.deepEqual(c.swarm.holders({ size: data.length }), ['a']);
+  assert.deepEqual(c.swarm.holders({ size: data.length, fp: fpSync(data) }), ['a']);
   // many changes in a row make at most one message per throttle period
   seen.length = 0;
   for (let i = 0; i < 20; i++) {
@@ -600,7 +616,7 @@ test('advertising: sent to new peers, on change (throttled), and cleared when th
   a.swarm.closeFilm();
   await sleep(150);
   assert.equal(seen.at(-1).key, null);
-  assert.deepEqual(b.swarm.holders({ size: data.length }), []);
+  assert.deepEqual(b.swarm.holders({ size: data.length, fp: fpSync(data) }), []);
   net.closeAll();
 });
 
@@ -666,8 +682,8 @@ test('planner: a streamer with the piece cached, else the assigned fetcher, else
   const rf = peerFile(me.swarm, data);
   rf.swarm.activate();
   const film = me.swarm.film;
-  const have = (id, o) => me.swarm.have.set(id, { key: `s:${data.length}`, local: false, ranges: [], via: 'peers', ...o });
-  me.swarm.have.set('s', { key: `s:${data.length}`, local: true, ranges: [[0, 5]], via: 'file' });
+  const have = (id, o) => me.swarm.have.set(id, { key: keyOf(data), local: false, ranges: [], via: 'peers', ...o });
+  me.swarm.have.set('s', { key: keyOf(data), local: true, ranges: [[0, 5]], via: 'file' });
   // streamers [a, m, z] (sorted, with me): piece p -> p mod 3; when it is me the plan has no friend (go to the origin)
   have('a');
   have('z');
@@ -724,7 +740,7 @@ test('a fetcher that is asked for a piece goes to the origin only, never to anot
   fc.swarm.activate();
   await sleep(40);
   // c asks b for piece 1 (b has nothing): b must fetch it from s, and ask nobody else
-  net.film('c', 'b', encodeFrame({ type: T.WANT, req: 7, key: keyId(`s:${data.length}`), piece: 1 }));
+  net.film('c', 'b', encodeFrame({ type: T.WANT, req: 7, key: keyId(keyOf(data)), piece: 1 }));
   await sleep(60);
   assert.deepEqual(b.mesh.out(T.WANT).map((x) => [x.to, x.f.piece]), [['s', 1]]);
   assert.deepEqual(c.mesh.out(T.WANT).length, 0);
@@ -962,5 +978,162 @@ test('a peer that leaves while pieces are queued for it frees them at once', asy
   const t0 = Date.now();
   assert((await pending).equals(data));
   assert(Date.now() - t0 < 500, 'no waiting for the long timeouts');
+  net.closeAll();
+});
+
+// ---- content fingerprints -------------------------------------------------------------------------------------
+test('fingerprint: SHA-256 over the size and the first, middle and last 64 KiB; the same bytes give the same value anywhere', async () => {
+  const data = makeData(3 * P + 17);
+  const fp = await computeFingerprint(data.length, async (a, b) => new Uint8Array(data.subarray(a, b)));
+  assert.match(fp, FP_RE);
+  assert.equal(fp, fpSync(data), 'matches an independent implementation');
+  assert.equal(await computeFingerprint(data.length, async (a, b) => new Uint8Array(Buffer.from(data).subarray(a, b))), fp, 'a copy of the file');
+  // a changed byte in each sampled region changes it ...
+  for (const at of [0, 65535, data.length >> 1, data.length - 1, data.length - 65536]) {
+    const other = Buffer.from(data);
+    other[at] ^= 1;
+    assert.notEqual(fpSync(other), fp, `byte ${at}`);
+  }
+  // ... and so does the size (same samples, longer file)
+  assert.notEqual(fpSync(Buffer.concat([data, Buffer.from([1])])), fp);
+  // what lies between the samples is not looked at (the documented limit of a sampled fingerprint)
+  const between = Buffer.from(data);
+  between[100 * 1024] ^= 1;
+  assert.equal(fpSync(between), fp);
+});
+
+test('fingerprint: small files, empty files, and short reads', async () => {
+  assert.deepEqual(fingerprintRanges(0), []);
+  assert.deepEqual(fingerprintRanges(10), [[0, 10]]);
+  assert.deepEqual(fingerprintRanges(100 * 1024), [[0, 100 * 1024]], 'overlapping samples merge');
+  assert.deepEqual(fingerprintRanges(10 * 1024 * 1024), [[0, 65536], [5 * 1024 * 1024 - 32768, 5 * 1024 * 1024 + 32768], [10 * 1024 * 1024 - 65536, 10 * 1024 * 1024]]);
+  const tiny = makeData(10);
+  assert.equal(await computeFingerprint(10, async (a, b) => new Uint8Array(tiny.subarray(a, b))), fpSync(tiny));
+  assert.equal(await computeFingerprint(0, async () => new Uint8Array(0)), null);
+  await assert.rejects(computeFingerprint(1000, async () => new Uint8Array(5)), /fingerprint/);
+});
+
+test('keys: the size key carries the fingerprint; a movie names itself with it', () => {
+  const fp = 'ab'.repeat(16);
+  assert.equal(sizeKey(5, fp), `s:5:${fp}`);
+  assert.equal(sizeKey(5, ''), 's:5');
+  assert.equal(filmKey({ size: 5, fp }), `s:5:${fp}`);
+  assert.equal(filmKey({ drive: { id: 'ABC' }, size: 5, fp }), 'd:ABC');
+  assert.deepEqual(movieKeys({ size: 5, fp, drive: { id: 'ABCDEFGHIJ' } }), ['d:ABCDEFGHIJ', `s:5:${fp}`]);
+  assert.deepEqual(movieKeys({ size: 5, fp: 'not a fingerprint' }), ['s:5']);
+  assert.equal(parseHave({ key: `s:5:${fp}`, local: true, ranges: [[0, 1]] }).key, `s:5:${fp}`);
+  for (const bad of [`s:5:${fp.toUpperCase()}`, 's:5:abc', `s:5:${fp}00`, `s:5:${fp}:1`]) assert.equal(parseHave({ key: bad, local: true, ranges: [] }), null, bad);
+});
+
+test('a local file is advertised with its fingerprint, and only once it is known', async () => {
+  const net = new Net();
+  const data = makeData(2 * P);
+  const a = net.node('a');
+  const b = net.node('b');
+  net.connect('a', 'b');
+  const film = a.swarm.openLocal(new Blob([data]));
+  assert.equal(film.fp, null);
+  assert.equal(a.swarm._haveMessage().key, null, 'nothing is advertised while the fingerprint is computed');
+  assert.equal(await film.ready, fpSync(data));
+  assert.equal(film.key, keyOf(data));
+  await sleep(20);
+  assert.equal(b.swarm.have.get('a').key, keyOf(data));
+  net.closeAll();
+});
+
+test('swarm: a copy of the same size but other content is never asked for pieces; the server serves a Drive film', async () => {
+  const net = new Net();
+  const data = makeData(3 * P);
+  const impostor = Buffer.from(data);
+  impostor[10] ^= 0xff; // same size, different file
+  const server = makeServer(data);
+  const h = net.node('h');
+  const a = net.node('a');
+  net.connect('h', 'a');
+  h.swarm.openLocal(new Blob([impostor]));
+  const fa = driveFile(a.swarm, data, server);
+  fa.swarm.activate();
+  await sleep(40);
+  assert.equal(a.swarm.have.get('h').local, true, 'it advertises a whole copy of that size');
+  assert.deepEqual(a.swarm.holders({ size: data.length, fp: fpSync(data), drive: { id: 'DRIVEFILE_0001' } }), [], 'but it is not a holder of this film');
+  const got = await read(fa, 0, 3 * P);
+  assert(got.equals(data), 'the bytes are the Drive file\'s, none of the impostor\'s');
+  assert.equal(a.mesh.out(T.WANT).length, 0, 'the other copy was not asked');
+  assert.equal(h.mesh.out(T.DATA).length, 0);
+  assert.equal(server.fpCalls.length, 3, 'the fingerprint was read from the server (once)');
+  assert.equal(a.swarm.stats.server, 3 * P);
+  net.closeAll();
+});
+
+test('swarm: a Drive film is fingerprinted lazily, once, and a copy with the same content then serves it', async () => {
+  const net = new Net();
+  const data = makeData(3 * P);
+  const server = makeServer(data);
+  const a = net.node('a');
+  const h = net.node('h');
+  net.connect('a', 'h');
+  const fa = driveFile(a.swarm, data, server);
+  fa.swarm.activate();
+  await sleep(20);
+  assert.equal(server.fpCalls.length, 0, 'nobody has a copy: nothing to compare with, nothing fetched');
+  assert.deepEqual([...fa.swarm.keys], ['d:DRIVEFILE_0001']);
+  h.swarm.openLocal(new Blob([data])); // a renamed copy: only the bytes count
+  await sleep(40);
+  assert.equal(server.fpCalls.length, 3, 'a friend with a file of that size appeared: the film fingerprints itself');
+  assert.deepEqual([...fa.swarm.keys].sort(), ['d:DRIVEFILE_0001', keyOf(data)].sort());
+  assert.deepEqual(a.swarm.holders({ size: data.length, drive: { id: 'DRIVEFILE_0001' } }), ['h'], 'found through the open film\'s names');
+  assert((await read(fa, 0, P)).equals(data.subarray(0, P)));
+  assert.equal(a.mesh.out(T.WANT)[0].to, 'h', 'the copy was the origin');
+  assert.equal(server.calls.length, 0);
+  await read(fa, P, 2 * P);
+  assert.equal(server.fpCalls.length, 3, 'once per film');
+  net.closeAll();
+});
+
+test('swarm: a film streamed from friends only accepts holders with its fingerprint', async () => {
+  const net = new Net();
+  const data = makeData(2 * P);
+  const impostor = Buffer.from(data);
+  impostor[data.length - 5] ^= 1;
+  const good = net.node('good');
+  const bad = net.node('bad');
+  const a = net.node('a', { firstByteMs: 200 });
+  net.connect('good', 'bad', 'a');
+  good.swarm.openLocal(new Blob([data]));
+  bad.swarm.openLocal(new Blob([impostor]));
+  const rf = peerFile(a.swarm, data, { retries: 0 });
+  rf.swarm.activate();
+  await sleep(40);
+  assert.deepEqual(a.swarm.holders({ size: data.length, fp: fpSync(data) }), ['good']);
+  assert((await read(rf, 0, 2 * P)).equals(data));
+  assert(a.mesh.out(T.WANT).every((x) => x.to === 'good'), 'the impostor was never asked');
+  // and when only the impostor is left, there is nobody to ask (rather than wrong bytes)
+  good.swarm.closeFilm();
+  await sleep(20);
+  const rf2 = peerFile(net.node('c').swarm, data, { retries: 0 });
+  net.connect('good', 'bad', 'a', 'c');
+  rf2.swarm.activate();
+  await sleep(40);
+  await assert.rejects(read(rf2, 0, P), /Nobody is sharing|Could not get/);
+  assert.equal(net.nodes.get('c').mesh.out(T.WANT).length, 0);
+  net.closeAll();
+});
+
+test('swarm: a holder serves a want only for its own fingerprint key', async () => {
+  const net = new Net();
+  const data = makeData(2 * P);
+  const h = net.node('h');
+  const x = net.node('x');
+  net.connect('h', 'x');
+  const film = h.swarm.openLocal(new Blob([data]));
+  await film.ready;
+  const asked = [];
+  x.mesh.addEventListener('film', (e) => asked.push(decodeFrame(e.detail.data)));
+  net.film('x', 'h', encodeFrame({ type: T.WANT, req: 3, key: keyId(`s:${data.length}`), piece: 0 })); // the old size-only key
+  net.film('x', 'h', encodeFrame({ type: T.WANT, req: 4, key: keyId(keyOf(data)), piece: 0 }));
+  await sleep(60);
+  assert.deepEqual(asked.filter((f) => f.type === T.DENY).map((f) => [f.req, f.flags]), [[3, DENIED.UNAVAILABLE]]);
+  assert(asked.some((f) => f.type === T.DATA && f.req === 4));
+  assert(!asked.some((f) => f.type === T.DATA && f.req === 3));
   net.closeAll();
 });

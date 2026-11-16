@@ -6,11 +6,15 @@ services:
     container_name: three-eight
     restart: unless-stopped
     ports:
-      - "4567:4567"
+      # Bound to this machine only: suits a reverse proxy on the same host (it forwards to 127.0.0.1:4567).
+      # For a proxy in another container, put both on a shared Docker network and drop "ports" instead of
+      # publishing the port. Publish it on all interfaces ("4567:4567") only if nothing sits in front.
+      - "127.0.0.1:4567:4567"
     environment:
       # Password for https://<your-host>/admin (required).
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Set ADMIN_PASSWORD in .env}
-      # The app runs behind a TLS reverse proxy (needed for camera/mic access).
+      # The app runs behind a TLS reverse proxy (needed for camera/mic access). Keep "true" only while the app is
+      # reachable solely through that proxy (see "ports"): otherwise clients could forge X-Forwarded-For.
       # (A number instead of "true" means that many proxies in a row, e.g. "2" for CDN + reverse proxy.)
       TRUST_PROXY: "true"
       # Max participants per room (default 12). Each person sends video to everyone else, so >8 gets heavy.

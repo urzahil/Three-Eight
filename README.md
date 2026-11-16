@@ -19,7 +19,7 @@ Video meetups and movie nights with friends, entirely in the browser (Chrome, Fi
 - **Server** (`server/`): Node.js with one dependency (`ws`). It serves the static app, stores rooms and their scrypt-hashed passwords in `/data/rooms.json`, checks the password when someone joins, relays WebRTC offers, answers and ICE candidates between members of the same room, and answers clock-sync pings. If a room has a Google Drive folder, it also reads that folder as a Google service account and streams the movies to the room's members (`server/drive.js`).
 - **Calls** (`public/assets/js/mesh.js`): a full mesh with one `RTCPeerConnection` per pair of people. Each person uploads one stream per friend, and video bitrate goes down automatically as the room grows. This works best with up to about 6–8 people.
 - **Movie sync** (`public/assets/js/sync.js`): everyone shares a small playback state: playing or paused, position, timestamp on the shared server clock, audio track and subtitle track. Any change is broadcast over WebRTC data channels and the newest change wins. Each browser works out where the movie should be right now and corrects drift. It speeds up or slows down by a few percent for small offsets and seeks for large ones. In testing, browsers stayed within about 10 ms of each other.
-- **Movie files are never stored on the server.** A movie is a local file, or comes from the room's Google Drive folder, which the server reads from Google and streams on (nothing is written to its disk). Movie data now also travels *between browsers*: viewers send each other pieces of the film over a second WebRTC data channel (`public/assets/js/player/swarm.js`), and a friend without the file can stream it from someone's copy. The page compares file size and name to warn when someone has a different file; there are no checksums, so sharing relies on the same trust as picking a matching file: it's meant for friends.
+- **Movie files are never stored on the server.** A movie is a local file, or comes from the room's Google Drive folder, which the server reads from Google and streams on (nothing is written to its disk). Movie data now also travels *between browsers*: viewers send each other pieces of the film over a second WebRTC data channel (`public/assets/js/player/swarm.js`), and a friend without the file can stream it from someone's copy. The page compares the files (size, duration and a sampled content fingerprint) to warn when someone has a different file, and pieces are only exchanged between identical fingerprints; there are no per-piece checksums, so sharing still relies on the trust of a room of friends.
 
 ### Audio tracks and subtitles in every browser
 
@@ -58,7 +58,7 @@ cp .env.example .env        # set ADMIN_PASSWORD
 docker compose up -d --build
 ```
 
-The server listens on **port 4567**. Rooms are kept in the `three-eight-data` volume.
+The server listens on **port 4567**, published on `127.0.0.1` only, which suits a TLS reverse proxy on the same host (see below). If your proxy runs in another container, put both on a shared Docker network and remove the `ports` entry instead of publishing the port. Only if nothing sits in front of the app, publish it on all interfaces (`"4567:4567"`) and set `TRUST_PROXY=false`. Rooms are kept in the `three-eight-data` volume.
 
 Or without compose:
 
@@ -67,7 +67,7 @@ docker build -t three-eight .
 ```
 
 ```bash
-docker run -d --name three-eight -p 4567:4567 -e ADMIN_PASSWORD=change-me -e TRUST_PROXY=true -v three-eight-data:/data three-eight
+docker run -d --name three-eight -p 127.0.0.1:4567:4567 -e ADMIN_PASSWORD=change-me -e TRUST_PROXY=true -v three-eight-data:/data three-eight
 ```
 
 ### HTTPS is required
@@ -104,9 +104,9 @@ server {
 }
 ```
 
-With `TRUST_PROXY=true` (the compose default), the server takes the client IP from `X-Forwarded-For`, which is used for login rate limiting. It also marks the admin cookie `Secure` and sends `Strict-Transport-Security`. `true` (or `1`, `yes`) means one trusted proxy: the server uses the last entry of `X-Forwarded-For`, the one your proxy appended, and ignores anything the client put before it. If there are several proxies in a row (say a CDN in front of nginx), set `TRUST_PROXY` to their number, e.g. `TRUST_PROXY=2`: the client address is then the second entry from the right. Setting it higher than the real number of proxies lets clients spoof their address.
+With `TRUST_PROXY=true` (the compose default, which assumes the app is reachable only through your proxy, as the localhost-only port mapping ensures), the server takes the client IP from `X-Forwarded-For`, which is used for login rate limiting. It also marks the admin cookie `Secure` and sends `Strict-Transport-Security`. `true` (or `1`, `yes`) means one trusted proxy: the server uses the last entry of `X-Forwarded-For`, the one your proxy appended, and ignores anything the client put before it. If there are several proxies in a row (say a CDN in front of nginx), set `TRUST_PROXY` to their number, e.g. `TRUST_PROXY=2`: the client address is then the second entry from the right. Setting it higher than the real number of proxies lets clients spoof their address.
 
-Browsers must open the WebSocket from the same host as the page: the `Origin` header must match the `Host` header your proxy passes on. Use `proxy_set_header Host $http_host;` (as above): `$host` drops the port, so on a non-default port (say `https://calls.example.com:8443`) the two would differ. As a fallback, while `TRUST_PROXY` is on the server also accepts an Origin whose host name equals the Host header's host name, provided the Origin's scheme matches the one the proxy forwards (`X-Forwarded-Proto: https` for an `https://` page) and its port is the default one for that scheme or the one in the Host header; a Host header that is not a plain `name[:port]` is never trusted. Without a trusted proxy the comparison is strict (host and port). Anything else, such as a non-default port while the proxy drops the port from Host, has to be listed in `ALLOWED_ORIGINS`. If the address people use is different from the `Host` header altogether, list it in `ALLOWED_ORIGINS` (e.g. `https://calls.example.com`; a default port or a trailing slash is fine, and entries that are not valid origins are ignored with a warning at startup). If you publish port 4567 directly to the internet without a proxy, set `TRUST_PROXY=false`, or bind the port to localhost only (`"127.0.0.1:4567:4567"`).
+Browsers must open the WebSocket from the same host as the page: the `Origin` header must match the `Host` header your proxy passes on. Use `proxy_set_header Host $http_host;` (as above): `$host` drops the port, so on a non-default port (say `https://calls.example.com:8443`) the two would differ. As a fallback, while `TRUST_PROXY` is on the server also accepts an Origin whose host name equals the Host header's host name, provided the Origin's scheme matches the one the proxy forwards (`X-Forwarded-Proto: https` for an `https://` page) and its port is the default one for that scheme or the one in the Host header; a Host header that is not a plain `name[:port]` is never trusted. Without a trusted proxy the comparison is strict (host and port). Anything else, such as a non-default port while the proxy drops the port from Host, has to be listed in `ALLOWED_ORIGINS`. If the address people use is different from the `Host` header altogether, list it in `ALLOWED_ORIGINS` (e.g. `https://calls.example.com`; a default port or a trailing slash is fine, and entries that are not valid origins are ignored with a warning at startup). If you publish port 4567 directly to the internet without a proxy, set `TRUST_PROXY=false` (the compose file already binds the port to localhost only).
 
 **Works on Wi-Fi but not on mobile data?** If the lobby says *Can’t reach the server, retrying…* and then *Could not connect to the server*, the page loaded but the WebSocket (`/ws`) did not get through. Mobile networks (4G/5G) usually connect over IPv6. If your domain has an `AAAA` record, the proxy must forward WebSockets on its IPv6 listener too. Test with `curl -6 -i -N -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' https://three-eight.example.com/ws`, which should answer `101 Switching Protocols`. If you get into the room but a friend's tile stays on *connecting…* / *connection failed*, the problem is the carrier's NAT instead; see [Do I need TURN?](#do-i-need-turn).
 
@@ -145,7 +145,7 @@ Whatever the source, playback is the same: everyone sees the same moment of the 
 
 ### Your own copy
 
-Everyone opens their own copy of the same file, and only play/pause/seek and track choices travel between browsers. This is the original Three-Eight way and the lightest one: nothing is uploaded or downloaded. The page compares file size and name, and warns when someone picks a different file (you can then use it just for yourself, or switch everyone to it). Opening your own copy is always possible, even when friends are streaming, and saves your connection if you have the file anyway.
+Everyone opens their own copy of the same file, and only play/pause/seek and track choices travel between browsers. This is the original Three-Eight way and the lightest one: nothing is uploaded or downloaded. The page compares the files (size and duration, plus a fingerprint of the file's content when the browser can compute one; a renamed copy still matches), and warns when someone picks a different file (you can then use it just for yourself, or switch everyone to it). Opening your own copy is always possible, even when friends are streaming, and saves your connection if you have the file anyway.
 
 ### Streaming from a friend's copy
 
@@ -167,9 +167,9 @@ If the admin attached a Google Drive folder to the room ([setup below](#google-d
 
 ### Mixing sources
 
-People in one room can mix the three: some open their own copy, some stream. Anyone who has the film open from their device is also a source for the others, including for Drive films (when the file sizes match), which takes load off the server. A viewer can switch at any time: open the **Movie** dialog to use their own copy, or **Stop using my file** to go back to streaming.
+People in one room can mix the three: some open their own copy, some stream. Anyone who has the film open from their device is also a source for the others, including for Drive films (when the files match, see below), which takes load off the server. A viewer can switch at any time: open the **Movie** dialog to use their own copy, or **Stop using my file** to go back to streaming.
 
-There are no checksums: files are matched by size (and name), so sharing relies on the same trust as picking a matching file. It's meant for friends.
+Files are matched by size and a **content fingerprint**: a SHA-256 over the size and three 64 KiB samples (the start, the middle and the end of the file). A local file computes it from the file on your device; a Drive film reads the same three ranges from the server, once, and only when a friend has a copy of the same size to compare with. Viewers exchange film pieces only when the fingerprints are equal, so a different file that happens to have the same size is never mixed in (it is just not used as a source), and renaming a file doesn't matter. This is a sample, not a checksum of every byte: it catches a different file, not one that differs only between the samples, and pieces have no individual hashes. A friend who deliberately sends wrong bytes can still make your player show garbage, so sharing relies on the trust of a room of friends. Without a secure context (plain `http`) the browser has no `crypto.subtle`; viewers then fall back to matching by size alone, and only with each other.
 
 ### Subtitles
 

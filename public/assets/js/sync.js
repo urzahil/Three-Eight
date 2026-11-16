@@ -69,6 +69,7 @@ export function cleanState(s) {
       size: isNum(m.size) && m.size >= 0 ? m.size : 0,
       duration: isNum(m.duration) && m.duration >= 0 ? m.duration : 0,
       ...(m.drive !== undefined && { drive: m.drive }),
+      ...(typeof m.fp === 'string' && FP_RE.test(m.fp) && { fp: m.fp }),
     });
   }
   const subFiles = [];
@@ -91,10 +92,23 @@ export function cleanState(s) {
   };
 }
 
+const DURATION_TOLERANCE = 2; // seconds
+const FP_RE = /^[0-9a-f]{32}$/; // content fingerprint (swarm.js computeFingerprint), optional in a movie
+
+/**
+ * Is `b` the film `a` describes? When both carry a content fingerprint (a sample of the file's bytes, see
+ * swarm.js), it decides. Otherwise equal sizes match even when the names differ (a renamed copy), unless both
+ * durations are known and differ: two different films of the same size are rare but not impossible. Without
+ * a usable size, the name and the duration decide.
+ */
 export function sameMovie(a, b) {
   if (!a || !b) return false;
-  if (a.size && b.size && a.size === b.size) return true;
-  return a.name === b.name && Math.abs((a.duration || 0) - (b.duration || 0)) < 2;
+  if (a.fp && b.fp) return a.fp === b.fp;
+  const da = a.duration || 0;
+  const db = b.duration || 0;
+  const durationsDiffer = da > 0 && db > 0 && Math.abs(da - db) >= DURATION_TOLERANCE;
+  if (a.size && b.size && a.size === b.size) return !durationsDiffer;
+  return a.name === b.name && Math.abs(da - db) < DURATION_TOLERANCE;
 }
 
 export class MovieSync extends EventTarget {
