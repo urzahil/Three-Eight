@@ -46,24 +46,25 @@ export class LocalMedia extends EventTarget {
     }
   }
 
-  /** Acquire devices according to the current on/off preferences. */
+  /**
+   * Acquire devices according to the current on/off preferences. A device that is switched off is not
+   * requested at all (no permission prompt, no recording indicator); setMic()/setCam() acquire it on demand.
+   */
   async init() {
-    // Ask for both at once so the browser shows a single permission prompt.
     if (this.micOn || this.camOn) {
+      // Ask for both at once so the browser shows a single permission prompt.
       try {
         const s = await navigator.mediaDevices.getUserMedia({
-          audio: this._audioConstraints(),
+          audio: this.micOn ? this._audioConstraints() : false,
           video: this.camOn ? this._videoConstraints() : false,
         });
         this._adopt('audio', s.getAudioTracks()[0]);
         this._adopt('video', s.getVideoTracks()[0]);
       } catch {
         // Try separately: maybe only one device exists or is allowed.
-        await this._acquire('audio');
+        if (this.micOn) await this._acquire('audio');
         if (this.camOn) await this._acquire('video');
       }
-    } else {
-      await this._acquire('audio');
     }
     // The page may have been left while the permission prompt was open: don't keep the devices then.
     if (this.stopped) {

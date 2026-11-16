@@ -4,6 +4,20 @@
 
 const CHUNK = 12 * 1024;
 
+// Limits for chunked JSON messages on the data channel. A peer is not trusted: everything it sends is
+// bounded, so a malicious one cannot make us allocate or loop without limit.
+// sync.js accepts subtitle text up to 5 MiB; JSON escaping can inflate it, so the cap sits well above that.
+const MAX_MESSAGE = 12 * 1024 * 1024; // chars of one reassembled message
+const MAX_CHUNKS = Math.ceil(MAX_MESSAGE / CHUNK);
+const MAX_MID = 32; // chars of a message id
+const MAX_ASSEMBLIES = 12; // messages being reassembled at once, per peer
+const MAX_BUFFERED = 2 * MAX_MESSAGE; // chars held by all unfinished messages of a peer
+const ASSEMBLY_TIMEOUT_MS = 30 * 1000; // an unfinished message is dropped when its last chunk is this old
+
+// The JSON channel queues outgoing chunks while more than DATA_HIGH bytes are buffered, like the film channel.
+const DATA_HIGH = 1024 * 1024;
+const DATA_LOW = 256 * 1024;
+
 // The film channel carries binary film pieces only, so they never queue up in front of chat and sync
 // messages on the JSON channel. Sends wait in a queue while more than FILM_HIGH bytes are buffered.
 const FILM_HIGH = 1024 * 1024;
@@ -30,6 +44,118 @@ function videoBudget(peerCount, lowPower) {
   return kbps * 1000;
 }
 
+/**
+ * Puts the chunks of one message back together. Strict on purpose: the first chunk of a message id fixes its
+ * chunk count, every chunk must be in range with a bounded size, and unfinished messages are limited in
+ * number, in total size and in age (the oldest are dropped first).
+ */
+export class Reassembler {
+  constructor() {
+    this.parts = new Map(); // mid -> { n, parts: string[], got, chars, last }
+    this.total = 0; // chars held in all assemblies
+  }
+
+  _drop(mid) {
+    const a = this.parts.get(mid);
+    if (!a) return;
+    this.total -= a.chars;
+    this.parts.delete(mid);
+  }
+
+  /** Drop assemblies whose last chunk is older than the timeout. */
+  sweep(now = Date.now()) {
+    for (const [mid, a] of this.parts) if (now - a.last > ASSEMBLY_TIMEOUT_MS) this._drop(mid);
+  }
+
+  clear() {
+    this.parts.clear();
+    this.total = 0;
+  }
+
+  /** Take one `_chunk` message. Returns the complete string when this chunk finished a message, else null. */
+  add(msg, now = Date.now()) {
+    this.sweep(now);
+    const { mid, n, i, d } = msg;
+    if (typeof mid !== 'string' || !mid || mid.length > MAX_MID) return null;
+    const ok = Number.isInteger(n) && Number.isInteger(i) && n > 1 && n <= MAX_CHUNKS && i >= 0 && i < n && typeof d === 'string' && d.length <= CHUNK;
+    let a = this.parts.get(mid);
+    if (!ok || (a && a.n !== n)) {
+      this._drop(mid); // a violation spoils the whole message
+      return null;
+    }
+    if (!a) {
+      a = { n, parts: new Array(n), got: 0, chars: 0, last: now };
+      this.parts.set(mid, a);
+      while (this.parts.size > MAX_ASSEMBLIES) this._drop(this.parts.keys().next().value);
+    }
+    a.last = now;
+    if (a.parts[i] !== undefined) return null; // a repeated chunk changes nothing
+    if (a.chars + d.length > MAX_MESSAGE) {
+      this._drop(mid);
+      return null;
+    }
+    a.parts[i] = d;
+    a.got++;
+    a.chars += d.length;
+    this.total += d.length;
+    if (a.got === a.n) {
+      this._drop(mid);
+      return a.parts.join('');
+    }
+    // Over the total budget: the oldest messages go (the current one is alone at most MAX_MESSAGE).
+    while (this.total > MAX_BUFFERED) this._drop(this.parts.keys().next().value);
+    return null;
+  }
+}
+
+/**
+ * Sends strings on a data channel, splitting long ones into chunks. A long message is queued and handed to
+ * the channel while its buffer is below DATA_HIGH; anything sent while the queue is not empty waits behind
+ * it, so messages keep their order.
+ */
+export class ChunkSender {
+  constructor(dc) {
+    this.dc = dc;
+    this.queue = []; // { s, mid, n, i } — i is the next chunk to send; mid is null for a short message
+    dc.bufferedAmountLowThreshold = DATA_LOW;
+  }
+
+  /** Returns false if the channel is not open. */
+  send(s) {
+    if (this.dc.readyState !== 'open') return false;
+    if (s.length <= CHUNK) {
+      if (!this.queue.length) {
+        this.dc.send(s);
+        return true;
+      }
+      this.queue.push({ s, mid: null, n: 1, i: 0 });
+    } else {
+      const mid = Math.random().toString(36).slice(2);
+      this.queue.push({ s, mid, n: Math.ceil(s.length / CHUNK), i: 0 });
+    }
+    this.pump();
+    return true;
+  }
+
+  pump() {
+    const dc = this.dc;
+    while (this.queue.length && dc.readyState === 'open' && dc.bufferedAmount <= DATA_HIGH) {
+      const m = this.queue[0];
+      try {
+        dc.send(m.mid === null ? m.s : JSON.stringify({ type: '_chunk', mid: m.mid, i: m.i, n: m.n, d: m.s.slice(m.i * CHUNK, (m.i + 1) * CHUNK) }));
+      } catch {
+        this.queue = [];
+        return;
+      }
+      if (++m.i >= m.n) this.queue.shift();
+    }
+  }
+
+  clear() {
+    this.queue = [];
+  }
+}
+
 class Peer {
   constructor(mesh, id, name) {
     this.mesh = mesh;
@@ -40,7 +166,7 @@ class Peer {
     this.ignoreOffer = false;
     this.stream = new MediaStream();
     this.media = { audio: false, video: false };
-    this.chunks = new Map();
+    this.chunks = new Reassembler();
     this.pendingCandidates = [];
     this.open = false;
     this.closed = false; // set by close()
@@ -57,14 +183,20 @@ class Peer {
 
     this.dc = pc.createDataChannel('data', { negotiated: true, id: 0, ordered: true });
     this.dc.binaryType = 'arraybuffer';
+    this.writer = new ChunkSender(this.dc);
+    // Unfinished incoming messages are dropped when they go stale, even if no further chunk arrives.
+    this._sweepTimer = setInterval(() => this.chunks.sweep(), ASSEMBLY_TIMEOUT_MS / 3);
     this.dc.onopen = () => {
       this.open = true;
       this.mesh._applyBitrates();
       this.mesh._attempts.delete(this.id); // the link works: forget earlier rebuild attempts
       this.mesh._emit('channel-open', { peer: this });
     };
+    this.dc.onbufferedamountlow = () => this.writer.pump();
     this.dc.onclose = () => {
       this.open = false;
+      this.writer.clear();
+      this.chunks.clear();
       // Closed by the other side (or the network), not by us: a negotiated channel never reopens.
       if (!this.closed) this.mesh._channelClosed(this);
     };
@@ -207,18 +339,7 @@ class Peer {
   }
 
   send(msg) {
-    if (this.dc.readyState !== 'open') return false;
-    const s = JSON.stringify(msg);
-    if (s.length <= CHUNK) {
-      this.dc.send(s);
-      return true;
-    }
-    const mid = Math.random().toString(36).slice(2);
-    const n = Math.ceil(s.length / CHUNK);
-    for (let i = 0; i < n; i++) {
-      this.dc.send(JSON.stringify({ type: '_chunk', mid, i, n, d: s.slice(i * CHUNK, (i + 1) * CHUNK) }));
-    }
-    return true;
+    return this.writer.send(JSON.stringify(msg));
   }
 
   /**
@@ -272,26 +393,15 @@ class Peer {
     } catch {
       return;
     }
-    if (msg.type === '_chunk') {
-      if (typeof msg.mid !== 'string' || !(msg.n > 0 && msg.n < 2000)) return;
-      let c = this.chunks.get(msg.mid);
-      if (!c) {
-        c = { parts: new Array(msg.n), got: 0 };
-        this.chunks.set(msg.mid, c);
-        if (this.chunks.size > 20) this.chunks.delete(this.chunks.keys().next().value);
+    if (msg && msg.type === '_chunk') {
+      const whole = this.chunks.add(msg);
+      if (whole === null) return;
+      try {
+        msg = JSON.parse(whole);
+      } catch {
+        return;
       }
-      if (c.parts[msg.i] == null) {
-        c.parts[msg.i] = String(msg.d);
-        c.got++;
-      }
-      if (c.got === msg.n) {
-        this.chunks.delete(msg.mid);
-        try {
-          msg = JSON.parse(c.parts.join(''));
-        } catch {
-          return;
-        }
-      } else return;
+      if (msg && msg.type === '_chunk') return; // chunks do not nest
     }
     if (msg && typeof msg.type === 'string') this.mesh._emit('message', { peer: this, msg });
   }
@@ -301,6 +411,9 @@ class Peer {
     clearTimeout(this._restartTimer);
     clearTimeout(this._watchdog);
     clearTimeout(this._staleCheck);
+    clearInterval(this._sweepTimer);
+    this.writer.clear();
+    this.chunks.clear();
     try {
       this.dc.close();
       this.film.close();

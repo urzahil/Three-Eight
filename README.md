@@ -126,6 +126,8 @@ For local testing, `http://localhost:4567` counts as a secure context, so camera
 3. Each person enters a display name, which is remembered in the browser's local storage, plus the room password. They can also choose to remember the password on that device.
 4. To watch together, one person clicks **Movie** and picks a film: a file from their device, or one from the room's Google Drive folder. Everyone else gets a button to join in; see [Watching a movie](#watching-a-movie) for the options. Use the player controls, the audio (🎧) and subtitle (CC) menus, or keyboard shortcuts: `space` play/pause, `←`/`→` ±10 s (adjustable in Settings), `f` full screen, `p` picture-in-picture, `m` mic, `v` camera, `c` chat.
 
+A device that is switched off in the lobby is not requested at all: with the mic off the browser never asks for (or shows an indicator for) the microphone until you turn it on.
+
 Tip: use headphones during the movie, so your microphone doesn't send the film's sound to your friends. Movie volume is per person.
 
 ## Watching a movie
