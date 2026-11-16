@@ -7,7 +7,7 @@ Name each branch after what it changes: a `feature/` or `fix/` prefix, then a sh
 - `feature/` for new functionality, e.g. `feature/export-to-csv`
 - `fix/` for bug fixes, e.g. `fix/crash-on-empty-input`
 
-This applies even when a session was started on an auto-generated branch name: create a properly named branch and work there.
+This applies even when a session was started on, or told to push to, an auto-generated branch name: create a properly named branch, work there and push there instead of the assigned one.
 
 Don't lecture the user about this rule, but do name the branch you pushed to when you report the push.
 
