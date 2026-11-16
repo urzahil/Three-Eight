@@ -249,6 +249,8 @@ button:focus-visible, .seek:focus-visible { outline: 2px solid var(--accent); ou
 /* ---- Google Drive browser (movie dialog) ---- */
 #movie-dialog.has-drive { width: min(560px, calc(100vw - 32px)); }
 .drive { display: flex; flex-direction: column; gap: 8px; }
+.drive-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.drive-head .icon-btn { width: 32px; height: 32px; font-size: 18px; }
 .drive h3 { margin: 0; font-size: 13px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
 .crumbs { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 4px; font-size: 14px; }
 .crumbs button { font: inherit; color: var(--accent); background: transparent; border: 0; padding: 4px 6px; border-radius: 6px; cursor: pointer; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

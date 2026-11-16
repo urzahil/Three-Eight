@@ -42,6 +42,7 @@ test('DriveClient: list and folderInfo share one cached request per folder, with
   const realFetch = globalThis.fetch;
   globalThis.fetch = async (url, init) => {
     calls.push({ url, auth: init.headers.Authorization });
+    if (url.endsWith('/session')) return new Response(null, { status: 204 });
     return new Response(JSON.stringify({ id: 'ROOTFOLDER_0001', name: 'Movies', items: [{ id: 'FILEID_00000001', name: 'a.mkv', kind: 'video', size: 5, durationMs: 0 }] }), { status: 200 });
   };
   try {
@@ -49,9 +50,10 @@ test('DriveClient: list and folderInfo share one cached request per folder, with
     assert.deepEqual((await d.list()).map((f) => f.name), ['a.mkv']);
     assert.deepEqual(await d.folderInfo(), { id: 'ROOTFOLDER_0001', name: 'Movies' });
     assert.equal((await d.list('ROOTFOLDER_0001')).length, 1, 'the root folder\'s own ID is the same listing');
-    assert.equal(calls.length, 1);
-    assert.equal(calls[0].url, '/api/rooms/My%20Room/drive/folders/root');
-    assert.equal(calls[0].auth, 'Bearer tok1');
+    const listings = calls.filter((c) => !c.url.endsWith('/session'));
+    assert.equal(listings.length, 1);
+    assert.equal(listings[0].url, '/api/rooms/My%20Room/drive/folders/root');
+    assert.equal(listings[0].auth, 'Bearer tok1');
     await assert.rejects(d.list('bad id!'), /not a valid/);
   } finally {
     globalThis.fetch = realFetch;
@@ -61,7 +63,8 @@ test('DriveClient: list and folderInfo share one cached request per folder, with
 test('DriveClient: remoteFile reads through the server, re-reading the token for every request', () => {
   const d = new DriveClient({ room: 'r', token: 'tok1', folder: 'ROOTFOLDER_0001' });
   const f = d.remoteFile({ id: 'FILEID_00000001', name: 'a.mkv', size: 10, folder: 'SUBFOLDER_00002' });
-  assert.equal(f.nativeUrl, '/api/rooms/r/drive/files/FILEID_00000001?t=tok1');
+  assert.equal(f.nativeUrl, '/api/rooms/r/drive/files/FILEID_00000001', 'no token in the URL');
+  assert.equal(typeof f.prepareNative, 'function');
   assert.deepEqual(f.drive, { id: 'FILEID_00000001', folder: 'SUBFOLDER_00002' });
   assert.throws(() => d.remoteFile({ id: 'FILEID_00000001', name: 'x', size: 0 }), /size/);
   const seen = [];
@@ -127,6 +130,7 @@ test('DriveClient: a range request that gets a 401 (token just replaced) is retr
   f.backoff = 1;
   const auth = [];
   globalThis.fetch = async (url, init) => {
+    if (url.endsWith('/session')) return new Response(null, { status: 204 });
     auth.push(init.headers.Authorization);
     if (init.headers.Authorization === 'Bearer old') {
       d.setToken('new'); // the fresh token arrives over the WebSocket meanwhile
@@ -140,4 +144,93 @@ test('DriveClient: a range request that gets a 401 (token just replaced) is retr
     globalThis.fetch = realFetch;
   }
   assert.deepEqual(auth, ['Bearer old', 'Bearer new']);
+});
+
+test('DriveClient: endSession clears the cookie (keepalive) and later sessions are not created', async () => {
+  const realFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url, init) => {
+    calls.push([url, init.method, init.keepalive]);
+    return new Response(null, { status: 204 });
+  };
+  try {
+    const d = new DriveClient({ room: 'My Room', token: 't1', folder: 'ROOTFOLDER_0001' });
+    await d.ensureSession();
+    d.endSession();
+    assert.deepEqual(calls.at(-1), ['/api/rooms/My%20Room/drive/session', 'DELETE', true]);
+    const n = calls.length;
+    d.setToken('t2');
+    await d.ensureSession();
+    await d.ensureSession(true);
+    assert.equal(calls.length, n, 'no POST after leaving');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('DriveClient: the cookie session is posted for every token and retried after a failure', async () => {
+  const realFetch = globalThis.fetch;
+  const posts = [];
+  let fail = true;
+  globalThis.fetch = async (url, init) => {
+    posts.push([url, init.method, init.headers.Authorization]);
+    return fail ? new Response(JSON.stringify({ error: 'nope' }), { status: 503 }) : new Response(null, { status: 204 });
+  };
+  try {
+    const d = new DriveClient({ room: 'My Room', token: 't1', folder: 'ROOTFOLDER_0001' });
+    await assert.rejects(d.ensureSession(), /nope/); // a failed session is reported...
+    fail = false;
+    await d.ensureSession(); // ...but not final: the next call tries again
+    assert.equal(posts.length, 2);
+    await d.ensureSession(); // a good one is reused
+    assert.equal(posts.length, 2);
+    d.setToken('t2'); // a renewed token renews the cookie
+    await d.ensureSession();
+    assert.deepEqual(posts.at(-1), ['/api/rooms/My%20Room/drive/session', 'POST', 'Bearer t2']);
+    await d.ensureSession(true); // forced
+    assert.equal(posts.length, 4);
+    const f = d.remoteFile({ id: 'FILEID_00000001', name: 'a.mkv', size: 10 });
+    await f.prepareNative();
+    assert.equal(posts.length, 4);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('DriveClient: listings expire after 45 s, refresh() drops one, and `truncated` is passed on', async () => {
+  const realFetch = globalThis.fetch;
+  const realNow = Date.now;
+  let now = realNow();
+  Date.now = () => now;
+  const asked = [];
+  globalThis.fetch = async (url) => {
+    if (url.endsWith('/session')) return new Response(null, { status: 204 });
+    asked.push(url);
+    return new Response(JSON.stringify({ id: 'ROOTFOLDER_0001', name: 'Movies', items: [], ...(url.includes('/SUBFOLDER_00002') ? { truncated: true } : {}) }), { status: 200 });
+  };
+  try {
+    const d = new DriveClient({ room: 'r', token: 't', folder: 'ROOTFOLDER_0001' });
+    await d.list();
+    now += 44_000;
+    await d.list();
+    assert.equal(asked.length, 1, 'still fresh after 44 s');
+    now += 2_000;
+    await d.list();
+    assert.equal(asked.length, 2, 'expired after 46 s');
+    d.refresh();
+    await d.list();
+    assert.equal(asked.length, 3, 'refresh() asks again');
+    d.refresh('ROOTFOLDER_0001'); // the root by its own ID is the same entry
+    await d.list('ROOTFOLDER_0001');
+    assert.equal(asked.length, 4);
+    await d.list('SUBFOLDER_00002');
+    d.refresh('SUBFOLDER_00002');
+    assert.equal(asked.length, 5);
+    assert.deepEqual(await d.listing('SUBFOLDER_00002'), { items: [], truncated: true });
+    assert.equal(asked.length, 6);
+    assert.deepEqual(await d.listing(), { items: [], truncated: false });
+  } finally {
+    globalThis.fetch = realFetch;
+    Date.now = realNow;
+  }
 });

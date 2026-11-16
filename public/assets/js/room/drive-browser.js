@@ -18,6 +18,7 @@ export class DriveBrowser {
       return;
     }
     if (!ok && !this.drive) return;
+    if (!ok) this.drive.endSession(); // no folder any more: clear the cookie (a new folder's client overwrites it instead)
     this.driveFolder = folder;
     this.drive = ok ? new DriveClient({ room: this.roomName, token: cfg.token, folder }) : null;
     this.driveTrail = null;
@@ -48,6 +49,14 @@ export class DriveBrowser {
       }, () => { /* keep the fallback name; listing shows the real error */ });
     }
     this._renderDriveCrumbs();
+    // Listings are remembered for a short while; the button asks the server again (new files, renamed files).
+    $('drive-refresh').onclick = () => {
+      const trail = this.driveTrail;
+      if (!this.drive || !trail) return;
+      this.drive.refresh(trail[trail.length - 1].id);
+      this._driveSubs = null;
+      this._loadDriveFolder();
+    };
     this._loadDriveFolder();
   }
 
@@ -99,8 +108,9 @@ export class DriveBrowser {
     this._driveShown = null;
     list.replaceChildren(note('Loading…'));
     let items;
+    let truncated = false;
     try {
-      items = await drive.list(folder.id);
+      ({ items, truncated } = await drive.listing(folder.id));
     } catch (err) {
       if (token !== this._driveToken || drive !== this.drive) return;
       const retry = document.createElement('button');
@@ -113,6 +123,7 @@ export class DriveBrowser {
     }
     if (token !== this._driveToken || drive !== this.drive) return;
     this._driveShown = items;
+    this._driveTruncated = truncated;
     this._renderDriveItems();
   }
 
@@ -162,6 +173,12 @@ export class DriveBrowser {
       b.append(icon(f.kind === 'folder' ? 'folder' : f.kind === 'video' ? 'film' : 'cc'), name, meta);
       return b;
     });
+    if (this._driveTruncated) {
+      const p = document.createElement('p');
+      p.className = 'muted';
+      p.textContent = 'This folder is very large: only the first part is listed.';
+      rows.push(p);
+    }
     list.replaceChildren(...rows);
   }
 

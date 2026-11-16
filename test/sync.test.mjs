@@ -2,7 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import './browser-globals.mjs';
-import { cleanState, emptyState, MovieSync } from '../public/assets/js/sync.js';
+import { cleanState, emptyState, MovieSync, sameMovie } from '../public/assets/js/sync.js';
 
 const good = (over = {}) => ({ seq: 3, by: 'peer-aaaaaaaa', movie: { name: 'A.mkv', size: 100, duration: 60 }, paused: false, pos: 12.5, at: 1700000000000, rate: 1, audio: 1, sub: 'e0', subFiles: [{ id: 'x1', name: 'a.srt' }], ...over });
 
@@ -196,4 +196,38 @@ test('a hostile state at the cap with the highest possible id does not freeze th
   assert.equal(members[1].sync.state.by, 'aaaa-peer-one');
   assert.equal(members[1].sync.state.pos, 42);
   for (const m of members) m.sync.destroy();
+});
+
+test('sameMovie: equal sizes match even when renamed, unless both durations are known and differ by 2 s or more', () => {
+  const m = (o) => ({ name: 'A.mkv', size: 1000, duration: 60, ...o });
+  assert.equal(sameMovie(m(), m()), true);
+  assert.equal(sameMovie(m(), m({ name: 'Renamed copy.mkv' })), true, 'a renamed copy of the same file');
+  assert.equal(sameMovie(m(), m({ duration: 61.9 })), true, 'durations within 2 s');
+  assert.equal(sameMovie(m(), m({ duration: 62 })), false, 'a different film of the same size');
+  assert.equal(sameMovie(m(), m({ duration: 5400, name: 'Other.mkv' })), false);
+  assert.equal(sameMovie(m({ duration: 0 }), m({ duration: 5400 })), true, 'a duration that is not known does not count');
+  assert.equal(sameMovie(m(), m({ duration: undefined })), true);
+});
+
+test('sameMovie: without a usable size the name and the duration decide', () => {
+  const m = (o) => ({ name: 'A.mkv', size: 0, duration: 60, ...o });
+  assert.equal(sameMovie(m(), m()), true);
+  assert.equal(sameMovie(m(), m({ duration: 61 })), true);
+  assert.equal(sameMovie(m(), m({ duration: 70 })), false);
+  assert.equal(sameMovie(m(), m({ name: 'B.mkv' })), false);
+  assert.equal(sameMovie(m({ size: 1000 }), m({ size: 2000 })), true, 'sizes that differ fall back to name and duration');
+  assert.equal(sameMovie(m({ size: 1000 }), m({ size: 2000, name: 'B.mkv' })), false);
+  assert.equal(sameMovie(null, m()), false);
+  assert.equal(sameMovie(m(), undefined), false);
+});
+
+test('sameMovie: a content fingerprint on both sides decides; the movie keeps only a well-formed one', () => {
+  const fp1 = 'a'.repeat(32);
+  const fp2 = 'b'.repeat(32);
+  const m = (o) => ({ name: 'A.mkv', size: 1000, duration: 60, ...o });
+  assert.equal(sameMovie(m({ fp: fp1 }), m({ fp: fp1, name: 'renamed.mkv', duration: 0 })), true);
+  assert.equal(sameMovie(m({ fp: fp1 }), m({ fp: fp2 })), false, 'same size, same name, same duration, other bytes');
+  assert.equal(sameMovie(m({ fp: fp1 }), m()), true, 'one side without a fingerprint: size and duration');
+  assert.equal(cleanState(good({ movie: { name: 'A', size: 5, duration: 1, fp: fp1 } })).movie.fp, fp1);
+  for (const bad of ['xyz', 'A'.repeat(32), fp1 + 'a', 5, null, {}]) assert.equal('fp' in cleanState(good({ movie: { name: 'A', size: 5, duration: 1, fp: bad } })).movie, false, String(bad));
 });

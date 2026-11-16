@@ -185,7 +185,10 @@
       <h2>Watch together</h2>
       <p id="movie-dialog-text" class="muted">Choose a movie file on your device. Friends who don’t have it can stream it from your copy.</p>
       <section id="drive-section" class="drive" aria-labelledby="drive-title" hidden>
-        <h3 id="drive-title">From Google Drive</h3>
+        <div class="drive-head">
+          <h3 id="drive-title">From Google Drive</h3>
+          <button id="drive-refresh" type="button" class="icon-btn" title="Reload this folder" aria-label="Reload this folder">↻</button>
+        </div>
         <nav id="drive-crumbs" class="crumbs" aria-label="Folder path"></nav>
         <div id="drive-list" class="drive-list" aria-live="polite"></div>
       </section>

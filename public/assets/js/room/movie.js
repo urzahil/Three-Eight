@@ -194,7 +194,7 @@ export class Movie {
       if (this.drive && m.drive) {
         this.chooseMovieFile(this.drive.remoteFile({ id: m.drive.id, name: String(m.name || 'Movie'), size: Number(m.size), folder: m.drive.folder }, this.swarm));
       } else {
-        this.chooseMovieFile(this.swarm.openRemote({ name: String(m.name || 'Movie'), size: Number(m.size) }));
+        this.chooseMovieFile(this.swarm.openRemote({ name: String(m.name || 'Movie'), size: Number(m.size), fp: m.fp }));
       }
     } catch (err) {
       toast(err.message, 'warn');
@@ -251,7 +251,14 @@ export class Movie {
     }
     const info = { name: file.name, size: file.size, duration: Math.round(this.player.duration * 10) / 10 };
     if (file.drive) info.drive = { ...file.drive };
-    if (!file.remote) this.swarm.openLocal(file); // a copy on this device can feed friends who have none
+    if (!file.remote) {
+      // A copy on this device can feed friends who have none. Its content fingerprint (a few small reads) tells
+      // the others which file it is; when it cannot be computed the movie is matched by size and duration only.
+      const film = this.swarm.openLocal(file);
+      const fp = await film.ready;
+      if (this.player.file !== file) return; // another file was picked meanwhile
+      if (fp) info.fp = fp;
+    } else if (file.swarm?.fp) info.fp = file.swarm.fp;
     this.sync.setLocalFile(info, asRoom);
     if (asRoom && file.drive?.folder) this._autoDriveSubtitle(file); // in the background: never holds up playback
     if (asRoom) this.mesh.broadcast({ type: 'chat', msg: { id: randomId(), from: this.id, name: this.name, text: `🎬 Started a movie: ${file.name}`, ts: this.signaling.now() } });

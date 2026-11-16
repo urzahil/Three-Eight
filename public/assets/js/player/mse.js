@@ -217,11 +217,18 @@ export class MseEngine extends EventTarget {
 
   waitWake(ms) {
     return new Promise((resolve) => {
-      const timer = setTimeout(resolve, ms);
-      this._wakers.push(() => {
+      const waker = () => {
         clearTimeout(timer);
         resolve();
-      });
+      };
+      // A wait that times out takes its waker with it: wake() only ever clears the ones still waiting, so a
+      // feeder that keeps polling would otherwise grow the list without bound.
+      const timer = setTimeout(() => {
+        const i = this._wakers.indexOf(waker);
+        if (i >= 0) this._wakers.splice(i, 1);
+        resolve();
+      }, ms);
+      this._wakers.push(waker);
     });
   }
 

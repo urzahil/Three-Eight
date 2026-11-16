@@ -297,3 +297,21 @@ test('only one read-ahead download is in flight at a time', async () => {
   await new Promise((r) => setTimeout(r, 100));
   assert.ok(calls.length - before <= 3);
 });
+
+test('Content-Range of a 206 is checked: the right length at the wrong offset is refused and retried', async () => {
+  const data = makeData(8 * BS);
+  const range = (a, b, total = data.length) => ({ 'Content-Range': `bytes ${a}-${b}/${total}` });
+  // first answer: the bytes of another part, with the right length (and a header that says so)
+  const calls = serve(data, { behave: (c, n) => (n === 1 ? new Response(data.subarray(c.start + BS, c.end + 1 + BS), { status: 206, headers: range(c.start + BS, c.end + BS) }) : null) });
+  assert.deepEqual(await read(file(data), 0, BS), data.subarray(0, BS), 'the retry got the right bytes');
+  assert.equal(calls.length, 2);
+  // right range, wrong total (another file); an unusable header; the right header is accepted
+  for (const bad of [range(0, BS - 1, data.length + 1), { 'Content-Range': 'bytes 0-5/*x' }, { 'Content-Range': 'items 0-1023/8192' }, range(0, BS)]) {
+    serve(data, { behave: (c) => new Response(data.subarray(c.start, c.end + 1), { status: 206, headers: bad }) });
+    await assert.rejects(read(file(data, { retries: 1 }), 0, BS), (e) => e instanceof RemoteError && /different part/.test(e.message), JSON.stringify(bad));
+  }
+  serve(data, { behave: (c) => new Response(data.subarray(c.start, c.end + 1), { status: 206, headers: range(c.start, c.end) }) });
+  assert.deepEqual(await read(file(data), BS, 2 * BS), data.subarray(BS, 2 * BS));
+  serve(data, { behave: (c) => new Response(data.subarray(c.start, c.end + 1), { status: 206, headers: { 'Content-Range': `bytes ${c.start}-${c.end}/*` } }) });
+  assert.deepEqual(await read(file(data), 0, BS), data.subarray(0, BS), 'an unknown total is fine');
+});

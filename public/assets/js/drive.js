@@ -2,11 +2,14 @@
 // our own server (the server reads Drive as a service account; the browser
 // never contacts Google). Requests carry the room token that the server sent
 // in the welcome message. Used by the room page.
+// A <video> element cannot send headers, so for native playback the token also goes to the server once (and again
+// whenever it is renewed) as a cookie that only our Drive endpoints read: see DriveClient.ensureSession().
 
 import { RemoteFile } from './player/remotefile.js';
 
 const ID_RE = /^[A-Za-z0-9_-]{10,200}$/;
 const NETWORK_MESSAGE = 'Could not reach the server.';
+const CACHE_MS = 45 * 1000; // a folder listing is reused for this long (files appear in Drive while the room is open)
 
 function checkId(id) {
   if (!ID_RE.test(String(id))) throw new Error('That is not a valid Google Drive ID.');
@@ -91,12 +94,56 @@ export class DriveClient {
     this.room = room;
     this.token = token;
     this.folder = folder;
-    this.cache = new Map(); // folder id ('root' for the room's folder) -> Promise of its listing
+    this.cache = new Map(); // folder id ('root' for the room's folder) -> { p: Promise of its listing, at: when it was asked }
+    this.session = null; // Promise of the cookie session for the current token
+    this._startSession();
   }
 
-  /** A reconnect brings a fresh token: files already open pick it up on their next request. */
+  /**
+   * A reconnect or a periodic renewal brings a fresh token: files already open pick it up on their next request,
+   * and the cookie is renewed in place, so a video that is playing natively keeps working without a new src.
+   */
   setToken(token) {
     this.token = token;
+    this._startSession();
+  }
+
+  _startSession() {
+    if (this.ended) return this.session; // left the room: the cookie must stay cleared
+    const token = this.token;
+    const p = (async () => {
+      let res;
+      try {
+        res = await fetch(`${this.base}/session`, { method: 'POST', headers: { Authorization: `Bearer ${token}` }, cache: 'no-store' });
+      } catch (err) {
+        throw networkError(err);
+      }
+      if (!res.ok) throw await serverError(res);
+    })();
+    p.catch(() => {}); // nobody may be waiting for it; ensureSession() reports it to whoever is
+    this.session = p;
+    p.failed = false;
+    p.catch(() => { p.failed = true; });
+    return p;
+  }
+
+  /**
+   * Clears the cookie (it would otherwise outlive the page, up to the token's lifetime) and stops later calls from
+   * setting it again. `keepalive` lets the request finish while the page is being closed.
+   */
+  endSession() {
+    this.ended = true;
+    fetch(`${this.base}/session`, { method: 'DELETE', keepalive: true, cache: 'no-store' }).catch(() => {});
+  }
+
+  /**
+   * Resolves when the server has set the cookie for the current token (what a native <video> request needs).
+   * A failed attempt is not final: the next call tries again (`force` also replaces one that succeeded earlier,
+   * e.g. after a media error that may mean the cookie is gone).
+   */
+  ensureSession(force = false) {
+    if (force || this.session.failed) this._startSession();
+    return this.session;
   }
 
   get base() {
@@ -125,18 +172,30 @@ export class DriveClient {
   _folder(folderId) {
     const id = !folderId || folderId === this.folder ? 'root' : folderId;
     if (id !== 'root') checkId(id);
-    let p = this.cache.get(id);
-    if (!p) {
-      p = this._getJson(`/folders/${id}`);
-      this.cache.set(id, p);
-      p.catch(() => this.cache.delete(id)); // let the user retry
+    let e = this.cache.get(id);
+    if (e && Date.now() - e.at > CACHE_MS) e = null;
+    if (!e) {
+      e = { p: this._getJson(`/folders/${id}`), at: Date.now() };
+      this.cache.set(id, e);
+      e.p.catch(() => { if (this.cache.get(id) === e) this.cache.delete(id); }); // let the user retry
     }
-    return p;
+    return e.p;
   }
 
-  /** Folders, videos and subtitle files in a folder ({ id, name, kind, size, durationMs }): folders first, then by name. Cached per session. */
+  /** Drop what is remembered about a folder (the room's folder when omitted), so the next list() asks the server again. */
+  refresh(folderId = 'root') {
+    this.cache.delete(!folderId || folderId === this.folder ? 'root' : folderId);
+  }
+
+  /** Folders, videos and subtitle files in a folder ({ id, name, kind, size, durationMs }): folders first, then by name. Cached for 45 s. */
   async list(folderId = 'root') {
     return (await this._folder(folderId)).items;
+  }
+
+  /** Like list(), as { items, truncated }: `truncated` when the folder is larger than the server lists. */
+  async listing(folderId = 'root') {
+    const f = await this._folder(folderId);
+    return { items: f.items, truncated: f.truncated === true };
   }
 
   /** Name of the room's folder. */
@@ -160,7 +219,7 @@ export class DriveClient {
     const common = {
       name: file.name,
       size: file.size,
-      nativeUrl: `${url}?t=${encodeURIComponent(this.token)}`, // a <video> element cannot send headers
+      nativeUrl: url, // authorized by the session cookie, never by a token in the URL (it would end up in access logs)
       explain: serverError,
       networkError,
       retries: 2,
@@ -177,6 +236,7 @@ export class DriveClient {
       });
     }
     rf.drive = drive;
+    rf.prepareNative = (force) => this.ensureSession(force); // the player awaits this before it sets video.src
     return rf;
   }
 

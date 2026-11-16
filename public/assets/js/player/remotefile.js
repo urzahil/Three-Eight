@@ -357,6 +357,16 @@ export class RemoteFile {
         // `explain` may already know that retrying is pointless (e.g. a quota that is used up).
         throw Object.assign(err, { remote: true, status: res.status, permanent: err.permanent ?? !retry });
       }
+      // A right-sized answer for the wrong offset would be cached as bytes it is not. A 206 without the header is
+      // tolerated (some intermediaries drop it); one that names another range or another total is refused.
+      const cr = res.status === 206 ? res.headers?.get?.('content-range') : null;
+      if (cr != null) {
+        const m = /^\s*bytes (\d+)-(\d+)\/(\d+|\*)\s*$/i.exec(cr);
+        if (!m || Number(m[1]) !== start || Number(m[2]) !== end - 1 || (m[3] !== '*' && Number(m[3]) !== this.size)) {
+          ctrl.abort();
+          throw new RemoteError(`The server sent a different part of the file than asked for (${cr}).`, { status: 206 });
+        }
+      }
       let data;
       try {
         data = new Uint8Array(await res.arrayBuffer());

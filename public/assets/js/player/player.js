@@ -234,6 +234,7 @@ export class MoviePlayer extends EventTarget {
     this.file = file;
     this.triedModes = new Set();
     this.diagnosed = false;
+    this.sessionRetried = false;
     this._emit('status', { text: file.peerOnly ? 'Connecting to your friend…' : file.remote ? 'Connecting to Google Drive…' : 'Reading file…' });
     const demux = await openDemuxer(file);
     if (token !== this._loadToken) return;
@@ -304,6 +305,16 @@ export class MoviePlayer extends EventTarget {
     this.mode = mode;
     this.triedModes = this.triedModes || new Set();
     this.triedModes.add(mode);
+    if (mode === 'native' && this.file.remote && this.file.prepareNative) {
+      // The <video> element authenticates with a cookie that has to be in place before it asks for the file.
+      const loadToken = this._loadToken;
+      try {
+        await this.file.prepareNative();
+      } catch {
+        /* the element's own request will fail the same way and the error handling takes over */
+      }
+      if (loadToken !== this._loadToken) return; // another film was loaded (or this one unloaded) meanwhile
+    }
     const metadata = new Promise((resolve) => {
       const done = () => {
         this.video.removeEventListener('loadedmetadata', done);
@@ -576,6 +587,23 @@ export class MoviePlayer extends EventTarget {
     const err = this.video.error;
     console.warn('Video error', err);
     const time = this.time;
+    if (this.mode === 'native' && this.file.prepareNative && !this.sessionRetried && (err?.code === 2 || err?.code === 4)) {
+      // The cookie may be missing or expired: renew it once and try again before looking for other causes.
+      this.sessionRetried = true;
+      const file = this.file;
+      let renewed = true;
+      try {
+        await file.prepareNative(true);
+      } catch {
+        renewed = false;
+      }
+      if (this.file !== file) return;
+      if (renewed) {
+        await this._start('native', time);
+        this._emit('tracks');
+        return;
+      }
+    }
     if (this.mode === 'native' && this.file.remote && !this.diagnosed && (err?.code === 2 || err?.code === 4)) {
       // The element downloads by itself and only says "network error". Find out whether the server is
       // refusing us (or we are offline) before trying anything else.

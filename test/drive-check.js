@@ -143,7 +143,7 @@ async function adminApi(base) {
         if (!r.url().startsWith(BASE)) return;
         const u = new URL(r.url());
         stats.server.push(u.pathname + u.search);
-        if (u.pathname.includes('/drive/')) stats.requests.push({ url: r.url(), path: u.pathname, t: u.searchParams.get('t'), auth: r.headers().authorization, range: r.headers().range, type: r.resourceType() });
+        if (u.pathname.includes('/drive/')) stats.requests.push({ url: r.url(), path: u.pathname, method: r.method(), t: u.searchParams.get('t'), auth: r.headers().authorization, range: r.headers().range, type: r.resourceType() });
       });
       await page.goto(`${BASE}/${room}?debug`);
       await page.fill('#lobby-name', name);
@@ -396,7 +396,8 @@ async function adminApi(base) {
       await dave.click('#movie-overlay button:has-text("Stream from Google Drive")');
       await waitFor(dave, () => document.getElementById('movie').readyState >= 2 && room.player.file?.name === 'single.mp4');
       assert.strictEqual(await dave.evaluate(() => room.player.mode), 'native');
-      assert((await dave.evaluate(() => document.getElementById('movie').currentSrc)).startsWith(`${BASE}/api/rooms/${ROOM}/drive/files/${ID.mp4}?t=`), 'native <video> streams from our server');
+      assert((await dave.evaluate(() => document.getElementById('movie').currentSrc)).startsWith(`${BASE}/api/rooms/${ROOM}/drive/files/${ID.mp4}`), 'native <video> streams from our server');
+      assert(!(await dave.evaluate(() => document.getElementById('movie').currentSrc)).includes('t='), 'no token in the URL');
       assert.strictEqual(await dave.evaluate(() => room.swarm.film), null, 'a native player does not take part in sharing');
       await waitFor(alice, () => room.sync.peerStatus.size >= 2 && [...room.sync.peerStatus.values()].every((x) => x.matches));
       await ctl(alice, '#m-play');
@@ -554,13 +555,15 @@ async function adminApi(base) {
       assert.deepStrictEqual(bad, [], 'unexpected requests to our server');
       for (const r of S.requests) {
         driveRequests++;
-        if (r.type === 'media') assert(r.t && !r.auth, `a <video> request carries the token in the URL: ${r.url}`);
+        if (r.type === 'media') assert(!r.t && !r.auth && !r.url.includes('t='), `a <video> request carries no token in the URL or a header (the session cookie authorizes it): ${r.url}`);
+        else if (r.path.endsWith('/drive/session') && r.method === 'DELETE') assert(!r.t && !r.auth, 'clearing the cookie on leaving sends no token');
+        else if (r.path.endsWith('/drive/session')) assert(/^Bearer \S{20,}$/.test(r.auth || '') && !r.t, 'the session is opened with the token in the Authorization header');
         else assert(/^Bearer \S{20,}$/.test(r.auth || '') && !r.t, `a fetch carries the token in the Authorization header: ${r.url}`);
       }
     }
     assert(driveRequests > 20, 'drive requests were observed');
     assert(!/BEGIN PRIVATE KEY|ya29\./.test(serverLog()), 'the server log holds no secrets');
-    console.log(`the page made ${driveRequests} requests to our Drive endpoints, all with the token, and none to Google`);
+    console.log(`the page made ${driveRequests} requests to our Drive endpoints, all authorized by header or cookie (never the URL), and none to Google`);
     console.log('DRIVE CHECK OK');
   } finally {
     await cleanup();

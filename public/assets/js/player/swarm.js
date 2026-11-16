@@ -6,15 +6,23 @@
 // our server. The RemoteFile block cache is the piece store; pieces that arrive are injected into it, so
 // they can be served to other viewers too.
 //
-// Film identity ("key"): `d:<driveId>` for a film from the room's Drive folder, `s:<size>` for a film
-// that is a file on someone's device. A Drive film and a local copy of the same size are the same film
-// (this is the same rule as sync.js `sameMovie`), so local copies can serve a Drive film.
+// Film identity ("key"): `d:<driveId>` for a film from the room's Drive folder, `s:<size>:<fingerprint>` for
+// a film that is a file on someone's device. The fingerprint is a SHA-256 over the size and three 64 KiB samples
+// (start, middle, end) of the file, so two different files of the same size do not pass for one film. A Drive
+// film computes the same fingerprint from the same byte ranges, fetched from our server once, lazily (when the
+// film is first read); from then on its keys are `d:<driveId>` and `s:<size>:<fingerprint>`, so local copies
+// can serve a Drive film, but only when the fingerprints are equal. Until the fingerprint is known a Drive film
+// has no local holders and reads from our server. A local file is advertised only once its fingerprint is
+// computed (a few small reads). A film that is only streamed from friends gets the fingerprint from the room's
+// movie state (sync.js `movie.fp`, set by whoever picked the file). Without crypto.subtle (a page that is not a
+// secure context) there is no fingerprint and the key is the old `s:<size>`, which matches only other viewers
+// in the same situation.
 //
-// INTEGRITY: there are no per-piece hashes. Matching by size is the trust model between friends that the
-// app already has (everybody picks their own copy of a file, and only its size is compared). A friend
-// who deliberately sends wrong bytes can make your player show garbage; it can't do more than that,
-// because every message is validated (see decodeFrame and the checks in Swarm) and bytes only ever go
-// to the demuxer, like any file.
+// INTEGRITY: there are no per-piece hashes. The sampled fingerprint catches a different file, not a file
+// that differs only between the samples (a re-encode of the same size is implausible, a deliberate attacker
+// is possible). A friend who deliberately sends wrong bytes can make your player show garbage; it can't do
+// more than that, because every message is validated (see decodeFrame and the checks in Swarm) and bytes only
+// ever go to the demuxer, like any file.
 //
 // PROTOCOL
 //   Channel 0 (JSON, mesh.js `send`):
@@ -66,7 +74,9 @@ export const T = { WANT: 1, DATA: 2, DENY: 3, CANCEL: 4 };
 export const DENIED = { BUSY: 1, UNAVAILABLE: 2 };
 const MAX_PIECES = 1 << 22; // 4 TiB of film
 const PIECE_LIMIT = 64 * MiB; // no sane piece size is larger: offsets beyond it are garbage
-const KEY_RE = /^(d:[A-Za-z0-9_-]{10,200}|s:[0-9]{1,15})$/;
+const KEY_RE = /^(d:[A-Za-z0-9_-]{10,200}|s:[0-9]{1,15}(:[0-9a-f]{32})?)$/;
+export const FP_RE = /^[0-9a-f]{32}$/;
+const FP_SAMPLE = 64 * 1024; // bytes read at the start, the middle and the end of a file for its fingerprint
 const noop = () => {};
 export const MAX_CUES = 20000;
 export const MAX_CUE_TEXT = 8 * MiB;
@@ -74,17 +84,63 @@ const TRACK_RE = /^e[0-9]{1,6}$/;
 
 // ---- pure helpers --------------------------------------------------------------------------------------
 
-/** The film's identity: `d:<driveId>` for a Drive film, otherwise `s:<size>`. */
-export function filmKey({ drive, size }) {
-  return drive?.id ? `d:${drive.id}` : `s:${size}`;
+/** The key of a film that is a file: `s:<size>:<fingerprint>`, or `s:<size>` when there is no fingerprint. */
+export function sizeKey(size, fp) {
+  return fp ? `s:${size}:${fp}` : `s:${size}`;
 }
 
-/** Keys that name the same film as this movie ({size, drive?}): its Drive key and its size key. */
+/** The film's identity: `d:<driveId>` for a Drive film, otherwise its size key. */
+export function filmKey({ drive, size, fp }) {
+  return drive?.id ? `d:${drive.id}` : sizeKey(size, fp);
+}
+
+/** Keys that name the same film as this movie ({size, fp?, drive?}): its Drive key and its size key. */
 export function movieKeys(movie) {
   const keys = [];
   if (movie?.drive?.id) keys.push(`d:${movie.drive.id}`);
-  if (movie?.size > 0) keys.push(`s:${movie.size}`);
+  if (movie?.size > 0) keys.push(sizeKey(movie.size, FP_RE.test(movie.fp || '') ? movie.fp : ''));
   return keys;
+}
+
+/** The byte ranges [start, end) a fingerprint samples: the first, middle and last FP_SAMPLE bytes (merged for small files). */
+export function fingerprintRanges(size) {
+  if (!(size > 0)) return [];
+  const mid = Math.max(0, Math.floor(size / 2) - FP_SAMPLE / 2);
+  const ranges = [[0, Math.min(size, FP_SAMPLE)], [mid, Math.min(size, mid + FP_SAMPLE)], [Math.max(0, size - FP_SAMPLE), size]].sort((a, b) => a[0] - b[0]);
+  const out = [ranges[0]];
+  for (const r of ranges.slice(1)) {
+    const last = out[out.length - 1];
+    if (r[0] <= last[1]) last[1] = Math.max(last[1], r[1]);
+    else out.push(r);
+  }
+  return out;
+}
+
+/**
+ * The fingerprint of a file of `size` bytes: 32 hex characters of SHA-256 over the size and the sampled
+ * ranges. `read(start, end)` resolves to the bytes [start, end) (a Uint8Array of exactly that length).
+ * Resolves to null when this page has no crypto.subtle.
+ */
+export async function computeFingerprint(size, read) {
+  const subtle = globalThis.crypto?.subtle;
+  if (!subtle || !(size > 0)) return null;
+  const ranges = fingerprintRanges(size);
+  const parts = [new Uint8Array(8)];
+  new DataView(parts[0].buffer).setUint32(0, Math.floor(size / 2 ** 32));
+  new DataView(parts[0].buffer).setUint32(4, size >>> 0);
+  for (const [a, b] of ranges) {
+    const bytes = await read(a, b);
+    if (!bytes || bytes.length !== b - a) throw new Error('The file could not be read for its fingerprint.');
+    parts.push(bytes);
+  }
+  const all = new Uint8Array(parts.reduce((n, x) => n + x.length, 0));
+  let at = 0;
+  for (const x of parts) {
+    all.set(x, at);
+    at += x.length;
+  }
+  const digest = new Uint8Array(await subtle.digest('SHA-256', all));
+  return Array.from(digest.subarray(0, 16), (x) => x.toString(16).padStart(2, '0')).join('');
 }
 
 /** 32-bit FNV-1a of a (ASCII) key. */
@@ -247,8 +303,9 @@ class Film {
   /**
    * @param {Swarm} swarm
    * @param {object} o
-   * @param {string} o.key  `d:<id>` or `s:<size>`
+   * @param {string} o.key  `d:<id>` or `s:<size>[:<fingerprint>]`
    * @param {number} o.size
+   * @param {string} [o.fp]  the content fingerprint, when already known
    * @param {Blob} [o.local]  the film as a file on this device (served to friends when sharing is on)
    * @param {(start, endInclusive, signal) => Promise<Response>} [o.server]  Range request to our server (Drive films)
    * @param {RemoteFile} [o.store]  the block cache that holds pieces (set with bind() when it needs `request` first)
@@ -261,10 +318,12 @@ class Film {
     this.server = o.server || null;
     this.store = o.store || null;
     this.nPieces = Math.ceil(o.size / swarm.pieceSize);
-    // A Drive film is also named by its size, which is how a local copy of it advertises itself.
-    this.keys = new Set([o.key]);
-    if (this.server && !this.key.startsWith('s:')) this.keys.add(`s:${o.size}`);
-    this.keyIds = new Set([...this.keys].map(keyId));
+    this.fp = null; // content fingerprint (see computeFingerprint); null while unknown or unavailable
+    // A local file is advertised only when its fingerprint is known (setFp); a Drive film learns it lazily (_ensureFp).
+    this.fpTask = null;
+    this.fpRetryAt = 0;
+    this.setFp(o.fp || null);
+    this.fpPending = !!o.local; // set again: setFp() clears it
     this.inflight = new Map(); // piece -> shared acquisition (peers, then the server)
     this.serverInflight = new Map(); // piece -> shared server fetch
     this.acqs = new Map(); // req -> my outstanding want
@@ -274,6 +333,21 @@ class Film {
     this.closed = false;
     this.active = false;
     this.request = (start, end, signal, opts) => swarm._request(this, start, end, signal, opts);
+  }
+
+  /**
+   * Set the fingerprint (null: none, e.g. no crypto.subtle). A Drive film is named by its Drive ID and, once
+   * the fingerprint is known, by its size key, which is how a local copy of it advertises itself; a file
+   * (or a film streamed from friends) is named by its size key alone.
+   */
+  setFp(fp) {
+    this.fp = fp;
+    this.fpPending = false;
+    const drive = this.key.startsWith('d:');
+    if (!drive) this.key = sizeKey(this.size, fp);
+    this.keys = new Set([this.key]);
+    if (drive && (fp || this.fpDone)) this.keys.add(sizeKey(this.size, fp));
+    this.keyIds = new Set([...this.keys].map(keyId));
   }
 
   bind(store) {
@@ -381,8 +455,19 @@ export class Swarm extends EventTarget {
    * Reading it for playback does not involve the swarm.
    */
   openLocal(file) {
-    const film = new Film(this, { key: `s:${file.size}`, size: file.size, local: file });
+    const film = new Film(this, { key: sizeKey(file.size, ''), size: file.size, local: file });
     film.activate();
+    // `film.ready` resolves (never rejects) to the fingerprint, or null if it cannot be computed.
+    film.ready = computeFingerprint(file.size, async (a, b) => new Uint8Array(await file.slice(a, b).arrayBuffer()))
+      .catch(() => null)
+      .then((fp) => {
+        if (!film.closed) {
+          film.setFp(fp);
+          this._changed();
+          this._emit('change');
+        }
+        return fp;
+      });
     return film;
   }
 
@@ -391,8 +476,9 @@ export class Swarm extends EventTarget {
    * used for the pieces that nobody else provides; without it the film can only come from friends' copies.
    * The film becomes the active one at film.activate() (or its first read).
    */
-  openRemote({ name, size, drive = null, server = null, nativeUrl = null, ...rest }) {
-    const film = new Film(this, { key: filmKey({ drive: server ? drive : null, size }), size, server });
+  openRemote({ name, size, drive = null, server = null, nativeUrl = null, fp = null, ...rest }) {
+    // `fp`: the fingerprint of a film that only exists on friends' devices, from the room's movie state.
+    const film = new Film(this, { key: filmKey({ drive: server ? drive : null, size, fp: server ? null : FP_RE.test(fp || '') ? fp : null }), size, server, fp: server ? null : FP_RE.test(fp || '') ? fp : null });
     const rf = new RemoteFile({ maxParallel: 4, ...rest, name, size, nativeUrl, request: film.request });
     film.bind(rf);
     rf.swarm = film;
@@ -401,11 +487,48 @@ export class Swarm extends EventTarget {
     return rf;
   }
 
+  /** Does a friend advertise a whole copy of a file of this film's size (with or without a fingerprint)? */
+  _hasSizeCandidate(film) {
+    const k = `s:${film.size}`;
+    for (const h of this.have.values()) if (h.local && (h.key === k || h.key.startsWith(`${k}:`))) return true;
+    return false;
+  }
+
+  /**
+   * A Drive film learns its fingerprint from our server (three small reads), once and only when it is needed:
+   * when a friend has a copy of that size, which would be compared with it. After a failure it tries again
+   * at most every 15 s. Local copies match the film only once it is known.
+   */
+  _ensureFp(film) {
+    if (!film.server || !this._hasSizeCandidate(film) || film.fpTask || film.fpDone || film.closed || this.now() < film.fpRetryAt) return;
+    const ctrl = new AbortController();
+    film.fpCtrl = ctrl;
+    film.fpTask = computeFingerprint(film.size, async (a, b) => {
+      const res = await film.server(a, b - 1, ctrl.signal);
+      if (res.status !== 206 && !(res.status === 200 && a === 0 && b === film.size)) throw new Error('The server did not give the bytes for the fingerprint.');
+      return new Uint8Array(await res.arrayBuffer());
+    }).then(
+      (fp) => {
+        film.fpTask = null;
+        if (film.closed) return;
+        film.fpDone = true;
+        film.setFp(fp);
+        this._changed();
+        this._emit('change');
+      },
+      () => {
+        film.fpTask = null;
+        film.fpRetryAt = this.now() + 15000;
+      },
+    );
+  }
+
   _activate(film) {
     if (film.closed || this.film === film) return;
     const prev = this.film;
     this.film = film;
     film.active = true;
+    this._ensureFp(film);
     if (prev) this._teardown(prev);
     this._changed();
     this._emit('change');
@@ -424,6 +547,7 @@ export class Swarm extends EventTarget {
   _teardown(film) {
     film.closed = true;
     film.active = false;
+    film.fpCtrl?.abort();
     for (const e of film.inflight.values()) e.ctrl.abort();
     for (const e of film.serverInflight.values()) e.ctrl.abort();
     for (const acq of [...film.acqs.values()]) acq.finish(null, true);
@@ -439,6 +563,8 @@ export class Swarm extends EventTarget {
   /** Ids of connected peers that have a whole copy of this movie ({size, drive?}) on their device and share it. */
   holders(movie) {
     const keys = new Set(movieKeys(movie));
+    // The open film may know more names for this movie (a Drive film that has its fingerprint).
+    if (this.film && !this.film.closed && keys.has(this.film.key)) for (const k of this.film.keys) keys.add(k);
     return [...this.have].filter(([id, h]) => h.local && keys.has(h.key) && this._usable(id)).map(([id]) => id).sort();
   }
 
@@ -453,7 +579,7 @@ export class Swarm extends EventTarget {
     const none = { type: 'film-have', key: null, local: false, ranges: [], via: '' };
     if (!f || f.closed) return none;
     if (f.local) {
-      if (!this.share) return none;
+      if (!this.share || f.fpPending) return none;
       return { type: 'film-have', key: f.key, local: true, ranges: [[0, f.nPieces - 1]], via: 'file', subs: this._subList() };
     }
     const ranges = f.store?.cachedPieces ? mergeRanges(f.store.cachedPieces(this.pieceSize), this.maxRanges) : [];
@@ -564,6 +690,7 @@ export class Swarm extends EventTarget {
     const wait = Math.max(0, this._lastAt + this.advertiseMs - this.now());
     this._timer = setTimeout(() => {
       this._timer = 0;
+      if (this.film?.fpPending) return; // not known yet what to advertise: setFp() asks again
       const msg = this._haveMessage();
       const s = JSON.stringify(msg);
       if (s === this._lastSent) return;
@@ -578,7 +705,10 @@ export class Swarm extends EventTarget {
     const h = parseHave(msg);
     if (!h) return;
     if (!h.key) this.have.delete(peer.id);
-    else this.have.set(peer.id, h);
+    else {
+      this.have.set(peer.id, h);
+      if (h.local && this.film?.server) this._ensureFp(this.film); // a copy to compare with: start early
+    }
     this._emit('change');
   }
 
@@ -641,6 +771,12 @@ export class Swarm extends EventTarget {
     if (!film.active && !this.film) film.activate();
     // A few blocks for an embedded subtitle: don't pull whole pieces for that.
     if (opts.small && film.server) return film.server(start, end, signal);
+    if (film.server && !film.fpDone) {
+      // A friend has a copy of this size: find out first whether it is this film, so its pieces can be used.
+      this._ensureFp(film);
+      if (film.fpTask) await film.fpTask; // never rejects
+      if (signal?.aborted) throw abortError();
+    }
     const P = this.pieceSize;
     const first = Math.floor(start / P);
     const last = Math.floor(end / P);

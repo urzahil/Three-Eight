@@ -329,7 +329,7 @@ test('drive: a token is required, and it only works for its own room', async () 
   assert.match((await res.json()).error, /./);
 
   assert.strictEqual((await api(folders, tokA)).status, 200);
-  assert.strictEqual((await fetch(`${BASE}${folders}?t=${encodeURIComponent(tokA)}`)).status, 200, 't query parameter');
+  assert.strictEqual((await fetch(`${BASE}${folders}?t=${encodeURIComponent(tokA)}`)).status, 401, 'the token in the URL is not accepted any more');
   // Room A's token on room B's URLs, and the other way round.
   assert.strictEqual((await api('/api/rooms/drive-b/drive/folders/root', tokA)).status, 401);
   assert.strictEqual((await api(files('drive-b', D.movieB), tokA)).status, 401);
@@ -338,6 +338,85 @@ test('drive: a token is required, and it only works for its own room', async () 
   // Other methods
   assert.strictEqual((await api(folders, tokA, { method: 'POST' })).status, 405);
   assert.strictEqual((await api('/api/rooms/drive-a/drive/nothing/x1234567890', tokA)).status, 404);
+});
+
+/** The "name=value" pair of a Set-Cookie header, to send back as a Cookie header. */
+const cookiePair = (res) => res.headers.get('set-cookie').split(';')[0];
+
+test('drive: POST .../drive/session sets a per-room, HttpOnly, SameSite=Strict cookie that expires with the token', async () => {
+  const url = '/api/rooms/drive-a/drive/session';
+  const res = await api(url, tokA, { method: 'POST' });
+  assert.strictEqual(res.status, 204);
+  assert.strictEqual(await res.text(), '');
+  const set = res.headers.get('set-cookie');
+  const id = crypto.createHash('sha256').update('drive-a').digest('base64url').slice(0, 16);
+  assert(set.startsWith(`t8d_${id}=${tokA};`), set);
+  assert.match(set, /; Path=\/api\/rooms\/(;|$)/);
+  assert.match(set, /; HttpOnly/);
+  assert.match(set, /; SameSite=Strict/);
+  assert.doesNotMatch(set, /Secure/, 'plain http');
+  const maxAge = Number(/Max-Age=(\d+)/.exec(set)[1]);
+  assert(maxAge > 11.9 * 3600 && maxAge <= 12 * 3600, `Max-Age ${maxAge}`);
+  assert.strictEqual(res.headers.get('cache-control'), 'private, no-store');
+  // The room's name in another case: the same room, the same cookie.
+  assert.strictEqual(cookiePair(await api('/api/rooms/Drive-A/drive/session', tokA, { method: 'POST' })), cookiePair(res));
+  // Behind a TLS-terminating proxy the cookie is Secure too (same rule as the admin cookie): see the TRUST_PROXY test.
+  // Refused: no token, a wrong token, a token of another room, other methods.
+  assert.strictEqual((await api(url, undefined, { method: 'POST' })).status, 401);
+  assert.strictEqual((await api(url, 'garbage', { method: 'POST' })).status, 401);
+  assert.strictEqual((await api(url, tokB, { method: 'POST' })).status, 401);
+  assert.strictEqual((await fetch(BASE + url + `?t=${encodeURIComponent(tokA)}`, { method: 'POST' })).status, 401);
+  assert.strictEqual((await cookieReq(url, cookiePair(res), { method: 'POST' })).status, 401, 'the cookie cannot renew itself');
+  for (const method of ['GET', 'HEAD', 'PUT']) {
+    const r = await api(url, tokA, { method });
+    assert.strictEqual(r.status, 405, method);
+    assert.strictEqual(r.headers.get('allow'), 'POST, DELETE');
+  }
+  assert.strictEqual((await api(url, tokA, { method: 'POST', headers: { Authorization: `Bearer ${tokA}`, 'Content-Length': '5000' }, body: 'x'.repeat(5000) })).status, 413);
+});
+
+test('drive: DELETE .../drive/session clears the room cookie, without a token and for any room', async () => {
+  const id = (room) => crypto.createHash('sha256').update(room).digest('base64url').slice(0, 16);
+  const url = '/api/rooms/drive-a/drive/session';
+  const res = await fetch(BASE + url, { method: 'DELETE' }); // no token: clearing one's own cookie grants nothing
+  assert.strictEqual(res.status, 204);
+  assert.strictEqual(await res.text(), '');
+  assert.strictEqual(res.headers.get('set-cookie'), `t8d_${id('drive-a')}=; Path=/api/rooms/; HttpOnly; SameSite=Strict; Max-Age=0`);
+  assert.strictEqual(res.headers.get('cache-control'), 'private, no-store');
+  // With a token it is the same; the room's name in another case names the same cookie.
+  assert.strictEqual((await api(url, tokA, { method: 'DELETE' })).status, 204);
+  assert.strictEqual((await fetch(BASE + '/api/rooms/Drive-A/drive/session', { method: 'DELETE' })).headers.get('set-cookie'), res.headers.get('set-cookie'));
+  // A room that does not exist (any more) can still be cleared.
+  const gone = await fetch(BASE + '/api/rooms/no-such-room/drive/session', { method: 'DELETE' });
+  assert.strictEqual(gone.status, 204);
+  assert.match(gone.headers.get('set-cookie'), new RegExp(`^t8d_${id('no-such-room')}=; .*Max-Age=0`));
+  assert.strictEqual((await fetch(BASE + url, { method: 'DELETE', headers: { 'Content-Length': '5000' }, body: 'x'.repeat(5000) })).status, 413);
+});
+
+const cookieReq = (p, cookieHeader, extra = {}) => fetch(BASE + p, { ...extra, headers: { Cookie: cookieHeader, ...(extra.headers || {}) } });
+
+test('drive: files and folders open with the room cookie and no header; a cookie opens only its own room', async () => {
+  const ck = cookiePair(await api('/api/rooms/drive-a/drive/session', tokA, { method: 'POST' }));
+  const ckB = cookiePair(await api('/api/rooms/drive-b/drive/session', tokB, { method: 'POST' }));
+  assert.notStrictEqual(ck.split('=')[0], ckB.split('=')[0], 'one cookie per room');
+  const r = await cookieReq(files('drive-a', D.movie), ck, { headers: { Range: 'bytes=10-19' } });
+  assert.strictEqual(r.status, 206);
+  assert.deepStrictEqual(Buffer.from(await r.arrayBuffer()), DATA.movie.subarray(10, 20));
+  assert.strictEqual((await cookieReq('/api/rooms/drive-a/drive/folders/root', ck)).status, 200);
+  assert.strictEqual((await cookieReq(files('drive-a', D.movie), ck, { method: 'HEAD' })).status, 200);
+  // A cookie of room A on room B's URLs (the browser sends every cookie under /api/rooms/), alone or among others.
+  assert.strictEqual((await cookieReq(files('drive-b', D.movieB), ck)).status, 401);
+  assert.strictEqual((await cookieReq('/api/rooms/drive-b/drive/folders/root', ck)).status, 401);
+  assert.strictEqual((await cookieReq('/api/rooms/drive-b/drive/folders/root', `${ck}; ${ckB}`)).status, 200);
+  assert.strictEqual((await cookieReq('/api/rooms/drive-a/drive/folders/root', `x=1; ${ckB}; ${ck}; y=2`)).status, 200);
+  // Room A's token under room B's cookie name does not work either.
+  assert.strictEqual((await cookieReq('/api/rooms/drive-b/drive/folders/root', `${ckB.split('=')[0]}=${tokA}`)).status, 401);
+  // Bearer comes first: a bad header is not rescued by a good cookie.
+  assert.strictEqual((await cookieReq('/api/rooms/drive-a/drive/folders/root', ck, { headers: { Authorization: 'Bearer nope' } })).status, 401);
+  assert.strictEqual((await cookieReq('/api/rooms/drive-a/drive/folders/root', ck, { headers: { Authorization: `Bearer ${tokA}` } })).status, 200);
+  // Defensive parsing: junk and an over-long header are just "no cookie".
+  assert.strictEqual((await cookieReq('/api/rooms/drive-a/drive/folders/root', '%%;;=;===')).status, 401);
+  assert.strictEqual((await cookieReq('/api/rooms/drive-a/drive/folders/root', `pad=${'x'.repeat(9000)}; ${ck}`)).status, 401);
 });
 
 test('drive: folders are listed with kinds, sizes and durations; only the room folder tree is reachable', async () => {
@@ -1535,4 +1614,115 @@ test('a failed join leaves no ghost: it cannot relay signals, is not counted, an
   a.close();
   b.close();
   s.stop();
+});
+
+// A second server with Drive on: tokens are renewed while members stay connected, and the session cookie is Secure behind TLS.
+test('drive: a member connected for a long time gets a fresh token pushed; the cookie is Secure behind a TLS proxy', async () => {
+  const FOLDER = 'REFRESH_FOLDER_01';
+  google.addFolder(FOLDER, 'Refresh folder');
+  google.addFile('REFRESH_MOVIE_001', 'r.mp4', FOLDER, Buffer.from('0123456789'), 'video/mp4');
+  const s = await spawnServer({
+    GOOGLE_SERVICE_ACCOUNT: google.writeAccount(keyDir), GOOGLE_API_BASE: google.url, DRIVE_DEBUG: '1',
+    DRIVE_TOKEN_REFRESH_MS: '600', HEARTBEAT_MS: '150', TRUST_PROXY: 'true',
+  });
+  const login = await fetch(s.base + '/api/admin/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password: 'admin-pw' }) });
+  const admin = { 'Content-Type': 'application/json', cookie: login.headers.get('set-cookie').split(';')[0] };
+  assert.strictEqual((await fetch(s.base + '/api/admin/rooms', { method: 'POST', headers: admin, body: JSON.stringify({ name: 'refresh', password: 'pw' }) })).status, 201);
+  assert.strictEqual((await fetch(s.base + '/api/admin/rooms/refresh/drive', { method: 'PUT', headers: admin, body: JSON.stringify({ link: FOLDER }) })).status, 200);
+
+  const ws = new WebSocket(s.base.replace('http', 'ws') + '/ws');
+  const inbox = [];
+  let wake = null;
+  ws.on('message', (m) => { inbox.push(JSON.parse(m.toString())); wake?.(); });
+  const next = async (ms = 4000) => {
+    const end = Date.now() + ms;
+    while (!inbox.length && Date.now() < end) await new Promise((r) => { wake = r; setTimeout(r, 50); });
+    return inbox.shift();
+  };
+  await new Promise((r) => ws.on('open', r));
+  ws.send(JSON.stringify({ type: 'join', room: 'refresh', id: 'rrrrrrrr1', name: 'Tester', password: 'pw' }));
+  const welcome = await next();
+  assert.strictEqual(welcome.type, 'welcome');
+  const first = welcome.drive.token;
+  const get = (token) => fetch(s.base + '/api/rooms/refresh/drive/folders/root', { headers: { Authorization: `Bearer ${token}` } });
+  assert.strictEqual((await get(first)).status, 200);
+
+  // After more than the (shortened) refresh age and a housekeeping tick, a new token arrives over the socket.
+  const push = await next();
+  assert.strictEqual(push?.type, 'drive');
+  assert.strictEqual(push.drive.folder, FOLDER);
+  assert.notStrictEqual(push.drive.token, first);
+  assert.strictEqual((await get(push.drive.token)).status, 200);
+  // ...and then again, so a member never runs out (the timer restarts with each push).
+  const again = await next();
+  assert.strictEqual(again?.type, 'drive');
+  assert.notStrictEqual(again.drive.token, push.drive.token);
+  ws.close();
+
+  // The session cookie is Secure when the proxy says the request came in over https, like the admin cookie.
+  const viaProxy = (proto) => fetch(s.base + '/api/rooms/refresh/drive/session', { method: 'POST', headers: { Authorization: `Bearer ${push.drive.token}`, 'X-Forwarded-Proto': proto, 'X-Forwarded-For': '203.0.113.9' } });
+  assert.match((await viaProxy('https')).headers.get('set-cookie'), /; Secure/);
+  assert.doesNotMatch((await viaProxy('http')).headers.get('set-cookie'), /Secure/);
+  // Clearing it is Secure under the same rule.
+  const clearVia = (proto) => fetch(s.base + '/api/rooms/refresh/drive/session', { method: 'DELETE', headers: { 'X-Forwarded-Proto': proto, 'X-Forwarded-For': '203.0.113.9' } });
+  assert.match((await clearVia('https')).headers.get('set-cookie'), /Max-Age=0; Secure$/);
+  assert.doesNotMatch((await clearVia('http')).headers.get('set-cookie'), /Secure/);
+});
+
+// Drive limits seen from the HTTP side: a folder listing that was cut off says so, and one room cannot hold
+// more than 3 x MAX_ROOM_SIZE file streams open at once.
+test('drive: `truncated` reaches the folders endpoint, and a room has a cap on open file streams (429)', async () => {
+  const F = 'LIMITS_FOLDER_001', BIG = 'LIMITS_BIG_FILE_01';
+  google.addFolder(F, 'Limits folder');
+  for (let i = 0; i < 5; i++) google.addFile(`LIMITS_MOVIE_00${i}_`, `m${i}.mp4`, F, Buffer.from('0123456789'), 'video/mp4');
+  const big = bytes(48 * MiB);
+  google.addFile(BIG, 'big.mp4', F, big, 'video/mp4');
+  const s = await spawnServer({
+    GOOGLE_SERVICE_ACCOUNT: google.writeAccount(keyDir), GOOGLE_API_BASE: google.url, DRIVE_DEBUG: '1',
+    DRIVE_MAX_LIST_ITEMS: '3', MAX_ROOM_SIZE: '1', // at most 3 streams per room
+  });
+  const login = await fetch(s.base + '/api/admin/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password: 'admin-pw' }) });
+  const admin = { 'Content-Type': 'application/json', cookie: login.headers.get('set-cookie').split(';')[0] };
+  assert.strictEqual((await fetch(s.base + '/api/admin/rooms', { method: 'POST', headers: admin, body: JSON.stringify({ name: 'limits' }) })).status, 201);
+  const put = await fetch(s.base + '/api/admin/rooms/limits/drive', { method: 'PUT', headers: admin, body: JSON.stringify({ link: F }) });
+  assert.deepStrictEqual((await put.json()).check, { name: 'Limits folder', items: 3, truncated: true });
+
+  const ws = new WebSocket(s.base.replace('http', 'ws') + '/ws');
+  const welcome = await new Promise((resolve) => {
+    ws.on('open', () => ws.send(JSON.stringify({ type: 'join', room: 'limits', id: 'llllllll1', name: 'L' })));
+    ws.on('message', (m) => resolve(JSON.parse(m.toString())));
+  });
+  const token = welcome.drive.token;
+  const listing = await (await fetch(s.base + '/api/rooms/limits/drive/folders/root', { headers: { Authorization: `Bearer ${token}` } })).json();
+  assert.strictEqual(listing.items.length, 3);
+  assert.strictEqual(listing.truncated, true);
+
+  // Three streams that nobody reads stay open (the file is far bigger than the socket buffers); the fourth is refused.
+  const open = () => new Promise((resolve, reject) => {
+    const req = http.get(s.base + `/api/rooms/limits/drive/files/${BIG}`, { headers: { Authorization: `Bearer ${token}` } }, (res) => {
+      res.pause();
+      resolve({ res, req });
+    });
+    req.on('error', reject);
+  });
+  const held = [await open(), await open(), await open()];
+  assert(held.every((h) => h.res.statusCode === 200));
+  const refused = await fetch(s.base + `/api/rooms/limits/drive/files/${BIG}`, { headers: { Authorization: `Bearer ${token}`, Range: 'bytes=0-9' } });
+  assert.strictEqual(refused.status, 429);
+  assert.match((await refused.json()).error, /Too many movie streams/);
+  assert.strictEqual(refused.headers.get('retry-after'), '5');
+  // Other requests of the room still work (folders, and a stream is not needed for them)
+  assert.strictEqual((await fetch(s.base + '/api/rooms/limits/drive/folders/root', { headers: { Authorization: `Bearer ${token}` } })).status, 200);
+  // Closing one frees a place.
+  held[0].req.destroy();
+  let freed = false;
+  for (let i = 0; i < 50 && !freed; i++) {
+    await new Promise((r) => setTimeout(r, 100));
+    const r = await fetch(s.base + `/api/rooms/limits/drive/files/${BIG}`, { headers: { Authorization: `Bearer ${token}`, Range: 'bytes=0-9' } });
+    freed = r.status === 206;
+    await r.arrayBuffer();
+  }
+  assert(freed, 'a stream was possible again after one closed');
+  for (const h of held) h.req.destroy();
+  ws.close();
 });

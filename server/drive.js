@@ -30,6 +30,11 @@ const DEFAULT_TOKEN_URI = 'https://oauth2.googleapis.com/token';
 const BLOCK = MiB; // cache granularity
 const MAX_RUN_BLOCKS = 8; // one upstream request fetches at most 8 MiB
 const TREE_DEPTH = 32;
+const TREE_POSITIVE_MS = 60_000; // how long "this file is inside the room's folder" is believed
+const TREE_NEGATIVE_MS = 5 * 60_000; // ... and "it is not"
+const MAX_QUEUE = 64; // media requests waiting for an upstream slot
+const MAX_LIST_ITEMS = 5000; // items of one folder listing
+const MAX_LIST_PAGES = 20; // pages of 1000 files read for one listing
 
 const noop = () => {};
 const ext = (name) => (String(name).match(/\.([A-Za-z0-9]+)$/)?.[1] || '').toLowerCase();
@@ -103,9 +108,11 @@ function makeAssertion(account, nowMs = Date.now()) {
 
 // ---- small TTL memo (shares in-flight work, never keeps failures) ---------------------------------
 class Memo {
-  constructor(ttlMs, max = 500) {
+  /** `ttlOf(value)` (optional) gives the lifetime of a finished answer when it should depend on the answer. */
+  constructor(ttlMs, max = 500, ttlOf = null) {
     this.ttl = ttlMs;
     this.max = max;
+    this.ttlOf = ttlOf;
     this.map = new Map(); // key -> { p, exp }
   }
 
@@ -114,13 +121,13 @@ class Memo {
     if (e && e.exp > Date.now()) return e.p;
     const entry = { p: Promise.resolve().then(fn), exp: Date.now() + this.ttl };
     this.map.set(key, entry);
-    entry.p.catch(() => { if (this.map.get(key) === entry) this.map.delete(key); });
+    entry.p.then((value) => { if (this.ttlOf) entry.exp = Date.now() + this.ttlOf(value); }, () => { if (this.map.get(key) === entry) this.map.delete(key); });
     this._prune();
     return entry.p;
   }
 
   put(key, value) {
-    this.map.set(key, { p: Promise.resolve(value), exp: Date.now() + this.ttl });
+    this.map.set(key, { p: Promise.resolve(value), exp: Date.now() + (this.ttlOf ? this.ttlOf(value) : this.ttl) });
     this._prune();
   }
 
@@ -169,12 +176,18 @@ class GoogleDrive {
    * @param {string} [o.apiBase]  https://www.googleapis.com (tests point it at a fake)
    * @param {number} [o.cacheBytes]  block cache budget
    * @param {number} [o.maxUpstream]  concurrent media requests to Google, across all clients
+   * @param {number} [o.maxQueue]  media requests allowed to wait for a free upstream slot; more are refused as "busy"
+   * @param {number} [o.maxListItems]  items of one folder listing kept (the rest is cut off and reported as truncated)
+   * @param {number} [o.maxListPages]  pages of 1000 files read for one listing
    */
-  constructor({ account, apiBase = 'https://www.googleapis.com', cacheBytes = 256 * MiB, maxUpstream = 4, retryBackoffMs = 400, networkRetryMs = 1000 }) {
+  constructor({ account, apiBase = 'https://www.googleapis.com', cacheBytes = 256 * MiB, maxUpstream = 4, maxQueue = MAX_QUEUE, maxListItems = MAX_LIST_ITEMS, maxListPages = MAX_LIST_PAGES, retryBackoffMs = 400, networkRetryMs = 1000 }) {
     this.account = account;
     this.apiBase = apiBase.replace(/\/+$/, '');
     this.cacheBytes = cacheBytes;
     this.maxUpstream = maxUpstream;
+    this.maxQueue = maxQueue;
+    this.maxListItems = maxListItems;
+    this.maxListPages = maxListPages;
     this.retryBackoffMs = retryBackoffMs;
     this.networkRetryMs = networkRetryMs;
 
@@ -184,7 +197,9 @@ class GoogleDrive {
     this._lists = new Memo(60_000, 200); // folder id -> items
     this._infos = new Memo(60_000, 500); // id -> { id, name, mimeType }
     this._metas = new Memo(60_000, 2000); // id -> file metadata (name, mimeType, size, trashed)
-    this._tree = new Memo(5 * 60_000, 20_000); // "<room folder>/<id>" -> boolean
+    // "<room folder>/<id>" -> boolean. "Not inside" is kept for 5 minutes (it costs a walk up the tree to find out), but
+    // "inside" for 60 s only: moving a file out of the room's folder must not leave it reachable for long.
+    this._tree = new Memo(TREE_NEGATIVE_MS, 20_000, (inside) => (inside ? TREE_POSITIVE_MS : TREE_NEGATIVE_MS));
 
     this.blocks = new Map(); // "<file>:<index>" -> Buffer; Map order = LRU order (oldest first)
     this.cached = 0;
@@ -365,7 +380,12 @@ class GoogleDrive {
   }
 
   /** Folders, videos and subtitle files in a folder: folders first, then by name. Cached for 60 s. */
-  list(folderId) {
+  async list(folderId) {
+    return (await this.listing(folderId)).items;
+  }
+
+  /** Like list(), as { items, truncated }: `truncated` when the folder is larger than the limits and the rest was left out. */
+  listing(folderId) {
     GoogleDrive._id(folderId);
     return this._lists.run(folderId, () => this._list(folderId));
   }
@@ -373,6 +393,8 @@ class GoogleDrive {
   async _list(folderId) {
     const out = [];
     let pageToken = '';
+    let truncated = false;
+    let pages = 0;
     do {
       const params = new URLSearchParams({
         q: `'${folderId}' in parents and trashed=false`,
@@ -383,20 +405,29 @@ class GoogleDrive {
       });
       if (pageToken) params.set('pageToken', pageToken);
       const data = await this._json(`files?${params}`);
+      pages++;
       for (const f of data.files || []) {
         if (!ID_RE.test(String(f.id))) continue;
         const kind = kindOf(f);
         if (!kind) continue;
+        if (out.length >= this.maxListItems) {
+          truncated = true;
+          break;
+        }
         const size = Number(f.size) || 0;
         out.push({ id: f.id, name: String(f.name), kind, size, durationMs: Number(f.videoMediaMetadata?.durationMillis) || 0 });
         // Lets a following request for this file skip the metadata call.
         if (kind !== 'folder') this._metas.put(f.id, { id: f.id, name: String(f.name), mimeType: String(f.mimeType || ''), size: Number(f.size), trashed: false });
       }
-      pageToken = data.nextPageToken || '';
+      pageToken = truncated ? '' : data.nextPageToken || '';
+      if (pageToken && pages >= this.maxListPages) {
+        truncated = true; // a folder of mostly other files: do not page through all of it
+        pageToken = '';
+      }
     } while (pageToken);
     const rank = (f) => (f.kind === 'folder' ? 0 : 1);
     out.sort((a, b) => rank(a) - rank(b) || a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' }));
-    return out;
+    return { items: out, truncated };
   }
 
   /** Forget cached answers about a folder (after the admin attaches it). */
@@ -477,6 +508,8 @@ class GoogleDrive {
       this.active++;
       return;
     }
+    // Everybody else is waiting already: a short, honest "busy" is better than a queue that grows without bound.
+    if (this.queue.length >= this.maxQueue) throw new DriveError('Google Drive is busy, try again shortly.', 503);
     await new Promise((resolve, reject) => this.queue.push({ run, resolve, reject }));
   }
 
@@ -522,6 +555,9 @@ class GoogleDrive {
   _abortRun(run) {
     run.aborted = true;
     run.ctrl.abort();
+    // Still waiting for an upstream slot: leave the queue now rather than when a slot frees up.
+    const i = this.queue.findIndex((w) => w.run === run);
+    if (i >= 0) this.queue.splice(i, 1)[0].reject(new DriveError('Cancelled', 499, { aborted: true }));
     for (let i = run.a; i <= run.b; i++) {
       const k = `${run.fileId}:${i}`;
       if (this.pending.get(k)?.run === run) this.pending.delete(k);
@@ -555,6 +591,14 @@ class GoogleDrive {
           throw new DriveError('Google Drive ignored the byte range request.', 502, { permanent: true });
         }
         throw await this._errorFrom(res);
+      }
+      // The length can be right while the offset is wrong: a block cached under the wrong offset would corrupt the film.
+      if (res.status === 206) {
+        const cr = String(res.headers.get('content-range') || '').trim();
+        if (cr !== `bytes ${start}-${end}/${size}`) {
+          await res.body?.cancel().catch(noop);
+          throw new DriveError('Google Drive sent a different part of the file than asked for.', 502, { retryable: true });
+        }
       }
       let buf;
       try {
