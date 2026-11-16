@@ -51,6 +51,10 @@ for (const entry of (process.env.ALLOWED_ORIGINS || '').split(',').map((o) => o.
   }
 }
 const DRIVE_DEBUG = process.env.DRIVE_DEBUG === '1';
+// Test knobs, honoured only together with DRIVE_DEBUG=1: how old a member's Drive token may get before a new one is
+// pushed, and how often the housekeeping tick (which does that) runs. Production uses 10 h and 30 s.
+const TOKEN_REFRESH_MS = (DRIVE_DEBUG && parseInt(process.env.DRIVE_TOKEN_REFRESH_MS, 10)) || 10 * 3600 * 1000;
+const HEARTBEAT_MS = (DRIVE_DEBUG && parseInt(process.env.HEARTBEAT_MS, 10)) || 30000;
 const MAX_MESSAGE_BYTES = 64 * 1024;
 // Per-socket message budget (token bucket): room for ICE candidate bursts and clock-sync pings.
 // A newcomer in a full room sends an offer plus a dozen ICE candidates to each peer, so the burst is generous.
@@ -105,10 +109,10 @@ const MIN_DRIVE_CACHE_MB = 32;
 }
 
 // ---- Room tokens for the Drive endpoints -----------------------------------------
-// A token proves that its holder joined a room (it is only sent in the welcome message, after the
-// password check). Format: base64url(JSON {r: room key, e: expiry ms, v: room version}) + '.' +
+// A token proves that its holder joined a room (it is only sent over the member's WebSocket, after the
+// password check: in the welcome message, and again before it expires or when the room's access changes). Format: base64url(JSON {r: room key, e: expiry ms, v: room version}) + '.' +
 // base64url(HMAC-SHA256 of the first part). The secret is random per process, so tokens do not
-// survive a restart (clients get a fresh one when they reconnect). The version is a hash of the
+// survive a restart (clients get a fresh one when they reconnect, and every TOKEN_REFRESH_MS while connected). The version is a hash of the
 // room's creation time, password hash and Drive folder: changing the password or the folder
 // invalidates every token issued before.
 const TOKEN_SECRET = crypto.randomBytes(32);
@@ -127,8 +131,8 @@ function issueToken(r) {
   return `${body}.${tokenSignature(body)}`;
 }
 
-/** The room a valid token belongs to, or null. */
-function verifyToken(token) {
+/** The room a valid token belongs to and the time it expires, or null. */
+function checkToken(token) {
   if (typeof token !== 'string' || token.length > 600) return null;
   const dot = token.indexOf('.');
   if (dot <= 0) return null;
@@ -145,7 +149,12 @@ function verifyToken(token) {
   if (!claim || typeof claim.r !== 'string' || typeof claim.e !== 'number' || claim.e < Date.now()) return null;
   const room = store.get(claim.r);
   if (!room || !room.drive || claim.v !== roomVersion(room)) return null;
-  return room;
+  return { room, exp: claim.e };
+}
+
+/** The room a valid token belongs to, or null. */
+function verifyToken(token) {
+  return checkToken(token)?.room ?? null;
 }
 
 // ---- ICE (STUN/TURN) configuration ---------------------------------------
@@ -543,7 +552,26 @@ function pushDrive(name) {
   const members = roomMembers(name);
   if (!members) return;
   const info = driveInfo(store.get(name));
-  for (const m of members.values()) send(m.ws, { type: 'drive', drive: info });
+  for (const m of members.values()) {
+    send(m.ws, { type: 'drive', drive: info });
+    m.driveAt = Date.now();
+  }
+}
+
+/** Hand a fresh token to the members whose last one is older than TOKEN_REFRESH_MS (a token lives 12 h). */
+function refreshDriveTokens() {
+  if (!driveApi) return;
+  const now = Date.now();
+  for (const [key, members] of live) {
+    let info; // one token per room and tick
+    for (const m of members.values()) {
+      if (now - m.driveAt < TOKEN_REFRESH_MS) continue;
+      info ??= driveInfo(store.get(key));
+      if (!info) break; // no folder (any more): nothing to refresh
+      send(m.ws, { type: 'drive', drive: info });
+      m.driveAt = now;
+    }
+  }
 }
 
 function kickRoom(name, code, message) {
@@ -628,18 +656,59 @@ const waitDrain = (res) => new Promise((resolve) => {
   res.once('close', done);
 });
 
+// A <video> element cannot send an Authorization header, and a token in the URL would end up in access logs, so native
+// playback uses a cookie instead: POST .../drive/session sets it from the Bearer token. One cookie per room (its name
+// carries a hash of the room key), because the cookie path covers all rooms.
+const DRIVE_COOKIE_PREFIX = 't8d_';
+const MAX_COOKIE_HEADER = 8192; // browsers send far less; anything longer is not parsed
+
+function driveCookieName(roomKey) {
+  return DRIVE_COOKIE_PREFIX + crypto.createHash('sha256').update(roomKey).digest('base64url').slice(0, 16);
+}
+
+/** The Drive token cookie of this room, or ''. Only that one cookie is looked at, in a bounded header. */
+function driveCookie(req, roomKey) {
+  const header = req.headers.cookie;
+  if (typeof header !== 'string' || header.length > MAX_COOKIE_HEADER) return '';
+  const name = driveCookieName(roomKey);
+  for (const part of header.split(';')) {
+    const i = part.indexOf('=');
+    if (i > 0 && part.slice(0, i).trim() === name) return part.slice(i + 1).trim();
+  }
+  return '';
+}
+
+// POST /api/rooms/:room/drive/session   Authorization: Bearer <room token>  ->  204 + the room's token cookie
+function handleDriveSession(req, res, parts) {
+  if (req.method !== 'POST') return sendJson(res, 405, { error: 'Method not allowed' }, { ...DRIVE_HEADERS, Allow: 'POST' });
+  if (!driveApi) return sendJson(res, 503, { error: 'Google Drive is not set up on this server.' }, DRIVE_HEADERS);
+  // There is no body to read; refuse a large one instead of draining it.
+  if (Number(req.headers['content-length'] || 0) > 1024) return sendJson(res, 413, { error: 'Body too large' }, DRIVE_HEADERS);
+  req.resume();
+  const bearer = /^Bearer\s+(\S+)$/i.exec(String(req.headers.authorization || ''));
+  const checked = bearer && checkToken(bearer[1]);
+  if (!checked || RoomStore.key(parts[2]) !== RoomStore.key(checked.room.name)) {
+    return sendJson(res, 401, { error: 'Your Drive session is missing or has expired. Rejoin the room.' }, DRIVE_HEADERS);
+  }
+  const maxAge = Math.max(0, Math.floor((checked.exp - Date.now()) / 1000));
+  const cookie = `${driveCookieName(RoomStore.key(checked.room.name))}=${bearer[1]}; Path=/api/rooms/; HttpOnly; SameSite=Strict; Max-Age=${maxAge}${isHttps(req) ? '; Secure' : ''}`;
+  res.writeHead(204, { ...SECURITY_HEADERS, ...DRIVE_HEADERS, 'Set-Cookie': cookie });
+  res.end();
+}
+
 // GET /api/rooms/:room/drive/folders/:id      (id may be "root": the room's folder)
 // GET|HEAD /api/rooms/:room/drive/files/:id
-// Authorization: Bearer <room token>, or ?t=<room token> (a <video> element cannot send headers).
+// Authorization: Bearer <room token>, or else the room's token cookie (see handleDriveSession). Never the URL.
 async function handleDrive(req, res, url, parts) {
   const what = parts[4];
+  if (what === 'session' && parts.length === 5) return handleDriveSession(req, res, parts);
   const isFiles = what === 'files';
   if (parts.length !== 6 || (what !== 'folders' && !isFiles)) return sendJson(res, 404, { error: 'Not found' }, DRIVE_HEADERS);
   if (req.method !== 'GET' && !(req.method === 'HEAD' && isFiles)) return sendJson(res, 405, { error: 'Method not allowed' }, { ...DRIVE_HEADERS, Allow: isFiles ? 'GET, HEAD' : 'GET' });
   if (!driveApi) return sendJson(res, 503, { error: 'Google Drive is not set up on this server.' }, DRIVE_HEADERS);
 
   const bearer = /^Bearer\s+(\S+)$/i.exec(String(req.headers.authorization || ''));
-  const room = verifyToken(bearer ? bearer[1] : url.searchParams.get('t') || '');
+  const room = verifyToken(bearer ? bearer[1] : driveCookie(req, RoomStore.key(parts[2])));
   if (!room || RoomStore.key(parts[2]) !== RoomStore.key(room.name)) {
     return sendJson(res, 401, { error: 'Your Drive session is missing or has expired. Rejoin the room.' }, DRIVE_HEADERS);
   }
@@ -1047,14 +1116,18 @@ async function handleJoin(ws, msg) {
     } catch { /* already gone */ }
   }
   const peers = [...members.entries()].filter(([pid]) => pid !== id).map(([pid, m]) => ({ id: pid, name: m.name }));
-  members.set(id, { ws, name });
+  const member = { ws, name, driveAt: 0 }; // driveAt: when this socket last got a Drive token
+  members.set(id, member);
   ws.room = key;
   ws.id = id;
   try {
     // resumed: this join took over the live entry of the same participant (a reconnect).
     const welcome = { type: 'welcome', id, room: room.name, peers, resumed: !!existing };
     const drive = driveInfo(room);
-    if (drive) welcome.drive = drive;
+    if (drive) {
+      welcome.drive = drive;
+      member.driveAt = Date.now();
+    }
     send(ws, welcome);
     if (!existing) {
       for (const [pid, m] of members) if (pid !== id) send(m.ws, { type: 'peer-joined', id, name });
@@ -1213,7 +1286,8 @@ const heartbeat = setInterval(() => {
   roomLimiter.sweep();
   const now = Date.now();
   for (const [t, exp] of adminSessions) if (exp < now) adminSessions.delete(t);
-}, 30000);
+  refreshDriveTokens();
+}, HEARTBEAT_MS);
 wss.on('close', () => clearInterval(heartbeat));
 
 server.listen(PORT, HOST, () => {

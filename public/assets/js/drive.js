@@ -2,6 +2,8 @@
 // our own server (the server reads Drive as a service account; the browser
 // never contacts Google). Requests carry the room token that the server sent
 // in the welcome message. Used by the room page.
+// A <video> element cannot send headers, so for native playback the token also goes to the server once (and again
+// whenever it is renewed) as a cookie that only our Drive endpoints read: see DriveClient.ensureSession().
 
 import { RemoteFile } from './player/remotefile.js';
 
@@ -92,11 +94,45 @@ export class DriveClient {
     this.token = token;
     this.folder = folder;
     this.cache = new Map(); // folder id ('root' for the room's folder) -> Promise of its listing
+    this.session = null; // Promise of the cookie session for the current token
+    this._startSession();
   }
 
-  /** A reconnect brings a fresh token: files already open pick it up on their next request. */
+  /**
+   * A reconnect or a periodic renewal brings a fresh token: files already open pick it up on their next request,
+   * and the cookie is renewed in place, so a video that is playing natively keeps working without a new src.
+   */
   setToken(token) {
     this.token = token;
+    this._startSession();
+  }
+
+  _startSession() {
+    const token = this.token;
+    const p = (async () => {
+      let res;
+      try {
+        res = await fetch(`${this.base}/session`, { method: 'POST', headers: { Authorization: `Bearer ${token}` }, cache: 'no-store' });
+      } catch (err) {
+        throw networkError(err);
+      }
+      if (!res.ok) throw await serverError(res);
+    })();
+    p.catch(() => {}); // nobody may be waiting for it; ensureSession() reports it to whoever is
+    this.session = p;
+    p.failed = false;
+    p.catch(() => { p.failed = true; });
+    return p;
+  }
+
+  /**
+   * Resolves when the server has set the cookie for the current token (what a native <video> request needs).
+   * A failed attempt is not final: the next call tries again (`force` also replaces one that succeeded earlier,
+   * e.g. after a media error that may mean the cookie is gone).
+   */
+  ensureSession(force = false) {
+    if (force || this.session.failed) this._startSession();
+    return this.session;
   }
 
   get base() {
@@ -160,7 +196,7 @@ export class DriveClient {
     const common = {
       name: file.name,
       size: file.size,
-      nativeUrl: `${url}?t=${encodeURIComponent(this.token)}`, // a <video> element cannot send headers
+      nativeUrl: url, // authorized by the session cookie, never by a token in the URL (it would end up in access logs)
       explain: serverError,
       networkError,
       retries: 2,
@@ -177,6 +213,7 @@ export class DriveClient {
       });
     }
     rf.drive = drive;
+    rf.prepareNative = (force) => this.ensureSession(force); // the player awaits this before it sets video.src
     return rf;
   }
 
