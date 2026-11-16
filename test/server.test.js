@@ -1726,3 +1726,16 @@ test('drive: `truncated` reaches the folders endpoint, and a room has a cap on o
   for (const h of held) h.req.destroy();
   ws.close();
 });
+
+test('container health check: exits 0 while the server answers, 1 when it is down', async () => {
+  const script = path.join(__dirname, '..', 'server', 'healthcheck.js');
+  const run = (env) => new Promise((resolve) => {
+    const child = spawn(process.execPath, [script], { env: { ...process.env, TLS_CERT: '', TLS_KEY: '', ...env }, stdio: 'ignore' });
+    child.on('exit', (code) => resolve(code));
+  });
+  assert.strictEqual(await run({ PORT: String(PORT), HOST: '127.0.0.1' }), 0, 'healthy server');
+  assert.strictEqual(await run({ PORT: String(PORT), HOST: '0.0.0.0' }), 0, 'wildcard bind is checked over loopback');
+  assert.strictEqual(await run({ PORT: String(await freePort()), HOST: '127.0.0.1' }), 1, 'nothing listening');
+  // A plain HTTP server speaking to an HTTPS check (TLS_CERT set) fails rather than passing by accident.
+  assert.strictEqual(await run({ PORT: String(PORT), HOST: '127.0.0.1', TLS_CERT: 'x', TLS_KEY: 'x' }), 1, 'TLS mismatch');
+});
