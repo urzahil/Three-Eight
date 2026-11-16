@@ -16,6 +16,7 @@ USER node
 
 EXPOSE 4567
 VOLUME ["/data"]
-HEALTHCHECK --interval=30s --timeout=3s CMD wget -qO- http://127.0.0.1:4567/healthz >/dev/null || exit 1
+# Follows PORT, HOST and TLS_CERT/TLS_KEY, so overriding them does not mark the container unhealthy.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 CMD ["node", "server/healthcheck.js"]
 
 CMD ["node", "server/server.js"]

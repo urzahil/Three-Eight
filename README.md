@@ -60,6 +60,8 @@ docker compose up -d --build
 
 The server listens on **port 4567**, published on `127.0.0.1` only, which suits a TLS reverse proxy on the same host (see below). If your proxy runs in another container, put both on a shared Docker network and remove the `ports` entry instead of publishing the port. Only if nothing sits in front of the app, publish it on all interfaces (`"4567:4567"`) and set `TRUST_PROXY=false`. Rooms are kept in the `three-eight-data` volume.
 
+The image has a health check (`node server/healthcheck.js`, which requests `/healthz` every 30 s using the same `PORT`, `HOST` and TLS settings as the server). `docker compose ps` shows the container as `healthy`, or `unhealthy` after three failed checks in a row.
+
 Or without compose:
 
 ```bash
