@@ -47,8 +47,15 @@ async function fetchConfig() {
 // ---------------------------------------------------------------------------
 const roomName = decodeURIComponent(location.pathname.replace(/^\/+|\/+$/g, ''));
 
+// Installable app (PWA). Service workers need a secure context (HTTPS or localhost); elsewhere this is skipped.
+if ('serviceWorker' in navigator && window.isSecureContext) {
+  navigator.serviceWorker.register('/sw.js').catch((err) => console.warn('service worker not registered:', err));
+}
+
 if (!roomName) {
   show('landing');
+  // The installed app opens on "/": offer the room used last.
+  $('landing-room').value = store.get('lastRoom', '');
   $('landing-form').addEventListener('submit', (e) => {
     e.preventDefault();
     const r = $('landing-room').value.trim();
@@ -65,7 +72,10 @@ if (!roomName) {
 // Lobby
 // ---------------------------------------------------------------------------
 async function startLobby(room) {
-  const res = await fetch('/api/rooms/' + encodeURIComponent(room));
+  const res = await fetch('/api/rooms/' + encodeURIComponent(room)).catch(() => {
+    // Offline (the installed app can open without a connection), or the server is down.
+    throw new Error('Could not reach the server. Check your connection and try again.');
+  });
   if (res.status === 404) {
     showMessage('Room not found', `There is no room called “${room}”. Check the link with whoever invited you.`);
     return;
@@ -73,6 +83,7 @@ async function startLobby(room) {
   if (!res.ok) throw new Error('Server error');
   const info = await res.json();
   document.title = `${info.name} · Three-Eight`;
+  store.set('lastRoom', info.name);
   $('lobby-room-name').textContent = info.name;
   $('lobby-name').value = store.get('name', '');
   const pwKey = 'pw.' + info.name.toLowerCase();
