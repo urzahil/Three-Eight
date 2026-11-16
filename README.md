@@ -164,6 +164,7 @@ If the admin attached a Google Drive folder to the room ([setup below](#google-d
 - Viewers share pieces with each other just like with a friend's copy, so the server sends each part of a film about once, however many people watch. If a friend stops answering or leaves, the others fetch the missing pieces from the server instead.
 - A browser without Media Source Extensions (old iOS) plays the film straight from the server and doesn't take part in sharing; that costs the server a full copy for that viewer.
 - If Google temporarily blocks a heavily downloaded file ("download quota exceeded"), people see that message; use a local copy until it clears.
+- Limits: a folder listing shows at most 5000 items (a note appears when a folder is larger); one room can have at most 3 × `MAX_ROOM_SIZE` film streams open at once, and at most 64 requests wait for a free connection to Google before the server answers "busy, try again shortly". Listings are remembered for 45 seconds in the browser (the reload button next to **From Google Drive** asks again) and 60 seconds on the server, and the server believes "this file is inside the room's folder" for 60 seconds. Every partial answer from Google is checked to be the byte range that was asked for.
 
 ### Mixing sources
 

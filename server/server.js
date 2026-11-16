@@ -100,6 +100,7 @@ const MIN_DRIVE_CACHE_MB = 32;
         account,
         apiBase: (process.env.GOOGLE_API_BASE || 'https://www.googleapis.com').trim(),
         cacheBytes: mb * MiB,
+        maxListItems: (DRIVE_DEBUG && parseInt(process.env.DRIVE_MAX_LIST_ITEMS, 10)) || undefined, // a test knob
       });
       console.log(`Google Drive enabled (service account ${account.email})`);
     } catch (err) {
@@ -592,9 +593,14 @@ function kickRoom(name, code, message) {
 /** @type {Map<string, Set<{version: string, abort: () => void}>>} */
 const driveStreams = new Map();
 
+// At most this many file responses are open per room at once (a viewer has a few in flight; members x 3 is generous).
+// More would be one room using the server's whole upstream budget, e.g. a client that opens requests without reading.
+const MAX_DRIVE_STREAMS_PER_ROOM = 3 * MAX_ROOM_SIZE;
+
 /**
  * Register a streaming response of `room` (the room object its token was verified against). Returns the function that
- * unregisters it, or null when the room is gone or changed since the token was checked (nothing is registered then).
+ * unregisters it, null when the room is gone or changed since the token was checked (nothing is registered then), or
+ * 'busy' when the room already has too many open file responses.
  */
 function trackDriveStream(room, abort) {
   const now = store.get(room.name);
@@ -602,6 +608,7 @@ function trackDriveStream(room, abort) {
   if (!now || roomVersion(now) !== version) return null;
   const key = RoomStore.key(room.name);
   let set = driveStreams.get(key);
+  if ((set?.size || 0) >= MAX_DRIVE_STREAMS_PER_ROOM) return 'busy';
   if (!set) driveStreams.set(key, (set = new Set()));
   const entry = { version, abort };
   set.add(entry);
@@ -628,8 +635,8 @@ async function checkFolder(folderId) {
     driveApi.forget(folderId);
     const info = await driveApi.folderInfo(folderId);
     if (info.mimeType !== FOLDER) return { error: 'That link points to a file, not a folder.' };
-    const items = await driveApi.list(folderId);
-    return { name: info.name, items: items.length };
+    const { items, truncated } = await driveApi.listing(folderId);
+    return { name: info.name, items: items.length, ...(truncated && { truncated: true }) };
   } catch (err) {
     return { error: err instanceof DriveError ? err.message : 'The folder could not be read.' };
   }
@@ -725,10 +732,11 @@ async function handleDrive(req, res, url, parts) {
     const now = store.get(room.name);
     if (!now || roomVersion(now) !== roomVersion(room)) return sendJson(res, 401, { error: 'Your Drive session is missing or has expired. Rejoin the room.' }, DRIVE_HEADERS);
     if (!isFiles) {
-      const [info, items] = await Promise.all([driveApi.folderInfo(id), driveApi.list(id)]);
+      const [info, { items, truncated }] = await Promise.all([driveApi.folderInfo(id), driveApi.listing(id)]);
       if (info.mimeType !== FOLDER) return sendJson(res, 404, { error: 'That is not a folder.' }, DRIVE_HEADERS);
       driveApi.markInTree(root, items.map((f) => f.id));
-      return sendJson(res, 200, { id, name: info.name, items }, DRIVE_HEADERS);
+      // `truncated`: the folder is larger than the server lists (the rest is not shown).
+      return sendJson(res, 200, { id, name: info.name, items, ...(truncated && { truncated: true }) }, DRIVE_HEADERS);
     }
     await serveFile(req, res, id, room);
   } catch (err) {
@@ -773,6 +781,7 @@ async function serveFile(req, res, id, room) {
     ctrl.abort();
     res.destroy(); // the client sees the connection cut, not a clean end
   });
+  if (untrack === 'busy') return sendJson(res, 429, { error: 'Too many movie streams are open in this room right now. Wait a moment and try again.' }, { ...DRIVE_HEADERS, 'Retry-After': '5' });
   if (!untrack) return sendJson(res, 401, { error: 'Your Drive session is missing or has expired. Rejoin the room.' }, DRIVE_HEADERS);
   res.on('close', () => {
     untrack();

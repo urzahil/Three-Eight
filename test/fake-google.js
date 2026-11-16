@@ -8,7 +8,7 @@
 //   // (GOOGLE_SERVICE_ACCOUNT) whose token_uri is this server's /token.
 //
 // Failure modes (properties of g.mode): quotaIds (Set of file ids whose media gets a 403
-// downloadQuotaExceeded), failMedia (number of next media requests that answer 500), slowMs (delay
+// downloadQuotaExceeded), failMedia (number of next media requests that answer 500), shiftMedia (number of next range requests answered with another offset), slowMs (delay
 // of media responses), tokenTtl (expires_in of new tokens, seconds), pageLimit (items per list page).
 'use strict';
 
@@ -27,7 +27,7 @@ async function startFakeGoogle() {
   const files = new Map(); // id -> { id, name, mimeType, parents, data? }
   const tokens = new Map(); // access token -> expiry ms
   const log = []; // { type: 'token'|'list'|'meta'|'media', ... }
-  const mode = { quotaIds: new Set(), failMedia: 0, slowMs: 0, tokenTtl: 3600, pageLimit: 1000 };
+  const mode = { quotaIds: new Set(), failMedia: 0, slowMs: 0, tokenTtl: 3600, pageLimit: 1000, shiftMedia: 0 };
   let issued = 0;
   let url = '';
 
@@ -145,6 +145,14 @@ async function startFakeGoogle() {
       }
       entry.status = 206;
       entry.end = b;
+      if (mode.shiftMedia > 0) {
+        // A broken upstream: the right number of bytes, but from one byte further on (or back) and a header that says so.
+        mode.shiftMedia--;
+        const d = b + 1 < data.length ? 1 : -1;
+        entry.shifted = true;
+        res.writeHead(206, { 'Content-Type': f.mimeType, 'Content-Length': b - a + 1, 'Content-Range': `bytes ${a + d}-${b + d}/${data.length}`, 'Accept-Ranges': 'bytes' });
+        return res.end(data.subarray(a + d, b + d + 1));
+      }
       res.writeHead(206, { 'Content-Type': f.mimeType, 'Content-Length': b - a + 1, 'Content-Range': `bytes ${a}-${b}/${data.length}`, 'Accept-Ranges': 'bytes' });
       return res.end(data.subarray(a, b + 1));
     } catch (err) {

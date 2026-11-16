@@ -9,6 +9,7 @@ import { RemoteFile } from './player/remotefile.js';
 
 const ID_RE = /^[A-Za-z0-9_-]{10,200}$/;
 const NETWORK_MESSAGE = 'Could not reach the server.';
+const CACHE_MS = 45 * 1000; // a folder listing is reused for this long (files appear in Drive while the room is open)
 
 function checkId(id) {
   if (!ID_RE.test(String(id))) throw new Error('That is not a valid Google Drive ID.');
@@ -93,7 +94,7 @@ export class DriveClient {
     this.room = room;
     this.token = token;
     this.folder = folder;
-    this.cache = new Map(); // folder id ('root' for the room's folder) -> Promise of its listing
+    this.cache = new Map(); // folder id ('root' for the room's folder) -> { p: Promise of its listing, at: when it was asked }
     this.session = null; // Promise of the cookie session for the current token
     this._startSession();
   }
@@ -161,18 +162,30 @@ export class DriveClient {
   _folder(folderId) {
     const id = !folderId || folderId === this.folder ? 'root' : folderId;
     if (id !== 'root') checkId(id);
-    let p = this.cache.get(id);
-    if (!p) {
-      p = this._getJson(`/folders/${id}`);
-      this.cache.set(id, p);
-      p.catch(() => this.cache.delete(id)); // let the user retry
+    let e = this.cache.get(id);
+    if (e && Date.now() - e.at > CACHE_MS) e = null;
+    if (!e) {
+      e = { p: this._getJson(`/folders/${id}`), at: Date.now() };
+      this.cache.set(id, e);
+      e.p.catch(() => { if (this.cache.get(id) === e) this.cache.delete(id); }); // let the user retry
     }
-    return p;
+    return e.p;
   }
 
-  /** Folders, videos and subtitle files in a folder ({ id, name, kind, size, durationMs }): folders first, then by name. Cached per session. */
+  /** Drop what is remembered about a folder (the room's folder when omitted), so the next list() asks the server again. */
+  refresh(folderId = 'root') {
+    this.cache.delete(!folderId || folderId === this.folder ? 'root' : folderId);
+  }
+
+  /** Folders, videos and subtitle files in a folder ({ id, name, kind, size, durationMs }): folders first, then by name. Cached for 45 s. */
   async list(folderId = 'root') {
     return (await this._folder(folderId)).items;
+  }
+
+  /** Like list(), as { items, truncated }: `truncated` when the folder is larger than the server lists. */
+  async listing(folderId = 'root') {
+    const f = await this._folder(folderId);
+    return { items: f.items, truncated: f.truncated === true };
   }
 
   /** Name of the room's folder. */

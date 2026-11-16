@@ -142,7 +142,7 @@ function changeDrive(name, current) {
     else if (check.error) toast(`Saved, but the folder could not be read: ${check.error}`, 10000);
     else {
       driveNames.set(name + '|' + drive.folderId, check.name);
-      toast(`Folder “${check.name}” linked: ${check.items} items`);
+      toast(`Folder “${check.name}” linked: ${check.items} items${check.truncated ? ' (very large: only the first part is listed)' : ''}`);
     }
     refresh();
   }, { once: true });

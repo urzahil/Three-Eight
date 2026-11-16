@@ -1646,3 +1646,61 @@ test('drive: a member connected for a long time gets a fresh token pushed; the c
   assert.match((await viaProxy('https')).headers.get('set-cookie'), /; Secure/);
   assert.doesNotMatch((await viaProxy('http')).headers.get('set-cookie'), /Secure/);
 });
+
+// Drive limits seen from the HTTP side: a folder listing that was cut off says so, and one room cannot hold
+// more than 3 x MAX_ROOM_SIZE file streams open at once.
+test('drive: `truncated` reaches the folders endpoint, and a room has a cap on open file streams (429)', async () => {
+  const F = 'LIMITS_FOLDER_001', BIG = 'LIMITS_BIG_FILE_01';
+  google.addFolder(F, 'Limits folder');
+  for (let i = 0; i < 5; i++) google.addFile(`LIMITS_MOVIE_00${i}_`, `m${i}.mp4`, F, Buffer.from('0123456789'), 'video/mp4');
+  const big = bytes(48 * MiB);
+  google.addFile(BIG, 'big.mp4', F, big, 'video/mp4');
+  const s = await spawnServer({
+    GOOGLE_SERVICE_ACCOUNT: google.writeAccount(keyDir), GOOGLE_API_BASE: google.url, DRIVE_DEBUG: '1',
+    DRIVE_MAX_LIST_ITEMS: '3', MAX_ROOM_SIZE: '1', // at most 3 streams per room
+  });
+  const login = await fetch(s.base + '/api/admin/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password: 'admin-pw' }) });
+  const admin = { 'Content-Type': 'application/json', cookie: login.headers.get('set-cookie').split(';')[0] };
+  assert.strictEqual((await fetch(s.base + '/api/admin/rooms', { method: 'POST', headers: admin, body: JSON.stringify({ name: 'limits' }) })).status, 201);
+  const put = await fetch(s.base + '/api/admin/rooms/limits/drive', { method: 'PUT', headers: admin, body: JSON.stringify({ link: F }) });
+  assert.deepStrictEqual((await put.json()).check, { name: 'Limits folder', items: 3, truncated: true });
+
+  const ws = new WebSocket(s.base.replace('http', 'ws') + '/ws');
+  const welcome = await new Promise((resolve) => {
+    ws.on('open', () => ws.send(JSON.stringify({ type: 'join', room: 'limits', id: 'llllllll1', name: 'L' })));
+    ws.on('message', (m) => resolve(JSON.parse(m.toString())));
+  });
+  const token = welcome.drive.token;
+  const listing = await (await fetch(s.base + '/api/rooms/limits/drive/folders/root', { headers: { Authorization: `Bearer ${token}` } })).json();
+  assert.strictEqual(listing.items.length, 3);
+  assert.strictEqual(listing.truncated, true);
+
+  // Three streams that nobody reads stay open (the file is far bigger than the socket buffers); the fourth is refused.
+  const open = () => new Promise((resolve, reject) => {
+    const req = http.get(s.base + `/api/rooms/limits/drive/files/${BIG}`, { headers: { Authorization: `Bearer ${token}` } }, (res) => {
+      res.pause();
+      resolve({ res, req });
+    });
+    req.on('error', reject);
+  });
+  const held = [await open(), await open(), await open()];
+  assert(held.every((h) => h.res.statusCode === 200));
+  const refused = await fetch(s.base + `/api/rooms/limits/drive/files/${BIG}`, { headers: { Authorization: `Bearer ${token}`, Range: 'bytes=0-9' } });
+  assert.strictEqual(refused.status, 429);
+  assert.match((await refused.json()).error, /Too many movie streams/);
+  assert.strictEqual(refused.headers.get('retry-after'), '5');
+  // Other requests of the room still work (folders, and a stream is not needed for them)
+  assert.strictEqual((await fetch(s.base + '/api/rooms/limits/drive/folders/root', { headers: { Authorization: `Bearer ${token}` } })).status, 200);
+  // Closing one frees a place.
+  held[0].req.destroy();
+  let freed = false;
+  for (let i = 0; i < 50 && !freed; i++) {
+    await new Promise((r) => setTimeout(r, 100));
+    const r = await fetch(s.base + `/api/rooms/limits/drive/files/${BIG}`, { headers: { Authorization: `Bearer ${token}`, Range: 'bytes=0-9' } });
+    freed = r.status === 206;
+    await r.arrayBuffer();
+  }
+  assert(freed, 'a stream was possible again after one closed');
+  for (const h of held) h.req.destroy();
+  ws.close();
+});

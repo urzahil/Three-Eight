@@ -174,3 +174,41 @@ test('DriveClient: the cookie session is posted for every token and retried afte
     globalThis.fetch = realFetch;
   }
 });
+
+test('DriveClient: listings expire after 45 s, refresh() drops one, and `truncated` is passed on', async () => {
+  const realFetch = globalThis.fetch;
+  const realNow = Date.now;
+  let now = realNow();
+  Date.now = () => now;
+  const asked = [];
+  globalThis.fetch = async (url) => {
+    if (url.endsWith('/session')) return new Response(null, { status: 204 });
+    asked.push(url);
+    return new Response(JSON.stringify({ id: 'ROOTFOLDER_0001', name: 'Movies', items: [], ...(url.includes('/SUBFOLDER_00002') ? { truncated: true } : {}) }), { status: 200 });
+  };
+  try {
+    const d = new DriveClient({ room: 'r', token: 't', folder: 'ROOTFOLDER_0001' });
+    await d.list();
+    now += 44_000;
+    await d.list();
+    assert.equal(asked.length, 1, 'still fresh after 44 s');
+    now += 2_000;
+    await d.list();
+    assert.equal(asked.length, 2, 'expired after 46 s');
+    d.refresh();
+    await d.list();
+    assert.equal(asked.length, 3, 'refresh() asks again');
+    d.refresh('ROOTFOLDER_0001'); // the root by its own ID is the same entry
+    await d.list('ROOTFOLDER_0001');
+    assert.equal(asked.length, 4);
+    await d.list('SUBFOLDER_00002');
+    d.refresh('SUBFOLDER_00002');
+    assert.equal(asked.length, 5);
+    assert.deepEqual(await d.listing('SUBFOLDER_00002'), { items: [], truncated: true });
+    assert.equal(asked.length, 6);
+    assert.deepEqual(await d.listing(), { items: [], truncated: false });
+  } finally {
+    globalThis.fetch = realFetch;
+    Date.now = realNow;
+  }
+});
