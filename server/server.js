@@ -1015,6 +1015,12 @@ function route(req, res) {
     return;
   }
 
+  // Installable app: the service worker must sit at the root so that its scope covers every room.
+  if (rel === '/sw.js' || rel === '/manifest.webmanifest') {
+    sendFile(req, res, path.join(PUBLIC_DIR, rel.slice(1)));
+    return;
+  }
+
   if (rel === '/favicon.ico') {
     sendFile(req, res, path.join(PUBLIC_DIR, 'assets', 'icon.svg'));
     return;

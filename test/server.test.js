@@ -145,6 +145,21 @@ test('public room lookup and routing', async () => {
   assert(Array.isArray(cfg.iceServers));
 });
 
+test('installable app: manifest, service worker and icons', async () => {
+  const man = await fetch(BASE + '/manifest.webmanifest');
+  assert.strictEqual(man.status, 200);
+  assert.match(man.headers.get('content-type'), /^application\/manifest\+json/);
+  const m = await man.json();
+  assert.strictEqual(m.start_url, '/');
+  assert.strictEqual(m.display, 'standalone');
+  for (const icon of m.icons) assert.strictEqual((await fetch(BASE + icon.src)).status, 200, icon.src);
+  assert(m.icons.some((i) => i.sizes === '512x512' && i.type === 'image/png'));
+  const sw = await fetch(BASE + '/sw.js');
+  assert.strictEqual(sw.status, 200);
+  assert.match(sw.headers.get('content-type'), /^text\/javascript/);
+  assert.match(await (await fetch(BASE + '/')).text(), /<link rel="manifest" href="\/manifest.webmanifest">/);
+});
+
 test('joining requires the right password; signaling is relayed', async () => {
   const a = await wsClient();
   a.sendJson({ type: 'join', room: 'movienight', id: 'aaaaaaaa1', name: 'Alice', password: 'wrong' });

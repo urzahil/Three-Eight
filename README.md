@@ -132,6 +132,12 @@ A device that is switched off in the lobby is not requested at all: with the mic
 
 Tip: use headphones during the movie, so your microphone doesn't send the film's sound to your friends. Movie volume is per person.
 
+### Installing it as an app
+
+Three-Eight is a Progressive Web App, so it can be installed and gets its own icon and window without browser bars. In Chrome or Edge on the desktop, use the install icon in the address bar. On Android, use **Install app** in the Chrome menu. On iPhone or iPad, tap **Share**, then **Add to Home Screen**. The installed app opens on the start page with the last room you joined already filled in. Installing needs HTTPS (or `localhost`), like the camera and mic do.
+
+A small service worker (`public/sw.js`) keeps a copy of the page's own files. It always asks the server first, so updates show up straight away, and uses the copy only when there is no connection. The app then opens and says it can't reach the server, instead of showing the browser's offline error. Calls, signaling, the API and Drive movies never go through its cache.
+
 ## Watching a movie
 
 Whatever the source, playback is the same: everyone sees the same moment of the film, and play, pause, seek, audio track and subtitles are shared by the room. There are three ways to have the film in your browser, and people in the same room can use different ones.
