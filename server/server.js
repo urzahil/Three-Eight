@@ -685,13 +685,23 @@ function driveCookie(req, roomKey) {
   return '';
 }
 
-// POST /api/rooms/:room/drive/session   Authorization: Bearer <room token>  ->  204 + the room's token cookie
+// POST   /api/rooms/:room/drive/session   Authorization: Bearer <room token>  ->  204 + the room's token cookie
+// DELETE /api/rooms/:room/drive/session   (no authentication)                 ->  204 + the cookie cleared
+// The cookie outlives the page (up to the token's 12 h), so a member who leaves clears it: on a shared computer the next
+// user must not inherit it. Clearing needs no token (it only removes the caller's own cookie), works for rooms that no
+// longer exist and does not depend on Drive being set up.
 function handleDriveSession(req, res, parts) {
-  if (req.method !== 'POST') return sendJson(res, 405, { error: 'Method not allowed' }, { ...DRIVE_HEADERS, Allow: 'POST' });
-  if (!driveApi) return sendJson(res, 503, { error: 'Google Drive is not set up on this server.' }, DRIVE_HEADERS);
+  if (req.method !== 'POST' && req.method !== 'DELETE') return sendJson(res, 405, { error: 'Method not allowed' }, { ...DRIVE_HEADERS, Allow: 'POST, DELETE' });
+  const del = req.method === 'DELETE';
+  if (!del && !driveApi) return sendJson(res, 503, { error: 'Google Drive is not set up on this server.' }, DRIVE_HEADERS);
   // There is no body to read; refuse a large one instead of draining it.
   if (Number(req.headers['content-length'] || 0) > 1024) return sendJson(res, 413, { error: 'Body too large' }, DRIVE_HEADERS);
   req.resume();
+  if (del) {
+    const cleared = `${driveCookieName(RoomStore.key(parts[2]))}=; Path=/api/rooms/; HttpOnly; SameSite=Strict; Max-Age=0${isHttps(req) ? '; Secure' : ''}`;
+    res.writeHead(204, { ...SECURITY_HEADERS, ...DRIVE_HEADERS, 'Set-Cookie': cleared });
+    return res.end();
+  }
   const bearer = /^Bearer\s+(\S+)$/i.exec(String(req.headers.authorization || ''));
   const checked = bearer && checkToken(bearer[1]);
   if (!checked || RoomStore.key(parts[2]) !== RoomStore.key(checked.room.name)) {

@@ -146,6 +146,28 @@ test('DriveClient: a range request that gets a 401 (token just replaced) is retr
   assert.deepEqual(auth, ['Bearer old', 'Bearer new']);
 });
 
+test('DriveClient: endSession clears the cookie (keepalive) and later sessions are not created', async () => {
+  const realFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url, init) => {
+    calls.push([url, init.method, init.keepalive]);
+    return new Response(null, { status: 204 });
+  };
+  try {
+    const d = new DriveClient({ room: 'My Room', token: 't1', folder: 'ROOTFOLDER_0001' });
+    await d.ensureSession();
+    d.endSession();
+    assert.deepEqual(calls.at(-1), ['/api/rooms/My%20Room/drive/session', 'DELETE', true]);
+    const n = calls.length;
+    d.setToken('t2');
+    await d.ensureSession();
+    await d.ensureSession(true);
+    assert.equal(calls.length, n, 'no POST after leaving');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
 test('DriveClient: the cookie session is posted for every token and retried after a failure', async () => {
   const realFetch = globalThis.fetch;
   const posts = [];

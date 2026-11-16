@@ -367,12 +367,30 @@ test('drive: POST .../drive/session sets a per-room, HttpOnly, SameSite=Strict c
   assert.strictEqual((await api(url, tokB, { method: 'POST' })).status, 401);
   assert.strictEqual((await fetch(BASE + url + `?t=${encodeURIComponent(tokA)}`, { method: 'POST' })).status, 401);
   assert.strictEqual((await cookieReq(url, cookiePair(res), { method: 'POST' })).status, 401, 'the cookie cannot renew itself');
-  for (const method of ['GET', 'HEAD', 'PUT', 'DELETE']) {
+  for (const method of ['GET', 'HEAD', 'PUT']) {
     const r = await api(url, tokA, { method });
     assert.strictEqual(r.status, 405, method);
-    assert.strictEqual(r.headers.get('allow'), 'POST');
+    assert.strictEqual(r.headers.get('allow'), 'POST, DELETE');
   }
   assert.strictEqual((await api(url, tokA, { method: 'POST', headers: { Authorization: `Bearer ${tokA}`, 'Content-Length': '5000' }, body: 'x'.repeat(5000) })).status, 413);
+});
+
+test('drive: DELETE .../drive/session clears the room cookie, without a token and for any room', async () => {
+  const id = (room) => crypto.createHash('sha256').update(room).digest('base64url').slice(0, 16);
+  const url = '/api/rooms/drive-a/drive/session';
+  const res = await fetch(BASE + url, { method: 'DELETE' }); // no token: clearing one's own cookie grants nothing
+  assert.strictEqual(res.status, 204);
+  assert.strictEqual(await res.text(), '');
+  assert.strictEqual(res.headers.get('set-cookie'), `t8d_${id('drive-a')}=; Path=/api/rooms/; HttpOnly; SameSite=Strict; Max-Age=0`);
+  assert.strictEqual(res.headers.get('cache-control'), 'private, no-store');
+  // With a token it is the same; the room's name in another case names the same cookie.
+  assert.strictEqual((await api(url, tokA, { method: 'DELETE' })).status, 204);
+  assert.strictEqual((await fetch(BASE + '/api/rooms/Drive-A/drive/session', { method: 'DELETE' })).headers.get('set-cookie'), res.headers.get('set-cookie'));
+  // A room that does not exist (any more) can still be cleared.
+  const gone = await fetch(BASE + '/api/rooms/no-such-room/drive/session', { method: 'DELETE' });
+  assert.strictEqual(gone.status, 204);
+  assert.match(gone.headers.get('set-cookie'), new RegExp(`^t8d_${id('no-such-room')}=; .*Max-Age=0`));
+  assert.strictEqual((await fetch(BASE + url, { method: 'DELETE', headers: { 'Content-Length': '5000' }, body: 'x'.repeat(5000) })).status, 413);
 });
 
 const cookieReq = (p, cookieHeader, extra = {}) => fetch(BASE + p, { ...extra, headers: { Cookie: cookieHeader, ...(extra.headers || {}) } });
@@ -1645,6 +1663,10 @@ test('drive: a member connected for a long time gets a fresh token pushed; the c
   const viaProxy = (proto) => fetch(s.base + '/api/rooms/refresh/drive/session', { method: 'POST', headers: { Authorization: `Bearer ${push.drive.token}`, 'X-Forwarded-Proto': proto, 'X-Forwarded-For': '203.0.113.9' } });
   assert.match((await viaProxy('https')).headers.get('set-cookie'), /; Secure/);
   assert.doesNotMatch((await viaProxy('http')).headers.get('set-cookie'), /Secure/);
+  // Clearing it is Secure under the same rule.
+  const clearVia = (proto) => fetch(s.base + '/api/rooms/refresh/drive/session', { method: 'DELETE', headers: { 'X-Forwarded-Proto': proto, 'X-Forwarded-For': '203.0.113.9' } });
+  assert.match((await clearVia('https')).headers.get('set-cookie'), /Max-Age=0; Secure$/);
+  assert.doesNotMatch((await clearVia('http')).headers.get('set-cookie'), /Secure/);
 });
 
 // Drive limits seen from the HTTP side: a folder listing that was cut off says so, and one room cannot hold

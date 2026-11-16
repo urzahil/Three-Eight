@@ -18,6 +18,7 @@ export class DriveBrowser {
       return;
     }
     if (!ok && !this.drive) return;
+    if (!ok) this.drive.endSession(); // no folder any more: clear the cookie (a new folder's client overwrites it instead)
     this.driveFolder = folder;
     this.drive = ok ? new DriveClient({ room: this.roomName, token: cfg.token, folder }) : null;
     this.driveTrail = null;

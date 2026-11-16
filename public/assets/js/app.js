@@ -299,6 +299,7 @@ class Room {
       /* ignore */
     }
     this.closePip();
+    this.drive?.endSession(); // clear the Drive cookie: it would outlive the page
     this.sync.destroy();
     this.player.unload();
     this.swarm.destroy();

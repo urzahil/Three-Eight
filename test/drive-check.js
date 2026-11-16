@@ -143,7 +143,7 @@ async function adminApi(base) {
         if (!r.url().startsWith(BASE)) return;
         const u = new URL(r.url());
         stats.server.push(u.pathname + u.search);
-        if (u.pathname.includes('/drive/')) stats.requests.push({ url: r.url(), path: u.pathname, t: u.searchParams.get('t'), auth: r.headers().authorization, range: r.headers().range, type: r.resourceType() });
+        if (u.pathname.includes('/drive/')) stats.requests.push({ url: r.url(), path: u.pathname, method: r.method(), t: u.searchParams.get('t'), auth: r.headers().authorization, range: r.headers().range, type: r.resourceType() });
       });
       await page.goto(`${BASE}/${room}?debug`);
       await page.fill('#lobby-name', name);
@@ -556,6 +556,7 @@ async function adminApi(base) {
       for (const r of S.requests) {
         driveRequests++;
         if (r.type === 'media') assert(!r.t && !r.auth && !r.url.includes('t='), `a <video> request carries no token in the URL or a header (the session cookie authorizes it): ${r.url}`);
+        else if (r.path.endsWith('/drive/session') && r.method === 'DELETE') assert(!r.t && !r.auth, 'clearing the cookie on leaving sends no token');
         else if (r.path.endsWith('/drive/session')) assert(/^Bearer \S{20,}$/.test(r.auth || '') && !r.t, 'the session is opened with the token in the Authorization header');
         else assert(/^Bearer \S{20,}$/.test(r.auth || '') && !r.t, `a fetch carries the token in the Authorization header: ${r.url}`);
       }

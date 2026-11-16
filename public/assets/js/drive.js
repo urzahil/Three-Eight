@@ -109,6 +109,7 @@ export class DriveClient {
   }
 
   _startSession() {
+    if (this.ended) return this.session; // left the room: the cookie must stay cleared
     const token = this.token;
     const p = (async () => {
       let res;
@@ -124,6 +125,15 @@ export class DriveClient {
     p.failed = false;
     p.catch(() => { p.failed = true; });
     return p;
+  }
+
+  /**
+   * Clears the cookie (it would otherwise outlive the page, up to the token's lifetime) and stops later calls from
+   * setting it again. `keepalive` lets the request finish while the page is being closed.
+   */
+  endSession() {
+    this.ended = true;
+    fetch(`${this.base}/session`, { method: 'DELETE', keepalive: true, cache: 'no-store' }).catch(() => {});
   }
 
   /**
