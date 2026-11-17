@@ -328,9 +328,14 @@ export class MovieSync extends EventTarget {
     }
   }
 
+  /** Monotonic milliseconds for timing seeks. */
+  _clock() {
+    return performance.now();
+  }
+
   _seekTo(t) {
     const p = this.player;
-    const started = performance.now();
+    const started = this._clock();
     this.expectMediaChange();
     // Only the latest seek is measured. "seeked" always follows a seek ("playing" does not when the target is
     // already buffered, and would then measure until some later resume).
@@ -338,7 +343,7 @@ export class MovieSync extends EventTarget {
     const onSeeked = () => {
       p.removeEventListener('seeked', onSeeked);
       if (this._onSeeked === onSeeked) this._onSeeked = null;
-      const took = (performance.now() - started) / 1000;
+      const took = (this._clock() - started) / 1000;
       // Learn how long seeks take so we land on time next time; a seek that took ages (stalled, tab in the
       // background) says nothing about the next one.
       if (took < 2.5) this.seekLatency = Math.min(2, Math.max(0.05, this.seekLatency * 0.6 + took * 0.4));

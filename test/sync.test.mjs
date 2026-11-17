@@ -279,22 +279,17 @@ test('seek latency: one listener per seek, and a seek that took ages is not lear
   player.addEventListener = (t, f) => { if (t === 'seeked') listeners++; add(t, f); };
   player.removeEventListener = (t, f) => { if (t === 'seeked') listeners--; remove(t, f); };
   player.seek = () => {};
-  const realNow = performance.now;
   let now = 0;
-  performance.now = () => now;
-  try {
-    sync._seekTo(10);
-    sync._seekTo(20);
-    assert.equal(listeners, 1, 'the earlier seek stops being measured');
-    now = 60_000; // e.g. the tab was in the background
-    player.dispatchEvent(new Event('seeked'));
-    assert.equal(listeners, 0);
-    assert.equal(sync.seekLatency, 0.15, 'unchanged');
-    sync._seekTo(30);
-    now += 500;
-    player.dispatchEvent(new Event('seeked'));
-    assert(Math.abs(sync.seekLatency - (0.15 * 0.6 + 0.5 * 0.4)) < 1e-9);
-  } finally {
-    performance.now = realNow;
-  }
+  sync._clock = () => now; // (performance.now itself is read-only on some Node versions)
+  sync._seekTo(10);
+  sync._seekTo(20);
+  assert.equal(listeners, 1, 'the earlier seek stops being measured');
+  now = 60_000; // e.g. the tab was in the background
+  player.dispatchEvent(new Event('seeked'));
+  assert.equal(listeners, 0);
+  assert.equal(sync.seekLatency, 0.15, 'unchanged');
+  sync._seekTo(30);
+  now += 500;
+  player.dispatchEvent(new Event('seeked'));
+  assert(Math.abs(sync.seekLatency - (0.15 * 0.6 + 0.5 * 0.4)) < 1e-9);
 });
