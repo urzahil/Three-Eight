@@ -246,7 +246,7 @@ Usually not. STUN is enough for most home connections. Some friends may be behin
 Everyone can pick an interface style for their own device: on the start page, under *Appearance* in the lobby, or in *Settings* in a room. The choice is saved in the browser and also applies to the admin page and the picture-in-picture window. All styles are dark:
 
 - **Three-Eight** (default): the original look.
-- **coss ui**, **AlignUI**, **daisyUI**, **HeroUI** and **Ant Design**: re-skins inspired by those UI libraries' dark themes (colors, radii, buttons, inputs, tabs).
+- **CossUI**, **AlignUI**, **DaisyUI**, **HeroUI** and **AntUI**: re-skins inspired by those UI libraries' dark themes (colors, radii, buttons, inputs, tabs).
 
 They are pure CSS in `public/assets/css/themes.css`: each one overrides the variables described below under `:root[data-ui="<id>"]`, plus a few component rules. No library code or web font is loaded (the Content-Security-Policy allows only same-origin scripts and fonts). The list of styles, with each one's `theme-color`, is in `public/assets/js/theme.js`; `public/assets/js/theme-boot.js` applies the saved style before the page is drawn. To add a style, add a block to `themes.css` and an entry to `THEMES`.
 

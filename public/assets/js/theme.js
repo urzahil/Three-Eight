@@ -6,11 +6,11 @@ const KEY = 'te.ui';
 /** id → label and the browser chrome color (the theme-color meta tag); keep in step with themes.css. */
 export const THEMES = [
   { id: 'default', label: 'Three-Eight (default)', color: '#0f1115' },
-  { id: 'coss', label: 'coss ui', color: '#0a0a0a' },
+  { id: 'coss', label: 'CossUI', color: '#0a0a0a' },
   { id: 'align', label: 'AlignUI', color: '#0e121b' },
-  { id: 'daisy', label: 'daisyUI', color: '#15191e' },
+  { id: 'daisy', label: 'DaisyUI', color: '#15191e' },
   { id: 'hero', label: 'HeroUI', color: '#000000' },
-  { id: 'ant', label: 'Ant Design', color: '#000000' },
+  { id: 'ant', label: 'AntUI', color: '#000000' },
 ];
 
 const byId = (id) => THEMES.find((t) => t.id === id) || THEMES[0];
