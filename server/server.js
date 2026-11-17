@@ -25,19 +25,26 @@ const { WebSocketServer } = require('ws');
 const { RoomStore, RoomError, parseDriveFolder } = require('./store');
 const { limiterKey, forwardedAddress } = require('./ip');
 const { GoogleDrive, DriveError, ID_RE: DRIVE_ID_RE, FOLDER, kindOf, loadServiceAccount, parseRange, MiB } = require('./drive');
+const { ConfigError, intSetting, trustedHops, driveCacheMb } = require('./config');
 
-const PORT = parseInt(process.env.PORT || '4567', 10);
+// Settings that are set but unusable stop the server (see config.js) rather than silently change its behaviour.
+let PORT, MAX_ROOM_SIZE, TRUSTED_HOPS, DRIVE_CACHE_SETTING_MB;
+try {
+  PORT = intSetting(process.env, 'PORT', 4567, 1, 65535);
+  // Each person sends video to everyone else, so the mesh gets heavy well before this upper bound.
+  MAX_ROOM_SIZE = intSetting(process.env, 'MAX_ROOM_SIZE', 12, 1, 100);
+  // Number of trusted reverse proxies in front of the server (0 = none, use the socket's address).
+  // TRUST_PROXY=true/1/yes means one hop; a larger number (e.g. 2 for CDN + proxy) means that many.
+  TRUSTED_HOPS = trustedHops(process.env);
+  DRIVE_CACHE_SETTING_MB = driveCacheMb(process.env, 256);
+} catch (err) {
+  if (!(err instanceof ConfigError)) throw err;
+  console.error(`Configuration error: ${err.message}`);
+  process.exit(1);
+}
 const HOST = process.env.HOST || '0.0.0.0';
 const PUBLIC_DIR = path.resolve(__dirname, '..', 'public');
 const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(__dirname, '..', 'data'));
-const MAX_ROOM_SIZE = parseInt(process.env.MAX_ROOM_SIZE || '12', 10);
-// Number of trusted reverse proxies in front of the server (0 = none, use the socket's address).
-// TRUST_PROXY=true/1/yes means one hop; a larger number (e.g. 2 for CDN + proxy) means that many.
-const TRUSTED_HOPS = (() => {
-  const v = (process.env.TRUST_PROXY || '').trim();
-  if (/^(true|yes)$/i.test(v)) return 1;
-  return /^\d{1,2}$/.test(v) ? parseInt(v, 10) : 0;
-})();
 // Origins (besides the request's own host) that may open a WebSocket, e.g. "https://calls.example.com".
 // Entries are normalised like a browser's Origin (default port and trailing slash dropped); unparseable ones are ignored.
 const ALLOWED_ORIGINS = new Set();
@@ -83,22 +90,25 @@ try {
 /** @type {GoogleDrive|null} */
 let driveApi = null;
 const MIN_DRIVE_CACHE_MB = 32;
+const GOOGLE_API_BASE = 'https://www.googleapis.com';
 {
   const keyFile = (process.env.GOOGLE_SERVICE_ACCOUNT || '').trim();
   if (keyFile) {
     try {
-      const account = loadServiceAccount(keyFile);
-      const mbSetting = (process.env.DRIVE_CACHE_MB || '').trim();
-      let mb = mbSetting === '' ? 256 : Number(mbSetting);
-      if (!Number.isFinite(mb) || mb < 0) mb = 256;
+      // A fake Google (other token and API endpoints) is for tests only: in production the signed JWT and the
+      // bearer tokens must only ever go to Google.
+      const account = loadServiceAccount(keyFile, { testEndpoints: DRIVE_DEBUG });
+      const apiBase = (process.env.GOOGLE_API_BASE || '').trim().replace(/\/+$/, '') || GOOGLE_API_BASE;
+      if (apiBase !== GOOGLE_API_BASE && !DRIVE_DEBUG) throw new Error('GOOGLE_API_BASE is a test setting (it needs DRIVE_DEBUG=1)');
+      let mb = DRIVE_CACHE_SETTING_MB;
       // The reader assumes blocks it just fetched stay cached for a moment: a tiny cache makes it refetch the same bytes.
       if (mb < MIN_DRIVE_CACHE_MB) {
-        console.warn(`DRIVE_CACHE_MB=${mbSetting} is too small: using the minimum of ${MIN_DRIVE_CACHE_MB} MB.`);
+        console.warn(`DRIVE_CACHE_MB=${process.env.DRIVE_CACHE_MB.trim()} is too small: using the minimum of ${MIN_DRIVE_CACHE_MB} MB.`);
         mb = MIN_DRIVE_CACHE_MB;
       }
       driveApi = new GoogleDrive({
         account,
-        apiBase: (process.env.GOOGLE_API_BASE || 'https://www.googleapis.com').trim(),
+        apiBase,
         cacheBytes: mb * MiB,
         maxListItems: (DRIVE_DEBUG && parseInt(process.env.DRIVE_MAX_LIST_ITEMS, 10)) || undefined, // a test knob
       });
@@ -203,8 +213,8 @@ const SECURITY_HEADERS = {
 };
 
 // Content-Security-Policy for the HTML pages. They load only same-origin ES modules and stylesheets.
-//  - style-src needs 'unsafe-inline': index.html has an inline style="" attribute (on the SVG sprite).
-//    (element.style.x = ... from scripts is not affected by CSP.)
+//  - style-src has no 'unsafe-inline': keep style="" attributes and <style> out of the HTML (use a class).
+//    Setting element.style.x = ... from scripts is not affected by CSP.
 //  - media-src blob: and img-src blob:/data: are for MediaSource / object URLs of local movie files and subtitles.
 //  - worker-src blob: is for the Picture-in-Picture worker, which is created from a Blob.
 //  - connect-src lists the WebSocket explicitly (older Safari does not match ws: to 'self').
@@ -216,7 +226,7 @@ function contentSecurityPolicy(req) {
   return [
     "default-src 'self'",
     "script-src 'self'",
-    "style-src 'self' 'unsafe-inline'",
+    "style-src 'self'",
     "img-src 'self' data: blob:",
     "media-src 'self' blob:",
     `connect-src 'self'${ws}`,
@@ -852,6 +862,9 @@ async function handleApi(req, res, url) {
     const ip = limiterKey(clientIp(req));
     if (adminLimiter.blocked(ip)) return sendJson(res, 429, { error: 'Too many attempts. Try again later.' });
     const body = await readJson(req);
+    // Check again: other attempts from this client may have failed while this body was arriving. From here to
+    // fail() nothing awaits, so concurrent requests cannot all slip past the limit.
+    if (adminLimiter.blocked(ip)) return sendJson(res, 429, { error: 'Too many attempts. Try again later.' });
     if (!safeEqual(typeof body.password === 'string' ? body.password : '', ADMIN_PASSWORD)) {
       adminLimiter.fail(ip);
       return sendJson(res, 401, { error: 'Wrong password' });

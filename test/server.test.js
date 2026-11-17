@@ -819,6 +819,52 @@ test('drive: an unusable key file disables Drive, with a clear log line that nev
 });
 
 
+test('drive: outside tests the key must name Google\'s token endpoint, and GOOGLE_API_BASE needs DRIVE_DEBUG', async () => {
+  const { loadServiceAccount } = require('../server/drive');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'three-eight-tokenuri-'));
+  try {
+    const key = JSON.parse(fs.readFileSync(google.writeAccount(dir), 'utf8'));
+    let n = 0;
+    const write = (tokenUri) => {
+      const file = path.join(dir, `k${n++}.json`);
+      const k = { ...key };
+      if (tokenUri === undefined) delete k.token_uri; else k.token_uri = tokenUri;
+      fs.writeFileSync(file, JSON.stringify(k));
+      return file;
+    };
+    for (const ok of [undefined, 'https://oauth2.googleapis.com/token', 'https://accounts.google.com/o/oauth2/token']) {
+      assert.strictEqual(loadServiceAccount(write(ok)).tokenUri, ok || 'https://oauth2.googleapis.com/token', String(ok));
+    }
+    for (const bad of [
+      `${google.url}/token`, 'http://oauth2.googleapis.com/token', 'https://oauth2.googleapis.com.evil.example/token',
+      'https://oauth2.googleapis.com:8443/token', 'https://user:pw@oauth2.googleapis.com/token',
+      'https://oauth2.googleapis.com/token?x=1', 'https://oauth2.googleapis.com/token#x', 'https://169.254.169.254/token',
+    ]) {
+      assert.throws(() => loadServiceAccount(write(bad)), /not Google's token endpoint/, bad);
+    }
+    // Tests may point it at a fake Google.
+    assert.strictEqual(loadServiceAccount(write(`${google.url}/token`), { testEndpoints: true }).tokenUri, `${google.url}/token`);
+
+    // The server: a fake token endpoint, or a GOOGLE_API_BASE other than Google's, disables Drive unless DRIVE_DEBUG=1.
+    for (const env of [
+      { GOOGLE_SERVICE_ACCOUNT: write(`${google.url}/token`) },
+      { GOOGLE_SERVICE_ACCOUNT: write(undefined), GOOGLE_API_BASE: google.url },
+    ]) {
+      const s = await spawnServer(env);
+      await new Promise((r) => setTimeout(r, 100));
+      assert.match(s.out.log, /GOOGLE_SERVICE_ACCOUNT is set but cannot be used: (token_uri|GOOGLE_API_BASE)/);
+      assert.doesNotMatch(s.out.log, /Google Drive enabled/);
+      s.stop();
+    }
+    const official = await spawnServer({ GOOGLE_SERVICE_ACCOUNT: write(undefined), GOOGLE_API_BASE: 'https://www.googleapis.com/' });
+    await new Promise((r) => setTimeout(r, 100));
+    assert.match(official.out.log, /Google Drive enabled/, "naming Google's own API base is fine");
+    official.stop();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // ---- Phantom rooms (inherited object properties) ---------------------------------------------------
 const PHANTOMS = ['constructor', '__proto__', 'toString', 'hasOwnProperty', 'valueOf'];
 
@@ -1132,6 +1178,7 @@ test('HTML pages carry a Content-Security-Policy; HSTS only for HTTPS requests',
     const csp = res.headers['content-security-policy'];
     assert.match(csp, /default-src 'self'/);
     assert.match(csp, /script-src 'self'(;|$)/, 'no inline scripts');
+    assert.match(csp, /style-src 'self'(;|$)/, 'no inline styles');
     assert.match(csp, /frame-ancestors 'none'/);
     assert.match(csp, /connect-src 'self' ws:\/\/calls\.example\.com wss:\/\/calls\.example\.com/);
     assert.match(csp, /media-src 'self' blob:/);
@@ -1429,9 +1476,63 @@ test('a newcomer in a full room can send 400 signals in a burst without being di
   s.stop();
 });
 
+// ---- Startup settings -------------------------------------------------------------------------------------------------
+/** Starts the server with `env` and expects it to refuse to start. Returns its output. */
+async function failedStart(env) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'three-eight-cfg-'));
+  try {
+    const child = spawn(process.execPath, [path.join(__dirname, '..', 'server', 'server.js')], {
+      env: { ...process.env, PORT: String(await freePort()), HOST: '127.0.0.1', ADMIN_PASSWORD: 'admin-pw', DATA_DIR: dir, GOOGLE_SERVICE_ACCOUNT: '', ...env },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let log = '';
+    child.stdout.on('data', (d) => { log += d; });
+    child.stderr.on('data', (d) => { log += d; });
+    const timer = setTimeout(() => child.kill(), 10000);
+    const code = await new Promise((r) => child.on('exit', r));
+    clearTimeout(timer);
+    assert.strictEqual(code, 1, `exits with an error (${JSON.stringify(env)}): ${log}`);
+    return log;
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test('config: settings are parsed strictly (unit)', () => {
+  const { ConfigError, intSetting, trustedHops, driveCacheMb } = require('../server/config');
+  assert.strictEqual(intSetting({}, 'X', 12, 1, 50), 12);
+  assert.strictEqual(intSetting({ X: ' ' }, 'X', 12, 1, 50), 12);
+  assert.strictEqual(intSetting({ X: ' 8 ' }, 'X', 12, 1, 50), 8);
+  for (const bad of ['twelve', '12abc', '1.5', '-3', '0x10', '1e3', '0', '51', '9'.repeat(30)]) { // (in [1, 50] here)
+    assert.throws(() => intSetting({ X: bad }, 'X', 12, 1, 50), ConfigError, bad);
+  }
+  assert.throws(() => intSetting({ X: 'z'.repeat(500) }, 'X', 1, 1, 2), (e) => e.message.length < 150, 'long values are cut short');
+  for (const [v, n] of [['', 0], ['false', 0], ['NO', 0], ['0', 0], ['true', 1], ['Yes', 1], ['1', 1], ['2', 2], [' 3 ', 3]]) {
+    assert.strictEqual(trustedHops({ TRUST_PROXY: v }), n, v);
+  }
+  assert.strictEqual(trustedHops({}), 0);
+  for (const bad of ['on', 'maybe', '-1', '100', '1.5']) assert.throws(() => trustedHops({ TRUST_PROXY: bad }), ConfigError, bad);
+  assert.strictEqual(driveCacheMb({}, 256), 256);
+  assert.strictEqual(driveCacheMb({ DRIVE_CACHE_MB: '0' }, 256), 0);
+  assert.strictEqual(driveCacheMb({ DRIVE_CACHE_MB: '64.5' }, 256), 64.5);
+  for (const bad of ['lots', '-1', 'Infinity', '1e3', '99999999']) assert.throws(() => driveCacheMb({ DRIVE_CACHE_MB: bad }, 256), ConfigError, bad);
+});
+
+test('config: an unusable setting stops the server with a message naming it', async () => {
+  for (const [env, re] of [
+    [{ MAX_ROOM_SIZE: 'invalid' }, /MAX_ROOM_SIZE=invalid is not a whole number/],
+    [{ MAX_ROOM_SIZE: '0' }, /MAX_ROOM_SIZE=0 is out of range/],
+    [{ PORT: '70000' }, /PORT=70000 is out of range/],
+    [{ TRUST_PROXY: 'on' }, /TRUST_PROXY=on is not valid/],
+    [{ DRIVE_CACHE_MB: 'lots' }, /DRIVE_CACHE_MB=lots is not a number/],
+  ]) {
+    assert.match(await failedStart(env), re);
+  }
+});
+
 // ---- Drive cache setting ---------------------------------------------------------------------------------------------
 test('DRIVE_CACHE_MB below the minimum is raised, with a warning', async () => {
-  const env = (mb) => ({ GOOGLE_SERVICE_ACCOUNT: google.writeAccount(keyDir), GOOGLE_API_BASE: google.url, DRIVE_CACHE_MB: mb });
+  const env = (mb) => ({ GOOGLE_SERVICE_ACCOUNT: google.writeAccount(keyDir), GOOGLE_API_BASE: google.url, DRIVE_DEBUG: '1', DRIVE_CACHE_MB: mb });
   const low = await spawnServer(env('0'));
   assert.match(low.out.log, /DRIVE_CACHE_MB=0 is too small: using the minimum of 32 MB/);
   low.stop();
@@ -1461,6 +1562,28 @@ test('limiterKey input: forwarded values that are not IPs fall back to the socke
   for (let i = 0; i < 10; i++) assert.strictEqual(await attempt(`5.5.5.5:${1000 + i}`), 401);
   assert.strictEqual(await attempt('5.5.5.5'), 429);
   assert.strictEqual(await attempt('[2001:db8:7::1]:5000'), 401);
+  s.stop();
+});
+
+test('admin login: concurrent wrong passwords cannot get past the limit while their bodies arrive', async () => {
+  const s = await spawnServer({});
+  const { port } = new URL(s.base);
+  const body = JSON.stringify({ password: 'wrong' });
+  // Open 25 requests and send their headers first; only once all are waiting for a body do the bodies follow.
+  const reqs = Array.from({ length: 25 }, () => {
+    const req = http.request({ host: '127.0.0.1', port, path: '/api/admin/login', method: 'POST', agent: false, headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } });
+    req.flushHeaders();
+    const status = new Promise((resolve, reject) => {
+      req.on('response', (res) => { res.resume(); resolve(res.statusCode); });
+      req.on('error', reject);
+    });
+    return { req, status };
+  });
+  await new Promise((r) => setTimeout(r, 300));
+  for (const { req } of reqs) req.end(body);
+  const statuses = await Promise.all(reqs.map((r) => r.status));
+  assert.strictEqual(statuses.filter((c) => c === 401).length, 10, `at most 10 checked passwords: ${statuses}`);
+  assert.strictEqual(statuses.filter((c) => c === 429).length, 15);
   s.stop();
 });
 

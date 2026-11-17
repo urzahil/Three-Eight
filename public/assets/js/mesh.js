@@ -12,6 +12,9 @@ const MAX_CHUNKS = Math.ceil(MAX_MESSAGE / CHUNK);
 const MAX_MID = 32; // chars of a message id
 const MAX_ASSEMBLIES = 12; // messages being reassembled at once, per peer
 const MAX_BUFFERED = 2 * MAX_MESSAGE; // chars held by all unfinished messages of a peer
+// Chars waiting in a ChunkSender queue. A peer that stops reading would otherwise make it grow without end;
+// past this the link is treated as stuck (see ChunkSender.onoverflow).
+export const MAX_QUEUED = 2 * MAX_MESSAGE;
 const ASSEMBLY_TIMEOUT_MS = 30 * 1000; // an unfinished message is dropped when its last chunk is this old
 
 // The JSON channel queues outgoing chunks while more than DATA_HIGH bytes are buffered, like the film channel.
@@ -142,28 +145,39 @@ export class Reassembler {
 /**
  * Sends strings on a data channel, splitting long ones into chunks. A long message is queued and handed to
  * the channel while its buffer is below DATA_HIGH; anything sent while the queue is not empty waits behind
- * it, so messages keep their order.
+ * it, so messages keep their order. At most MAX_QUEUED chars wait: a message that would go past that empties the
+ * queue, is not sent, and calls onoverflow (the peer is not reading, so the link is stuck).
  */
 export class ChunkSender {
-  constructor(dc) {
+  constructor(dc, maxQueued = MAX_QUEUED) {
     this.dc = dc;
     this.queue = []; // { s, mid, n, i } — i is the next chunk to send; mid is null for a short message
+    this.queued = 0; // chars of the messages in the queue
+    this.maxQueued = maxQueued;
+    /** @type {(() => void)|null} */
+    this.onoverflow = null;
     dc.bufferedAmountLowThreshold = DATA_LOW;
   }
 
-  /** Returns false if the channel is not open. */
+  /** Returns false if the channel is not open, or the message did not fit in the queue. */
   send(s) {
     if (this.dc.readyState !== 'open') return false;
+    if (s.length <= CHUNK && !this.queue.length) {
+      this.dc.send(s);
+      return true;
+    }
+    if (this.queued + s.length > this.maxQueued) {
+      this.clear();
+      this.onoverflow?.();
+      return false;
+    }
     if (s.length <= CHUNK) {
-      if (!this.queue.length) {
-        this.dc.send(s);
-        return true;
-      }
       this.queue.push({ s, mid: null, n: 1, i: 0 });
     } else {
       const mid = Math.random().toString(36).slice(2);
       this.queue.push({ s, mid, n: Math.ceil(s.length / CHUNK), i: 0 });
     }
+    this.queued += s.length;
     this.pump();
     return true;
   }
@@ -175,15 +189,19 @@ export class ChunkSender {
       try {
         dc.send(m.mid === null ? m.s : JSON.stringify({ type: '_chunk', mid: m.mid, i: m.i, n: m.n, d: m.s.slice(m.i * CHUNK, (m.i + 1) * CHUNK) }));
       } catch {
-        this.queue = [];
+        this.clear();
         return;
       }
-      if (++m.i >= m.n) this.queue.shift();
+      if (++m.i >= m.n) {
+        this.queue.shift();
+        this.queued -= m.s.length;
+      }
     }
   }
 
   clear() {
     this.queue = [];
+    this.queued = 0;
   }
 }
 
@@ -222,6 +240,13 @@ class Peer {
     this.dc = pc.createDataChannel('data', { negotiated: true, id: 0, ordered: true });
     this.dc.binaryType = 'arraybuffer';
     this.writer = new ChunkSender(this.dc);
+    // The other side has stopped reading: drop the link (onclose then rebuilds it) rather than buffer without end.
+    this.writer.onoverflow = () => {
+      console.warn(`data channel to ${this.id} is not draining: reconnecting`);
+      try {
+        this.dc.close();
+      } catch { /* already closing */ }
+    };
     // Unfinished incoming messages are dropped when they go stale, even if no further chunk arrives.
     this._sweepTimer = setInterval(() => this.chunks.sweep(), ASSEMBLY_TIMEOUT_MS / 3);
     this.dc.onopen = () => {

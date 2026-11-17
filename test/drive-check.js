@@ -65,7 +65,7 @@ async function startServer(google) {
   const port = await freePort();
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'te-drive-'));
   const child = spawn(process.execPath, [path.resolve(__dirname, '..', 'server', 'server.js')], {
-    env: { ...process.env, PORT: String(port), DATA_DIR: dir, ADMIN_PASSWORD: ADMIN, GOOGLE_SERVICE_ACCOUNT: google.writeAccount(dir), GOOGLE_API_BASE: google.url, TRUST_PROXY: 'false' },
+    env: { ...process.env, PORT: String(port), DATA_DIR: dir, ADMIN_PASSWORD: ADMIN, GOOGLE_SERVICE_ACCOUNT: google.writeAccount(dir), GOOGLE_API_BASE: google.url, DRIVE_DEBUG: '1', TRUST_PROXY: 'false' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let log = '';
