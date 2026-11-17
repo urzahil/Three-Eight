@@ -26,6 +26,8 @@ const VIDEO_EXT = new Set(['mkv', 'mp4', 'm4v', 'mov', 'webm', 'avi']);
 const SUB_EXT = new Set(['srt', 'vtt', 'ass', 'ssa']);
 const SCOPE = 'https://www.googleapis.com/auth/drive.readonly';
 const DEFAULT_TOKEN_URI = 'https://oauth2.googleapis.com/token';
+// Google's token endpoints as they appear in service account keys (older keys name the accounts.google.com one).
+const GOOGLE_TOKEN_URIS = new Set([DEFAULT_TOKEN_URI, 'https://accounts.google.com/o/oauth2/token']);
 
 const BLOCK = MiB; // cache granularity
 const MAX_RUN_BLOCKS = 8; // one upstream request fetches at most 8 MiB
@@ -61,9 +63,10 @@ class DriveError extends Error {
 // ---- service account key -------------------------------------------------------------------
 /**
  * Reads the key file. Throws an Error with a message that is safe to log (it never contains file
- * contents). Returns { email, privateKey, tokenUri }.
+ * contents). Returns { email, privateKey, tokenUri }. token_uri must be Google's token endpoint unless
+ * `testEndpoints` is set (tests point it at a fake Google).
  */
-function loadServiceAccount(file) {
+function loadServiceAccount(file, { testEndpoints = false } = {}) {
   let text;
   try {
     text = fs.readFileSync(file, 'utf8');
@@ -92,7 +95,9 @@ function loadServiceAccount(file) {
     throw new Error('token_uri in the file is not a valid URL');
   }
   if (u.protocol !== 'https:' && u.protocol !== 'http:') throw new Error('token_uri in the file is not a valid URL');
-  return { email: j.client_email, privateKey: j.private_key, tokenUri };
+  // The signed assertion goes to this URL: outside tests, only to Google (HTTPS, no other host, port, query or credentials).
+  if (!testEndpoints && !GOOGLE_TOKEN_URIS.has(u.href)) throw new Error(`token_uri in the file is not Google's token endpoint (${DEFAULT_TOKEN_URI})`);
+  return { email: j.client_email, privateKey: j.private_key, tokenUri: u.href };
 }
 
 const b64u = (x) => Buffer.from(x).toString('base64url');

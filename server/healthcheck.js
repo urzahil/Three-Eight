@@ -4,12 +4,21 @@
 const http = require('node:http');
 const https = require('node:https');
 
-const PORT = parseInt(process.env.PORT || '4567', 10);
+const { ConfigError, intSetting } = require('./config');
+
+let PORT, TIMEOUT_MS;
+try {
+  PORT = intSetting(process.env, 'PORT', 4567, 1, 65535);
+  TIMEOUT_MS = intSetting(process.env, 'HEALTHCHECK_TIMEOUT_MS', 2500, 100, 60000);
+} catch (err) {
+  if (!(err instanceof ConfigError)) throw err;
+  console.error(`healthcheck: ${err.message}`);
+  process.exit(1);
+}
 const BIND = process.env.HOST || '0.0.0.0';
 // A wildcard bind address accepts loopback connections; anything else must be dialled as is.
 const HOST = BIND === '0.0.0.0' ? '127.0.0.1' : BIND === '::' ? '::1' : BIND;
 const TLS = !!(process.env.TLS_CERT && process.env.TLS_KEY);
-const TIMEOUT_MS = parseInt(process.env.HEALTHCHECK_TIMEOUT_MS || '2500', 10);
 
 const req = (TLS ? https : http).get({
   host: HOST,

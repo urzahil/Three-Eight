@@ -73,6 +73,8 @@ body {
 }
 [hidden] { display: none !important; }
 svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; flex: none; }
+/* The icon sprite at the top of index.html: holds the <symbol>s, takes no space. (Not an inline style: the CSP forbids those.) */
+.sprite { position: absolute; width: 0; height: 0; overflow: hidden; }
 a { color: var(--accent); }
 h1, h2 { margin: 0; line-height: 1.2; }
 h1 { font-size: 26px; }

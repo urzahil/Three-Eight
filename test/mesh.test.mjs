@@ -2,7 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import './browser-globals.mjs';
-import { Reassembler, ChunkSender, routeVideo, screenBudget } from '../public/assets/js/mesh.js';
+import { Reassembler, ChunkSender, MAX_QUEUED, routeVideo, screenBudget } from '../public/assets/js/mesh.js';
 
 const CHUNK = 12 * 1024;
 const chunk = (mid, i, n, d = 'x') => ({ type: '_chunk', mid, i, n, d });
@@ -222,6 +222,32 @@ test('clear() empties the queue; a failing channel does not throw', () => {
   };
   s.send('y'.repeat(CHUNK * 3));
   assert.equal(s.queue.length, 0);
+});
+
+test('the queue is bounded: a peer that stops reading triggers onoverflow instead of endless buffering', () => {
+  assert.ok(MAX_QUEUED >= 2 * 12 * 1024 * 1024, 'room for a full-size subtitle message and more');
+  const dc = fakeChannel();
+  dc.bufferedAmount = 8 * 1024 * 1024; // the other side has stopped reading: the channel's buffer stays full
+  const s = new ChunkSender(dc, CHUNK * 100);
+  let overflows = 0;
+  s.onoverflow = () => overflows++;
+  assert.equal(s.send('y'.repeat(CHUNK * 60)), true);
+  assert.equal(s.send('{"type":"small"}'), true, 'queues behind the long one');
+  assert.ok(s.queued > 0 && s.queued <= CHUNK * 100);
+  assert.equal(overflows, 0);
+  assert.equal(s.send('z'.repeat(CHUNK * 50)), false, 'would go past the limit');
+  assert.equal(overflows, 1);
+  assert.equal(s.queue.length, 0, 'the queue is emptied');
+  assert.equal(s.queued, 0);
+  // Once the channel drains, the accounting is right again: a full queue drains back to zero.
+  dc.drain();
+  assert.equal(s.send('y'.repeat(CHUNK * 90)), true);
+  while (s.queue.length) {
+    dc.drain();
+    s.pump();
+  }
+  assert.equal(s.queued, 0);
+  assert.equal(overflows, 1);
 });
 
 // ---- Screen sharing: which incoming video is the camera, which the screen --------------------------------

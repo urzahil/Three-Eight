@@ -14,7 +14,7 @@ let google, keyDir, account;
 before(async () => {
   google = await startFakeGoogle();
   keyDir = fs.mkdtempSync(path.join(os.tmpdir(), 'three-eight-drive-'));
-  account = loadServiceAccount(google.writeAccount(keyDir));
+  account = loadServiceAccount(google.writeAccount(keyDir), { testEndpoints: true });
 });
 after(async () => {
   await google.close();

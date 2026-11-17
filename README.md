@@ -233,12 +233,12 @@ Notes:
 
 | Variable | Default | Description |
 |---|---|---|
-| `PORT` | `4567` | HTTP port |
+| `PORT` | `4567` | HTTP port (`1`–`65535`) |
 | `ADMIN_PASSWORD` | random, printed at start | Password for `/admin` |
 | `DATA_DIR` | `./data` (`/data` in Docker) | Where `rooms.json` is stored |
 | `TRUST_PROXY` | `false` (`true` in compose) | Trust `X-Forwarded-For` / `X-Forwarded-Proto`: `true`/`1`/`yes` for one proxy, a number for that many proxies in a row |
 | `ALLOWED_ORIGINS` | — | Comma-separated extra origins allowed to open the WebSocket (the page's own host is always allowed); entries are normalised like a browser's Origin, invalid ones are ignored with a warning |
-| `MAX_ROOM_SIZE` | `12` | Max participants per room |
+| `MAX_ROOM_SIZE` | `12` | Max participants per room (`1`–`100`; each person sends video to everyone else, so more than about 8 gets heavy) |
 | `STUN_URLS` | Google + Cloudflare STUN | Comma-separated STUN URLs |
 | `TURN_URLS` | — | Comma-separated TURN URLs (optional) |
 | `TURN_SECRET` | — | coturn `static-auth-secret` (ephemeral credentials) |
@@ -246,6 +246,8 @@ Notes:
 | `GOOGLE_SERVICE_ACCOUNT` | — | Path to a Google service account JSON key, for room Drive folders (optional, see above) |
 | `DRIVE_CACHE_MB` | `256` | Memory for the movie cache while streaming from Drive (minimum `32`; lower values are raised) |
 | `TLS_CERT` / `TLS_KEY` | — | Serve HTTPS directly instead of using a proxy |
+
+A setting that is set but unusable (say `MAX_ROOM_SIZE=twelve` or `TRUST_PROXY=on`) stops the server at startup with a message naming it, instead of being quietly replaced. A Google service account key must use Google's own token endpoint (as keys downloaded from Google Cloud do); pointing Drive at other endpoints (`token_uri`, `GOOGLE_API_BASE`) is for the test suite only and needs `DRIVE_DEBUG=1`.
 
 ### Do I need TURN?
 
