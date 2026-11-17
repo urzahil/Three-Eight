@@ -170,3 +170,35 @@ test('the folder-tree memo: "inside" is believed for 60 s, "not inside" for 5 mi
     Date.now = realNow;
   }
 });
+
+test('a long stream lets go of the runs it has read past (their blocks are not pinned in memory)', async () => {
+  const drive = makeDrive({ cacheBytes: 4 * MiB });
+  google.addFolder(id(60), 'Long stream');
+  const data = crypto.randomBytes(24 * MiB);
+  google.addFile(id(61), 'long.mp4', id(60), data, 'video/mp4');
+  const runs = [];
+  const startRun = drive._startRun.bind(drive);
+  drive._startRun = (...a) => {
+    const run = startRun(...a);
+    runs.push(run);
+    return run;
+  };
+  const gen = drive.read(id(61), data.length, 0, data.length - 1);
+  const parts = [];
+  for (let i = 0; i < 20; i++) parts.push((await gen.next()).value);
+  // Every run that ended before the current block is released by the reader and holds no blocks any more.
+  const behind = runs.filter((r) => r.done && r.b < 19);
+  assert(behind.length >= 1, 'some runs were already read past');
+  for (const r of behind) {
+    // (Boolean checks: a diff of the run would try to print its megabytes of blocks.)
+    assert(r.promise === null, `the finished run ${r.a}..${r.b} drops its blocks`);
+    assert(r.refs === 0, `and the reader no longer holds run ${r.a}..${r.b}`);
+  }
+  for (;;) {
+    const { value, done } = await gen.next();
+    if (done) break;
+    parts.push(value);
+  }
+  assert(Buffer.concat(parts).equals(data));
+  assert.strictEqual(drive.active, 0);
+});

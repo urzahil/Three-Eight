@@ -231,3 +231,70 @@ test('sameMovie: a content fingerprint on both sides decides; the movie keeps on
   assert.equal(cleanState(good({ movie: { name: 'A', size: 5, duration: 1, fp: fp1 } })).movie.fp, fp1);
   for (const bad of ['xyz', 'A'.repeat(32), fp1 + 'a', 5, null, {}]) assert.equal('fp' in cleanState(good({ movie: { name: 'A', size: 5, duration: 1, fp: bad } })).movie, false, String(bad));
 });
+
+function subSync(t) {
+  const mesh = new EventTarget();
+  mesh.broadcast = () => {};
+  const player = new EventTarget();
+  player.loaded = false;
+  player.subs = new Map();
+  player.addExternalSubtitle = (id, name, text) => player.subs.set(id, { name, text });
+  player.removeExternalSubtitle = (id) => player.subs.delete(id);
+  const sync = new MovieSync({ mesh, signaling: { now: () => 1000 }, player, selfId: 'me-me-me-me' });
+  t.after(() => sync.destroy());
+  const sent = [];
+  const peer = { id: 'peer-aaaaaaaa', send: (m) => sent.push(m) };
+  return { sync, player, peer, sent };
+}
+
+test('a shared subtitle file that arrives before the state listing it is kept, and not asked for again', (t) => {
+  const { sync, player, peer, sent } = subSync(t);
+  sync._onMessage(peer, { type: 'sub-file', id: 'x1', name: 'a.srt', text: '1\n00:00:01,000 --> 00:00:02,000\nHi\n' });
+  assert.equal(player.subs.size, 0, 'not shared yet');
+  sync._onMessage(peer, { type: 'sync-state', state: good() }); // lists x1
+  assert.deepEqual([...player.subs.keys()], ['x1']);
+  assert.equal(sent.filter((m) => m.type === 'sub-request').length, 0);
+});
+
+test('subtitle files nobody shares are bounded, and a new movie drops the old one\'s files', (t) => {
+  const { sync, player, peer } = subSync(t);
+  for (let i = 0; i < 100; i++) sync._onMessage(peer, { type: 'sub-file', id: 'junk' + i, name: 'j.srt', text: 'x' });
+  assert.equal(player.subs.size, 0);
+  assert(sync.subEarly.size <= 4);
+  sync._onMessage(peer, { type: 'sub-file', id: 'y'.repeat(101), name: 'j.srt', text: 'x' });
+  assert(![...sync.subEarly.keys()].some((k) => k.length > 100));
+  sync._onMessage(peer, { type: 'sync-state', state: good() });
+  sync._onMessage(peer, { type: 'sub-file', id: 'x1', name: 'a.srt', text: 'x' });
+  assert.deepEqual([...player.subs.keys()], ['x1']);
+  sync._onMessage(peer, { type: 'sync-state', state: good({ seq: 4, movie: { name: 'B.mkv', size: 200, duration: 90 }, sub: null, subFiles: [] }) });
+  assert.equal(player.subs.size, 0, 'the previous movie\'s file is gone');
+  assert.equal(sync.subTexts.size, 0);
+});
+
+test('seek latency: one listener per seek, and a seek that took ages is not learned', (t) => {
+  const { sync, player } = subSync(t);
+  let listeners = 0;
+  const add = player.addEventListener.bind(player);
+  const remove = player.removeEventListener.bind(player);
+  player.addEventListener = (t, f) => { if (t === 'seeked') listeners++; add(t, f); };
+  player.removeEventListener = (t, f) => { if (t === 'seeked') listeners--; remove(t, f); };
+  player.seek = () => {};
+  const realNow = performance.now;
+  let now = 0;
+  performance.now = () => now;
+  try {
+    sync._seekTo(10);
+    sync._seekTo(20);
+    assert.equal(listeners, 1, 'the earlier seek stops being measured');
+    now = 60_000; // e.g. the tab was in the background
+    player.dispatchEvent(new Event('seeked'));
+    assert.equal(listeners, 0);
+    assert.equal(sync.seekLatency, 0.15, 'unchanged');
+    sync._seekTo(30);
+    now += 500;
+    player.dispatchEvent(new Event('seeked'));
+    assert(Math.abs(sync.seekLatency - (0.15 * 0.6 + 0.5 * 0.4)) < 1e-9);
+  } finally {
+    performance.now = realNow;
+  }
+});

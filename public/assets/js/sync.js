@@ -111,6 +111,8 @@ export function sameMovie(a, b) {
   return a.name === b.name && Math.abs(da - db) < DURATION_TOLERANCE;
 }
 
+const MAX_EARLY_SUBS = 4;
+
 export class MovieSync extends EventTarget {
   constructor({ mesh, signaling, player, selfId }) {
     super();
@@ -119,7 +121,8 @@ export class MovieSync extends EventTarget {
     this.player = player;
     this.selfId = selfId;
     this.state = emptyState();
-    this.subTexts = new Map(); // external subtitle id -> {id, name, text}
+    this.subTexts = new Map(); // external subtitle id -> {id, name, text}, only for files the room shares now
+    this.subEarly = new Map(); // files that arrived before the state that lists them (the sharer sends the file first)
     this.peerStatus = new Map(); // peerId -> {file, ready, buffering}
     this.localFile = null; // {name, size, duration} of the file we loaded
     this.useAnyway = false; // user accepted a file that doesn't match
@@ -188,6 +191,7 @@ export class MovieSync extends EventTarget {
     next.at = clamp(next.at, 0, MAX_AT);
     this.state = next;
     this.mesh.broadcast({ type: 'sync-state', state: next });
+    this._syncSubtitles();
     this._apply(true);
     this._emit('state');
   }
@@ -246,6 +250,27 @@ export class MovieSync extends EventTarget {
 
   setSubtitle(id) {
     this._commit({ sub: id });
+  }
+
+  _addSubText(entry) {
+    this.subTexts.set(entry.id, entry);
+    this.player.addExternalSubtitle(entry.id, entry.name, entry.text);
+  }
+
+  /** Keep the external subtitles in step with the shared state: add early arrivals, drop files no longer shared. */
+  _syncSubtitles() {
+    const shared = new Set(this.state.subFiles.map((f) => f.id));
+    for (const id of shared) {
+      const early = this.subEarly.get(id);
+      if (!early) continue;
+      this.subEarly.delete(id);
+      if (!this.subTexts.has(id)) this._addSubText(early);
+    }
+    for (const id of [...this.subTexts.keys()]) {
+      if (shared.has(id)) continue;
+      this.subTexts.delete(id);
+      this.player.removeExternalSubtitle(id);
+    }
   }
 
   addSubtitleFile(entry) {
@@ -307,14 +332,20 @@ export class MovieSync extends EventTarget {
     const p = this.player;
     const started = performance.now();
     this.expectMediaChange();
-    p.seek(t);
+    // Only the latest seek is measured. "seeked" always follows a seek ("playing" does not when the target is
+    // already buffered, and would then measure until some later resume).
+    if (this._onSeeked) p.removeEventListener('seeked', this._onSeeked);
     const onSeeked = () => {
-      p.removeEventListener('playing', onSeeked);
+      p.removeEventListener('seeked', onSeeked);
+      if (this._onSeeked === onSeeked) this._onSeeked = null;
       const took = (performance.now() - started) / 1000;
-      // Learn how long seeks take so we land on time next time.
-      this.seekLatency = Math.min(2, Math.max(0.05, this.seekLatency * 0.6 + took * 0.4));
+      // Learn how long seeks take so we land on time next time; a seek that took ages (stalled, tab in the
+      // background) says nothing about the next one.
+      if (took < 2.5) this.seekLatency = Math.min(2, Math.max(0.05, this.seekLatency * 0.6 + took * 0.4));
     };
-    p.addEventListener('playing', onSeeked);
+    this._onSeeked = onSeeked;
+    p.addEventListener('seeked', onSeeked);
+    p.seek(t);
   }
 
   /** User clicked the "start playback" overlay after an autoplay block. */
@@ -384,6 +415,7 @@ export class MovieSync extends EventTarget {
         const prev = this.state;
         this.state = s;
         if (!sameMovie(prev.movie, this.state.movie)) this.useAnyway = false;
+        this._syncSubtitles();
         // Fetch any shared subtitle file we don't have yet.
         for (const f of this.state.subFiles) {
           if (!this.subTexts.has(f.id)) peer.send({ type: 'sub-request', id: f.id });
@@ -409,11 +441,17 @@ export class MovieSync extends EventTarget {
         break;
       }
       case 'sub-file': {
-        if (typeof msg.id !== 'string' || typeof msg.text !== 'string' || this.subTexts.has(msg.id)) return;
+        if (typeof msg.id !== 'string' || !msg.id || msg.id.length > 100 || typeof msg.text !== 'string' || this.subTexts.has(msg.id)) return;
         if (msg.text.length > 5 * 1024 * 1024) return;
         const entry = { id: msg.id, name: String(msg.name || 'Subtitles').slice(0, 120), text: msg.text };
-        this.subTexts.set(entry.id, entry);
-        this.player.addExternalSubtitle(entry.id, entry.name, entry.text);
+        if (!this.state.subFiles.some((f) => f.id === entry.id)) {
+          // Not shared (yet): the state listing it usually follows right away. Keep a few, not every file a peer sends.
+          this.subEarly.delete(entry.id);
+          this.subEarly.set(entry.id, entry);
+          while (this.subEarly.size > MAX_EARLY_SUBS) this.subEarly.delete(this.subEarly.keys().next().value);
+          return;
+        }
+        this._addSubText(entry);
         this._apply(false);
         break;
       }
@@ -424,5 +462,7 @@ export class MovieSync extends EventTarget {
 
   destroy() {
     clearInterval(this._timer);
+    if (this._onSeeked) this.player.removeEventListener('seeked', this._onSeeked);
+    this._onSeeked = null;
   }
 }

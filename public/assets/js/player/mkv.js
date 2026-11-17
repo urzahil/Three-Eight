@@ -77,10 +77,11 @@ function* children(b, start = 0, end = b.length) {
   }
 }
 
-/** Parse a (Simple)Block payload. */
+/** A (Simple)Block: track, relative timecode, keyframe flag and frames. Null when malformed or truncated. */
 function parseBlock(b) {
+  if (!b.length) return null;
   const tl = vintLength(b[0]);
-  if (!tl) return null;
+  if (!tl || b.length < tl + 3) return null;
   const track = readUint(b, 0, tl) - (0x80 >> (tl - 1)) * Math.pow(256, tl - 1);
   const rel = ((b[tl] << 8) | b[tl + 1]) << 16 >> 16;
   const flags = b[tl + 2];
@@ -90,34 +91,47 @@ function parseBlock(b) {
   if (lacing === 0) {
     frames = [b.subarray(o)];
   } else {
+    if (o >= b.length) return null;
     const count = b[o++] + 1;
     const sizes = [];
     if (lacing === 1) {
+      // Xiph lacing: each size is a run of 255s and a final byte.
       for (let i = 0; i < count - 1; i++) {
         let s = 0, v;
-        do { v = b[o++]; s += v; } while (v === 255);
+        do {
+          if (o >= b.length) return null;
+          v = b[o++];
+          s += v;
+        } while (v === 255);
         sizes.push(s);
       }
     } else if (lacing === 3) {
-      let l = vintLength(b[o]);
+      // EBML lacing: the first size, then signed differences.
+      let l = o < b.length ? vintLength(b[o]) : 0;
+      if (!l || o + l > b.length) return null;
       let s = readUint(b, o, l) - (0x80 >> (l - 1)) * Math.pow(256, l - 1);
       o += l;
       sizes.push(s);
       for (let i = 1; i < count - 1; i++) {
-        l = vintLength(b[o]);
+        l = o < b.length ? vintLength(b[o]) : 0;
+        if (!l || o + l > b.length) return null;
         const raw = readUint(b, o, l) - (0x80 >> (l - 1)) * Math.pow(256, l - 1);
         o += l;
         s += raw - (Math.pow(2, 7 * l - 1) - 1);
         sizes.push(s);
       }
     }
+    if (o > b.length) return null;
     const remaining = b.length - o;
     if (lacing === 2) {
-      const each = Math.floor(remaining / count);
+      // Fixed-size lacing: the frames split what is left evenly (the format requires it).
+      if (!remaining || remaining % count) return null;
+      const each = remaining / count;
       for (let i = 0; i < count; i++) sizes.push(each);
     } else {
       sizes.push(remaining - sizes.reduce((a, c) => a + c, 0));
     }
+    if (!sizes.every((x) => Number.isInteger(x) && x >= 0)) return null;
     frames = [];
     for (const s of sizes) {
       frames.push(b.subarray(o, o + s));
@@ -608,6 +622,7 @@ class MkvCursor {
     this.iter = null;
     this.pending = null;
     this.done = false;
+    this.lastDts = null;
   }
 
   seek(seconds) {
@@ -619,6 +634,7 @@ class MkvCursor {
     this.pending = null;
     this.needKey = this.t.type === 'video';
     this.done = false;
+    this.lastDts = null; // decode time of the last video frame handed out since the seek
   }
 
   async _nextBlock() {
@@ -666,7 +682,16 @@ class MkvCursor {
     for (let i = 0; i < frames.length; i++) delay = Math.max(delay, sorted[i] - frames[i].pts);
     this.d.reorderDelay.set(this.t.number, delay);
     const fd = this.d.frameDuration(this.t);
-    for (let i = 0; i < frames.length; i++) frames[i].dts = sorted[i] - delay;
+    // A later GOP can need a deeper delay than the earlier ones did. Shifting it back by the extra amount would
+    // overlap the decode times already appended, so keep them increasing (and never after the frame's own pts).
+    let last = this.lastDts;
+    for (let i = 0; i < frames.length; i++) {
+      let dts = sorted[i] - delay;
+      if (last !== null && dts <= last) dts = Math.min(frames[i].pts, last + 1);
+      frames[i].dts = dts;
+      last = dts;
+    }
+    this.lastDts = last;
     for (let i = 0; i < frames.length; i++) {
       frames[i].duration = i + 1 < frames.length ? frames[i + 1].dts - frames[i].dts : fd;
     }

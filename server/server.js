@@ -63,6 +63,7 @@ const DRIVE_DEBUG = process.env.DRIVE_DEBUG === '1';
 const TOKEN_REFRESH_MS = (DRIVE_DEBUG && parseInt(process.env.DRIVE_TOKEN_REFRESH_MS, 10)) || 10 * 3600 * 1000;
 const HEARTBEAT_MS = (DRIVE_DEBUG && parseInt(process.env.HEARTBEAT_MS, 10)) || 30000;
 const MAX_MESSAGE_BYTES = 64 * 1024;
+const MAX_WS_BUFFERED = 4 * 1024 * 1024; // bytes queued for one client before it counts as gone
 // Per-socket message budget (token bucket): room for ICE candidate bursts and clock-sync pings.
 // A newcomer in a full room sends an offer plus a dozen ICE candidates to each peer, so the burst is generous.
 const MSG_BURST = 1000;
@@ -416,7 +417,7 @@ function clientIp(req) {
 
 function isHttps(req) {
   if (req.socket.encrypted) return true;
-  return TRUSTED_HOPS > 0 && forwardedValue(req, 'x-forwarded-proto') === 'https';
+  return TRUSTED_HOPS > 0 && forwardedValue(req, 'x-forwarded-proto').toLowerCase() === 'https';
 }
 
 // Errors caused by bad client input: answered with 400 and their message. Everything else is a 500.
@@ -526,6 +527,7 @@ const roomLimiter = new FailLimiter(20, 10 * 60 * 1000);
 
 // ---- Admin sessions -----------------------------------------------------------
 const adminSessions = new Map(); // token -> expiry
+const MAX_ADMIN_SESSIONS = 256;
 
 function adminAuthed(req) {
   const token = parseCookies(req).te_admin;
@@ -870,14 +872,19 @@ async function handleApi(req, res, url) {
       return sendJson(res, 401, { error: 'Wrong password' });
     }
     const token = crypto.randomBytes(32).toString('base64url');
+    // Logging in again and again (a script) must not grow the map without bound: the oldest sessions go first.
+    while (adminSessions.size >= MAX_ADMIN_SESSIONS) adminSessions.delete(adminSessions.keys().next().value);
     adminSessions.set(token, Date.now() + ADMIN_SESSION_MS);
     const cookie = `te_admin=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${ADMIN_SESSION_MS / 1000}${isHttps(req) ? '; Secure' : ''}`;
     return sendJson(res, 200, { ok: true }, { 'Set-Cookie': cookie });
   }
 
   if (parts[2] === 'logout' && req.method === 'POST') {
+    req.resume(); // the body is not needed
     adminSessions.delete(parseCookies(req).te_admin);
-    return sendJson(res, 200, { ok: true }, { 'Set-Cookie': 'te_admin=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0' });
+    return sendJson(res, 200, { ok: true }, {
+      'Set-Cookie': `te_admin=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0${isHttps(req) ? '; Secure' : ''}`,
+    });
   }
 
   if (!adminAuthed(req)) return sendJson(res, 401, { error: 'Not logged in' });
@@ -1056,7 +1063,14 @@ const server = process.env.TLS_CERT && process.env.TLS_KEY
 const ID_RE = /^[A-Za-z0-9_-]{8,64}$/;
 
 function send(ws, msg) {
-  if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(msg));
+  if (ws.readyState !== ws.OPEN) return;
+  // A client that stopped reading (stalled connection) would otherwise collect everything its room sends until the
+  // heartbeat notices: drop it instead. Signaling needs every message in order, so skipping some is no option.
+  if (ws.bufferedAmount > MAX_WS_BUFFERED) {
+    ws.terminate();
+    return;
+  }
+  ws.send(JSON.stringify(msg));
 }
 
 /** True when this socket is the live member registered under its room and id (not merely a socket with those fields set). */

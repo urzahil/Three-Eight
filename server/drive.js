@@ -540,6 +540,8 @@ class GoogleDrive {
     run.promise = this._fetchRun(run, size);
     const finish = () => {
       run.done = true;
+      // A settled promise keeps its value alive: drop it, or a stream holding this run pins every block it fetched.
+      run.promise = null;
       for (let i = run.a; i <= run.b; i++) {
         const k = `${fileId}:${i}`;
         if (this.pending.get(k)?.run === run) this.pending.delete(k);
@@ -655,15 +657,27 @@ class GoogleDrive {
     const last = Math.floor(end / BLOCK);
     const held = new Set();
     let requested = first - 1;
-    const request = (upto) => {
-      const hi = Math.min(last, upto);
-      if (hi <= requested) return;
-      for (const run of this._ensure(fileId, size, requested + 1, hi)) {
+    const hold = (runs) => {
+      for (const run of runs) {
         if (!held.has(run)) {
           held.add(run);
           run.refs++;
         }
       }
+    };
+    // Finished runs need no cancelling: let them go so a long stream does not keep every run it ever used.
+    const releaseDone = () => {
+      for (const run of held) {
+        if (run.done) {
+          held.delete(run);
+          run.refs--;
+        }
+      }
+    };
+    const request = (upto) => {
+      const hi = Math.min(last, upto);
+      if (hi <= requested) return;
+      hold(this._ensure(fileId, size, requested + 1, hi));
       requested = hi;
     };
     let onAbort;
@@ -684,12 +698,7 @@ class GoogleDrive {
           let p = this.pending.get(key);
           if (!p) {
             // Cached when we asked, evicted since (or its download was cancelled): ask again.
-            for (const run of this._ensure(fileId, size, i, i)) {
-              if (!held.has(run)) {
-                held.add(run);
-                run.refs++;
-              }
-            }
+            hold(this._ensure(fileId, size, i, i));
             p = this.pending.get(key);
           }
           buf = p ? await Promise.race([p.promise, aborted]) : this._cacheGet(key);
@@ -697,6 +706,7 @@ class GoogleDrive {
         }
         const from = i === first ? start - i * BLOCK : 0;
         const to = i === last ? end - i * BLOCK + 1 : buf.length;
+        releaseDone();
         yield buf.subarray(from, to);
       }
     } finally {
