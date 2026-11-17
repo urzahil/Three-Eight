@@ -11,6 +11,8 @@
   <link rel="apple-touch-icon" href="/assets/icons/apple-touch-icon.png">
   <meta name="apple-mobile-web-app-title" content="Three-Eight">
   <link rel="stylesheet" href="/assets/css/style.css">
+  <link rel="stylesheet" href="/assets/css/themes.css">
+  <script src="/assets/js/theme-boot.js"></script>
 </head>
 <body>
   <svg width="0" height="0" style="position:absolute" aria-hidden="true">
@@ -56,6 +58,7 @@
         </label>
         <button class="btn primary" type="submit">Go to room</button>
       </form>
+      <label class="ui-pick">Interface style <select id="landing-ui" data-theme-select></select></label>
     </div>
   </main>
 
@@ -84,6 +87,10 @@
           <summary>Devices</summary>
           <label>Microphone <select id="lobby-audio-dev"></select></label>
           <label>Camera <select id="lobby-video-dev"></select></label>
+        </details>
+        <details class="devices">
+          <summary>Appearance</summary>
+          <label>Interface style <select id="lobby-ui" data-theme-select></select></label>
         </details>
         <p id="lobby-error" class="error" role="alert" hidden></p>
         <button id="lobby-join" class="btn primary" type="submit">Join room</button>
@@ -218,6 +225,7 @@
     <form method="dialog" class="stack">
       <h2>Settings</h2>
       <label>Your name <input id="set-name" maxlength="40"></label>
+      <label>Interface style <select id="set-ui" data-theme-select></select></label>
       <label>Microphone <select id="set-audio-dev"></select></label>
       <label>Camera <select id="set-video-dev"></select></label>
       <label class="check"><input id="set-noise" type="checkbox" checked> Noise suppression &amp; echo cancellation</label>

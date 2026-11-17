@@ -123,6 +123,7 @@ export class Pip {
   async _preparePipDocument(doc) {
     doc.title = this.sync.localFile?.name || document.title;
     doc.body.className = 'pip-window';
+    if (document.documentElement.dataset.ui) doc.documentElement.dataset.ui = document.documentElement.dataset.ui;
     const sprite = document.body.querySelector(':scope > svg');
     if (sprite) doc.body.prepend(doc.importNode(sprite, true));
     const loads = [...document.querySelectorAll('link[rel="stylesheet"]')].map((link) => {

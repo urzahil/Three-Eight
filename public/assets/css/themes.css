@@ -1,0 +1,269 @@
+/*
+ * Alternative interface styles, chosen in Settings (or on the start page) and saved on this device.
+ * The default look ("Three-Eight") is style.css alone. Each style below is a dark re-skin inspired by
+ * the design language of a UI library: it overrides the tokens from style.css's :root and adds a few
+ * component tweaks. No library code or font is loaded (the CSP allows only same-origin scripts and fonts),
+ * so the font stacks name the library's typeface first and fall back to the system font.
+ * Applied by <html data-ui="…">, set before first paint by js/theme-boot.js.
+ */
+
+/* ===================== CossUI — neutral, shadcn-style, white primary ===================== */
+:root[data-ui="coss"] {
+  --bg: #0a0a0a;
+  --bg-2: #141414;
+  --bg-3: #1f1f1f;
+  --line: #262626;
+  --text: #fafafa;
+  --muted: #a1a1a1;
+  --accent: #fafafa;
+  --accent-ink: #0a0a0a;
+  --danger: #e7000b;
+  --danger-text: #ff6467;
+  --danger-border: #4a1416;
+  --ok: #00c950;
+  --hover: #262626;
+  --warn-bg: #2a1f0b;
+  --warn-text: #fcc800;
+  --warn-border: #4d3a0c;
+  --hover-overlay: rgba(255, 255, 255, 0.08);
+  --round-bg: rgba(20, 20, 20, 0.85);
+  --r-card: 16px;
+  --r-btn: 8px;
+  --r-control: 8px;
+  --r-sm: 6px;
+  --tile-radius: 12px;
+  --radius: 12px;
+  --btn-weight: 500;
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.5), 0 12px 32px rgba(0, 0, 0, 0.5);
+  --font: "Inter", "Geist", system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+}
+[data-ui="coss"] .btn { box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05), 0 1px 2px rgba(0, 0, 0, 0.4); padding: 9px 14px; font-size: 14px; }
+[data-ui="coss"] .btn.primary { box-shadow: inset 0 -1px 0 rgba(0, 0, 0, 0.15), 0 1px 2px rgba(0, 0, 0, 0.4); }
+[data-ui="coss"] .btn.ghost { box-shadow: none; }
+[data-ui="coss"] .btn.ghost:hover { background: var(--bg-3); }
+[data-ui="coss"] .card, [data-ui="coss"] .dialog { border-color: rgba(255, 255, 255, 0.08); box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04), var(--shadow); }
+[data-ui="coss"] input:not([type=checkbox]):not([type=range]):not([type=file]),
+[data-ui="coss"] select { background: transparent; box-shadow: 0 1px 2px rgba(0, 0, 0, 0.3); padding: 9px 12px; }
+[data-ui="coss"] input:focus, [data-ui="coss"] select:focus { border-color: #737373; box-shadow: 0 0 0 3px rgba(163, 163, 163, 0.25); }
+[data-ui="coss"] button:focus-visible, [data-ui="coss"] .seek:focus-visible { outline: 2px solid #737373; }
+[data-ui="coss"] .tool.active { background: var(--bg-3); color: var(--text); box-shadow: inset 0 0 0 1px var(--line); }
+[data-ui="coss"] .tabs { padding: 8px; }
+[data-ui="coss"] .tab.active { box-shadow: inset 0 0 0 1px var(--line), 0 1px 2px rgba(0, 0, 0, 0.4); }
+[data-ui="coss"] .logo { border-radius: 8px; }
+
+/* ===================== AlignUI — deep navy surfaces, vivid blue primary ===================== */
+:root[data-ui="align"] {
+  --bg: #0e121b;
+  --bg-2: #181b25;
+  --bg-3: #222530;
+  --line: #2b303b;
+  --text: #ffffff;
+  --muted: #99a0ae;
+  --accent: #335cff;
+  --accent-ink: #ffffff;
+  --danger: #fb3748;
+  --danger-text: #ff7a85;
+  --danger-border: #5a1d25;
+  --ok: #1fc16b;
+  --hover: #2b303b;
+  --warn-bg: #3a2010;
+  --warn-text: #ffa16b;
+  --warn-border: #6b3815;
+  --hover-overlay: rgba(255, 255, 255, 0.08);
+  --round-bg: rgba(24, 27, 37, 0.85);
+  --r-card: 20px;
+  --r-btn: 10px;
+  --r-control: 10px;
+  --r-sm: 6px;
+  --tile-radius: 12px;
+  --radius: 16px;
+  --btn-weight: 500;
+  --shadow: 0 16px 32px -12px rgba(0, 0, 0, 0.6);
+  --font: "Inter", "Inter Display", system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+}
+[data-ui="align"] body { letter-spacing: -0.006em; }
+[data-ui="align"] .btn { font-size: 14px; padding: 9px 14px; box-shadow: 0 1px 2px rgba(10, 13, 20, 0.3); }
+[data-ui="align"] .btn.primary {
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.16), rgba(255, 255, 255, 0)) var(--accent);
+  box-shadow: 0 1px 2px rgba(14, 18, 27, 0.4), inset 0 0 0 1px #3559e9, inset 0 1px 0 rgba(255, 255, 255, 0.12);
+}
+[data-ui="align"] .btn.primary:hover { filter: none; background-color: #2547d0; }
+[data-ui="align"] .btn.ghost { box-shadow: none; color: var(--muted); }
+[data-ui="align"] .btn.ghost:hover { color: var(--text); background: var(--bg-3); }
+[data-ui="align"] .btn.danger:hover { background: rgba(251, 55, 72, 0.1); }
+[data-ui="align"] input:not([type=checkbox]):not([type=range]):not([type=file]),
+[data-ui="align"] select { background: var(--bg-2); box-shadow: 0 1px 2px rgba(10, 13, 20, 0.3); }
+[data-ui="align"] input:hover, [data-ui="align"] select:hover { background: var(--bg-3); }
+[data-ui="align"] input:focus, [data-ui="align"] select:focus { border-color: var(--line); box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px rgba(153, 160, 174, 0.3); }
+[data-ui="align"] label { color: var(--text); font-weight: 500; font-size: 14px; }
+[data-ui="align"] .tool { border-radius: 12px; color: var(--muted); }
+[data-ui="align"] .tool:hover { color: var(--text); }
+[data-ui="align"] .tool.active { color: var(--text); background: var(--bg-3); box-shadow: inset 0 0 0 1px var(--line); }
+[data-ui="align"] .tool.active svg { color: var(--accent); }
+[data-ui="align"] .tabs { margin: 8px; padding: 4px; border: 0; border-radius: 10px; background: var(--bg); }
+[data-ui="align"] .tab.active { background: var(--bg-3); box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4); }
+[data-ui="align"] .pill { border: 1px solid var(--warn-border); }
+[data-ui="align"] .logo { background: linear-gradient(135deg, #335cff, #7d52f4); color: #fff; }
+
+/* ===================== DaisyUI — slate base, indigo primary, playful press ===================== */
+:root[data-ui="daisy"] {
+  --bg: #15191e;
+  --bg-2: #1d232a;
+  --bg-3: #2a323c;
+  --line: #333c47;
+  --text: #ecf9ff;
+  --muted: #a6adbb;
+  --accent: #605dff;
+  --accent-ink: #edf1fe;
+  --danger: #ff627d;
+  --danger-text: #ff8fa3;
+  --danger-border: #5c2836;
+  --ok: #00d390;
+  --hover: #333c47;
+  --warn-bg: #3a2d08;
+  --warn-text: #fcb700;
+  --warn-border: #6b510b;
+  --hover-overlay: rgba(236, 249, 255, 0.1);
+  --round-bg: rgba(29, 35, 42, 0.9);
+  --r-card: 16px;
+  --r-btn: 8px;
+  --r-control: 8px;
+  --r-sm: 6px;
+  --tile-radius: 16px;
+  --radius: 16px;
+  --btn-weight: 600;
+  --shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.35), 0 8px 10px -6px rgba(0, 0, 0, 0.35);
+  --font: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+[data-ui="daisy"] .btn { min-height: 40px; padding: 8px 16px; font-size: 14px; border-color: var(--bg-3); transition: transform 0.15s, background-color 0.15s; }
+[data-ui="daisy"] .btn:active:not(:disabled), [data-ui="daisy"] .tool:active, [data-ui="daisy"] .round:active { transform: scale(0.97); }
+[data-ui="daisy"] .btn.primary:hover { filter: none; background: #4a47e6; }
+[data-ui="daisy"] .btn.danger { background: var(--danger); color: #4d0218; border-color: transparent; }
+[data-ui="daisy"] .btn.danger:hover { background: #ff4766; }
+[data-ui="daisy"] .card, [data-ui="daisy"] .dialog { border: 0; }
+[data-ui="daisy"] .card { background: var(--bg-2); }
+[data-ui="daisy"] input:not([type=checkbox]):not([type=range]):not([type=file]),
+[data-ui="daisy"] select { background: var(--bg); border-color: rgba(236, 249, 255, 0.2); min-height: 40px; padding: 8px 12px; }
+[data-ui="daisy"] input:focus, [data-ui="daisy"] select:focus { border-color: rgba(236, 249, 255, 0.2); outline: 2px solid rgba(236, 249, 255, 0.2); outline-offset: 2px; }
+[data-ui="daisy"] .tool.active { background: var(--accent); color: var(--accent-ink); }
+[data-ui="daisy"] .tool.active svg { color: var(--accent-ink); }
+[data-ui="daisy"] .tabs { margin: 8px; padding: 4px; border: 0; border-radius: var(--r-btn); background: var(--bg); }
+[data-ui="daisy"] .tab.active { background: var(--accent); color: var(--accent-ink); }
+[data-ui="daisy"] .badge { background: #f43098; }
+[data-ui="daisy"] .pill { background: var(--warn-text); color: #2a1d00; font-weight: 600; }
+[data-ui="daisy"] .logo { background: linear-gradient(135deg, #605dff, #f43098); color: #fff; }
+[data-ui="daisy"] .msg .meta b { color: #00d3bb; }
+
+/* ===================== HeroUI — pure black, zinc layers, large radii, soft press ===================== */
+:root[data-ui="hero"] {
+  --bg: #000000;
+  --bg-2: #18181b;
+  --bg-3: #27272a;
+  --line: #3f3f46;
+  --text: #ecedee;
+  --muted: #a1a1aa;
+  --accent: #006fee;
+  --accent-ink: #ffffff;
+  --danger: #f31260;
+  --danger-text: #f54180;
+  --danger-border: #61071f;
+  --ok: #17c964;
+  --hover: #3f3f46;
+  --warn-bg: #312107;
+  --warn-text: #f7b750;
+  --warn-border: #62420e;
+  --hover-overlay: rgba(255, 255, 255, 0.1);
+  --round-bg: rgba(39, 39, 42, 0.85);
+  --r-card: 14px;
+  --r-btn: 12px;
+  --r-control: 12px;
+  --r-sm: 8px;
+  --tile-radius: 14px;
+  --radius: 14px;
+  --btn-weight: 500;
+  --shadow: 0 0 5px rgba(0, 0, 0, 0.05), 0 2px 10px rgba(0, 0, 0, 0.2), inset 0 0 1px rgba(255, 255, 255, 0.15);
+  --font: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+}
+[data-ui="hero"] .btn { border: 0; min-height: 40px; padding: 8px 16px; font-size: 14px; transition: transform 0.15s, opacity 0.15s, background-color 0.15s; }
+[data-ui="hero"] .btn:hover { opacity: 0.9; }
+[data-ui="hero"] .btn:active:not(:disabled), [data-ui="hero"] .tool:active, [data-ui="hero"] .round:active, [data-ui="hero"] .icon-btn:active { transform: scale(0.97); }
+[data-ui="hero"] .btn.primary { box-shadow: 0 8px 16px -6px rgba(0, 111, 238, 0.45); }
+[data-ui="hero"] .btn.primary:hover { filter: none; }
+[data-ui="hero"] .btn.danger { background: rgba(243, 18, 96, 0.2); color: var(--danger-text); }
+[data-ui="hero"] .btn.ghost { background: transparent; }
+[data-ui="hero"] .btn.ghost:hover { background: var(--bg-3); }
+[data-ui="hero"] .card, [data-ui="hero"] .dialog { border: 0; }
+[data-ui="hero"] input:not([type=checkbox]):not([type=range]):not([type=file]),
+[data-ui="hero"] select { background: var(--bg-3); border-color: transparent; min-height: 40px; padding: 8px 12px; transition: background-color 0.15s; }
+[data-ui="hero"] input:hover, [data-ui="hero"] select:hover { background: var(--line); }
+[data-ui="hero"] input:focus, [data-ui="hero"] select:focus { border-color: transparent; background: var(--bg-3); box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px var(--accent); }
+[data-ui="hero"] button:focus-visible, [data-ui="hero"] .seek:focus-visible { outline-color: var(--accent); }
+[data-ui="hero"] .topbar, [data-ui="hero"] .toolbar { border-color: rgba(255, 255, 255, 0.1); }
+[data-ui="hero"] .sidebar { border-color: rgba(255, 255, 255, 0.1); }
+[data-ui="hero"] .tool.active { background: rgba(0, 111, 238, 0.2); color: #338ef7; }
+[data-ui="hero"] .tabs { margin: 8px; padding: 4px; border: 0; border-radius: 12px; background: var(--bg-3); }
+[data-ui="hero"] .tab { border-radius: 8px; }
+[data-ui="hero"] .tab.active { background: var(--line); box-shadow: 0 1px 4px rgba(0, 0, 0, 0.4); }
+[data-ui="hero"] .pill { background: rgba(245, 165, 36, 0.2); }
+[data-ui="hero"] .toast { border-color: transparent; background: var(--bg-2); }
+[data-ui="hero"] .logo { background: linear-gradient(135deg, #006fee, #9353d3); color: #fff; border-radius: 12px; }
+
+/* ===================== AntUI — dark algorithm: #141414 containers, 6px radii, ink-bar tabs ===================== */
+:root[data-ui="ant"] {
+  --bg: #000000;
+  --bg-2: #141414;
+  --bg-3: #1f1f1f;
+  --line: #424242;
+  --text: rgba(255, 255, 255, 0.88);
+  --muted: rgba(255, 255, 255, 0.55);
+  --accent: #1668dc;
+  --accent-ink: #ffffff;
+  --danger: #dc4446;
+  --danger-text: #e86e6b;
+  --danger-border: #7e2e2f;
+  --ok: #49aa19;
+  --hover: #262626;
+  --warn-bg: #2b2111;
+  --warn-text: #d89614;
+  --warn-border: #594214;
+  --hover-overlay: rgba(255, 255, 255, 0.08);
+  --round-bg: rgba(31, 31, 31, 0.88);
+  --r-card: 8px;
+  --r-btn: 6px;
+  --r-control: 6px;
+  --r-sm: 4px;
+  --tile-radius: 8px;
+  --radius: 8px;
+  --btn-weight: 400;
+  --shadow: 0 6px 16px 0 rgba(0, 0, 0, 0.08), 0 3px 6px -4px rgba(0, 0, 0, 0.12), 0 9px 28px 8px rgba(0, 0, 0, 0.05);
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", sans-serif;
+}
+[data-ui="ant"] body { font-size: 14px; line-height: 1.5715; }
+[data-ui="ant"] h1, [data-ui="ant"] h2 { font-weight: 600; }
+[data-ui="ant"] .btn { background: transparent; padding: 6px 15px; min-height: 36px; font-size: 14px; transition: all 0.2s cubic-bezier(0.645, 0.045, 0.355, 1); }
+[data-ui="ant"] .btn:hover { background: transparent; color: #3c89e8; border-color: #3c89e8; }
+[data-ui="ant"] .btn.primary { background: var(--accent); color: #fff; box-shadow: 0 2px 0 rgba(0, 0, 0, 0.1); }
+[data-ui="ant"] .btn.primary:hover { filter: none; background: #3c89e8; color: #fff; }
+[data-ui="ant"] .btn.danger:hover { color: #e86e6b; border-color: #e86e6b; background: transparent; }
+[data-ui="ant"] .btn.ghost { border-color: transparent; }
+[data-ui="ant"] .btn.ghost:hover { background: rgba(255, 255, 255, 0.08); color: var(--text); border-color: transparent; }
+[data-ui="ant"] .card, [data-ui="ant"] .dialog { border-color: #303030; }
+[data-ui="ant"] .topbar, [data-ui="ant"] .toolbar, [data-ui="ant"] .sidebar, [data-ui="ant"] .tabs, [data-ui="ant"] .chat-form { border-color: #303030; }
+[data-ui="ant"] .topbar, [data-ui="ant"] .toolbar { background: var(--bg-2); }
+[data-ui="ant"] input:not([type=checkbox]):not([type=range]):not([type=file]),
+[data-ui="ant"] select { background: var(--bg-2); padding: 6px 11px; min-height: 36px; transition: all 0.2s; }
+[data-ui="ant"] input:hover, [data-ui="ant"] select:hover { border-color: #3c89e8; }
+[data-ui="ant"] input:focus, [data-ui="ant"] select:focus { border-color: #3c89e8; box-shadow: 0 0 0 2px rgba(0, 60, 180, 0.15); }
+[data-ui="ant"] label { color: var(--text); font-size: 14px; }
+[data-ui="ant"] button:focus-visible, [data-ui="ant"] .seek:focus-visible { outline: 4px solid #153450; outline-offset: 1px; }
+[data-ui="ant"] .tool { border-radius: 6px; }
+[data-ui="ant"] .tool.active { background: #111a2c; color: #3c89e8; }
+[data-ui="ant"] .tabs { padding: 0 8px; gap: 0; }
+[data-ui="ant"] .tab { border-radius: 0; padding: 12px; font-weight: 400; color: var(--text); }
+[data-ui="ant"] .tab:hover { color: #3c89e8; }
+[data-ui="ant"] .tab.active { background: transparent; color: #1668dc; box-shadow: inset 0 -2px 0 #1668dc; }
+[data-ui="ant"] .menu, [data-ui="ant"] .toast { background: #1f1f1f; border-color: transparent; }
+[data-ui="ant"] .menu button:hover { background: rgba(255, 255, 255, 0.08); }
+[data-ui="ant"] .pill { border-radius: 4px; border: 1px solid var(--warn-border); }
+[data-ui="ant"] .badge { box-shadow: 0 0 0 1px var(--bg-2); }
+[data-ui="ant"] .toast.warn { background: var(--warn-bg); }

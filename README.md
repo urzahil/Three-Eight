@@ -241,6 +241,17 @@ Usually not. STUN is enough for most home connections. Some friends may be behin
 
 ## Customizing the look
 
+### Interface styles
+
+Everyone can pick an interface style for their own device: on the start page, under *Appearance* in the lobby, or in *Settings* in a room. The choice is saved in the browser and also applies to the admin page and the picture-in-picture window. All styles are dark:
+
+- **Three-Eight** (default): the original look.
+- **CossUI**, **AlignUI**, **DaisyUI**, **HeroUI** and **AntUI**: re-skins inspired by those UI libraries' dark themes (colors, radii, buttons, inputs, tabs).
+
+They are pure CSS in `public/assets/css/themes.css`: each one overrides the variables described below under `:root[data-ui="<id>"]`, plus a few component rules. No library code or web font is loaded (the Content-Security-Policy allows only same-origin scripts and fonts). The list of styles, with each one's `theme-color`, is in `public/assets/js/theme.js`; `public/assets/js/theme-boot.js` applies the saved style before the page is drawn. To add a style, add a block to `themes.css` and an entry to `THEMES`.
+
+### Colors
+
 All colors are CSS variables at the top of `public/assets/css/style.css` (the `:root` block). The admin page uses the same stylesheet.
 
 To change the accent color (yellow/orange by default), edit:
@@ -265,6 +276,7 @@ Other variable groups in the same block:
 - `--ok`: speaking indicator and mic level meter.
 - Subtitles: `--sub-text`, `--sub-outline`. These are also used by the compact picture-in-picture window.
 - Avatars: `--avatar-1` ... `--avatar-10` (each participant gets one by hashing their id), plus `--avatar-fallback` and `--on-color` (text on avatars and badges).
+- Radii: `--r-card` (cards, dialogs), `--r-btn` (buttons, toolbar, menus), `--r-control` (inputs, icon buttons, tabs), `--r-sm` (labels, menu items), `--radius`, `--tile-radius`; `--btn-weight` (button font weight).
 - Overlays and video: `--video-bg` (behind video), `--label-bg`, `--backdrop`, `--movie-overlay`, `--controls-scrim`, `--tooltip-bg`, `--round-bg`, `--meter-bg`, `--hover-overlay`, `--seek-track`, `--seek-buffered`, `--time-text`, `--shadow-color`.
 
 When running with Docker, rebuild the image after editing: `docker compose up -d --build`.
