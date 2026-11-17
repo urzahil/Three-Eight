@@ -4,7 +4,8 @@ import { MovieSync } from './sync.js';
 import { MoviePlayer } from './player/player.js';
 import { LocalMedia, watchLevel, audioContext } from './media.js';
 import { Swarm } from './player/swarm.js';
-import { $, store, show, showMessage, toast, setIcon, colorFor, initials, randomId, mixin } from './room/util.js';
+import { $, store, show, showMessage, toast, setIcon, colorFor, initials, randomId, mixin, pipState } from './room/util.js';
+import { bindThemeSelect } from './theme.js';
 import { Tiles } from './room/tiles.js';
 import { Toolbar } from './room/toolbar.js';
 import { Chat } from './room/chat.js';
@@ -51,6 +52,9 @@ const roomName = decodeURIComponent(location.pathname.replace(/^\/+|\/+$/g, ''))
 if ('serviceWorker' in navigator && window.isSecureContext) {
   navigator.serviceWorker.register('/sw.js').catch((err) => console.warn('service worker not registered:', err));
 }
+
+// Interface style pickers (start page, lobby, settings); a PiP window follows the change too.
+for (const select of document.querySelectorAll('select[data-theme-select]')) bindThemeSelect(select, () => [pipState.document]);
 
 if (!roomName) {
   show('landing');
