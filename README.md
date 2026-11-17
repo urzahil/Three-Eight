@@ -127,12 +127,27 @@ For local testing, `http://localhost:4567` counts as a secure context, so camera
 1. Open `https://three-eight.example.com/admin`, log in with `ADMIN_PASSWORD`, and create a room, for example `movienight`, with a password. The admin page also shows who is online in each room. From there you can change passwords (and optionally kick everyone) or delete rooms. Optionally attach a Google Drive folder to a room (see below).
 2. Send friends `https://three-eight.example.com/movienight` and the password.
 3. Each person enters a display name, which is remembered in the browser's local storage, plus the room password. They can also choose to remember the password on that device.
-4. To watch together, one person clicks **Movie** and picks a film: a file from their device, or one from the room's Google Drive folder. Everyone else gets a button to join in; see [Watching a movie](#watching-a-movie) for the options. Use the player controls, the audio (🎧) and subtitle (CC) menus, or keyboard shortcuts: `space` play/pause, `←`/`→` ±10 s (adjustable in Settings), `f` full screen, `p` picture-in-picture, `m` mic, `v` camera, `s` share screen, `c` chat.
+4. To watch together, one person clicks **Movie** and picks a film: a file from their device, or one from the room's Google Drive folder. Everyone else gets a button to join in; see [Watching a movie](#watching-a-movie) for the options. Use the player controls, the audio (🎧) and subtitle (CC) menus, or the [keyboard shortcuts](#keyboard-shortcuts).
 5. To show your screen, click **Share screen** and choose the entire screen, a window or a tab in the browser's picker. See [Sharing your screen](#sharing-your-screen).
 
 A device that is switched off in the lobby is not requested at all: with the mic off the browser never asks for (or shows an indicator for) the microphone until you turn it on.
 
 Tip: use headphones during the movie, so your microphone doesn't send the film's sound to your friends. Movie volume is per person.
+
+### Keyboard shortcuts
+
+| Key | Action |
+| --- | --- |
+| `space` or `k` | Play / pause the movie |
+| `←` / `→` | Back / forward 10 s (the step is adjustable in Settings: 5, 10, 15, 30 or 60 s) |
+| `f` | Full screen on / off |
+| `p` | Picture-in-picture on / off |
+| `m` | Mic on / off |
+| `v` | Camera on / off |
+| `s` | Share screen on / off (where the browser supports it) |
+| `c` | Open / close the chat |
+
+The movie shortcuts (`space`, `k`, arrows, `p`) work only while a movie is playing that you have joined. Shortcuts are ignored while you are typing in a text field or a dialog is open, and when `Ctrl`, `Alt` or `⌘` is held. They also work in the picture-in-picture window.
 
 ### Installing it as an app
 
