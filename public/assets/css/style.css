@@ -172,6 +172,15 @@ button:focus-visible, .seek:focus-visible { outline: 2px solid var(--accent); ou
 .main.watching .grid { flex: none; width: 220px; grid-template-columns: 1fr !important; grid-auto-rows: auto; align-content: start; overflow-y: auto; }
 .main.watching .tile .avatar { width: 48px; height: 48px; font-size: 20px; }
 
+/* ---- Shared screen (uses the stage, like the movie) ---- */
+.screen-box { position: relative; flex: 1; min-width: 0; background: var(--video-bg); border-radius: var(--tile-radius); overflow: hidden; display: flex; }
+.screen-box video { width: 100%; height: 100%; object-fit: contain; background: var(--video-bg); }
+.screen-box.mine video { opacity: 0.55; }
+.screen-box:fullscreen { border-radius: 0; }
+.screen-label { position: absolute; left: 10px; top: 10px; max-width: calc(100% - 70px); padding: 3px 10px; border-radius: var(--r-sm); background: var(--label-bg); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.screen-full { position: absolute; right: 8px; top: 8px; background: var(--label-bg); }
+.screen-mine { position: absolute; left: 50%; bottom: 16px; transform: translateX(-50%); display: flex; align-items: center; gap: 12px; width: max-content; max-width: calc(100% - 24px); padding: 10px 14px; border-radius: var(--r-btn); background: var(--label-bg); font-size: 14px; }
+
 /* ---- Movie stage ---- */
 .stage { flex: 1; min-width: 0; min-height: 0; display: flex; }
 .movie-box { position: relative; flex: 1; background: var(--video-bg); border-radius: var(--tile-radius); overflow: hidden; display: flex; }
@@ -287,7 +296,8 @@ button:focus-visible, .seek:focus-visible { outline: 2px solid var(--accent); ou
 /* ---- Small screens ---- */
 @media (max-width: 760px) {
   .topbar { padding: 6px 12px; min-height: 46px; }
-  .tool { min-width: 52px; padding: 6px; }
+  .toolbar { gap: 2px; padding-left: 6px; padding-right: 6px; }
+  .tool { min-width: 46px; padding: 6px 4px; } /* seven buttons on one row on a 360px phone */
   .tool span { display: none; }
   .main { padding: 6px; gap: 6px; }
   .main.watching { flex-direction: column; }

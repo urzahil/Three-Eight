@@ -15,6 +15,7 @@ import { DriveBrowser } from './room/drive-browser.js';
 import { Pip } from './room/pip.js';
 import { Settings } from './room/settings.js';
 import { Keyboard } from './room/keyboard.js';
+import { Screen } from './room/screen.js';
 
 /** This tab's participant id (kept across reloads so a rejoin replaces our old connection). */
 function sessionId() {
@@ -208,7 +209,7 @@ class Room {
     this.id = id;
     this.roomName = roomName;
     this.tiles = new Map();
-    this.profiles = new Map(); // peerId -> {name, audio, video}
+    this.profiles = new Map(); // peerId -> {name, audio, video, screen}
     this.chat = [];
     this.chatIds = new Set();
     this.unread = 0;
@@ -262,6 +263,7 @@ class Room {
 
     this._initTiles();
     this._initToolbar();
+    this._initScreen(); // before the movie: both decide who gets the stage
     this._initChat();
     this._initMovie();
     this._initPip();
@@ -316,6 +318,7 @@ class Room {
     this.closePip();
     this.drive?.endSession(); // clear the Drive cookie: it would outlive the page
     this.sync.destroy();
+    this.screen?.destroy();
     this.player.unload();
     this.swarm.destroy();
     this.mesh.close();
@@ -328,4 +331,4 @@ class Room {
 
 // The Room is the glue: it owns the state and wires the parts together. Each part (room/*.js) is a class
 // whose methods are installed on the Room, so they keep using `this.sync`, `this._renderStage()` etc.
-for (const part of [Tiles, Toolbar, Chat, Movie, MovieMenus, DriveBrowser, Pip, Settings, Keyboard]) mixin(Room, part);
+for (const part of [Tiles, Toolbar, Chat, Movie, MovieMenus, DriveBrowser, Pip, Settings, Keyboard, Screen]) mixin(Room, part);

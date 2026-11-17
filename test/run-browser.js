@@ -18,6 +18,7 @@ const ADMIN_PASSWORD = 'test';
 const SCRIPTS = [
   { name: 'e2e', file: 'e2e.js', kind: 'server' },
   { name: 'pip-check', file: 'pip-check.js', kind: 'server' },
+  { name: 'screen-check', file: 'screen-check.js', kind: 'server' },
   { name: 'player-check', file: 'player-check.js', kind: 'server', args: ['fixtures/multi.mkv', 'fixtures/multi.mp4'].map((f) => path.join(TEST_DIR, f)) },
   { name: 'share-check', file: 'share-check.js', kind: 'self' },
   { name: 'drive-check', file: 'drive-check.js', kind: 'self' },
