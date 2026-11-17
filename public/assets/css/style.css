@@ -140,7 +140,10 @@ button:focus-visible, .seek:focus-visible { outline: 2px solid var(--accent); ou
 .avatar.big { width: 110px; height: 110px; font-size: 42px; position: absolute; }
 
 /* ---- Room layout ---- */
-.room { height: 100%; height: 100dvh; display: grid; grid-template-rows: auto 1fr auto; overflow: hidden; }
+/* Pinned to the visible viewport rather than sized with 100%/100dvh: a fixed box can't be pushed down or
+   scrolled by the document (a stray scroll or focus() left a gap above the top bar and cut off the toolbar),
+   and inset: 0 follows the area the browser actually shows, scrollbars, info bars and mobile URL bars included. */
+.room { position: fixed; inset: 0; display: grid; grid-template-rows: auto minmax(0, 1fr) auto; overflow: hidden; }
 .topbar { display: flex; align-items: center; gap: 12px; padding: 8px 16px; padding-top: max(8px, env(safe-area-inset-top)); border-bottom: 1px solid var(--line); background: var(--bg); min-height: 52px; }
 .pill { font-size: 12px; padding: 3px 10px; border-radius: 999px; background: var(--warn-bg); color: var(--warn-text); }
 .room-body { display: flex; min-height: 0; }
