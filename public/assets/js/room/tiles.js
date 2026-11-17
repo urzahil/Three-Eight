@@ -6,12 +6,12 @@ import { $, toast, icon, colorFor, initials } from './util.js';
 
 export class Tiles {
   profileOf(peerId) {
-    if (peerId === this.id) return { name: this.name, audio: this.media.micOn && !!this.media.audioTrack, video: !!this.media.videoTrack };
-    return this.profiles.get(peerId) || { name: this.mesh.peers.get(peerId)?.name || 'Guest', audio: false, video: false };
+    if (peerId === this.id) return { name: this.name, audio: this.media.micOn && !!this.media.audioTrack, video: !!this.media.videoTrack, screen: this.screenSince || 0 };
+    return this.profiles.get(peerId) || { name: this.mesh.peers.get(peerId)?.name || 'Guest', audio: false, video: false, screen: 0 };
   }
 
   _broadcastProfile(peer) {
-    const msg = { type: 'profile', name: this.name, audio: this.media.micOn && !!this.media.audioTrack, video: !!this.media.videoTrack };
+    const msg = { type: 'profile', name: this.name, audio: this.media.micOn && !!this.media.audioTrack, video: !!this.media.videoTrack, screen: this.screenSince || 0 };
     if (peer) peer.send(msg);
     else this.mesh.broadcast(msg);
   }
@@ -31,7 +31,7 @@ export class Tiles {
 
     this.mesh.addEventListener('peer-added', (e) => {
       const peer = e.detail.peer;
-      if (!this.profiles.has(peer.id)) this.profiles.set(peer.id, { name: peer.name || 'Guest', audio: false, video: false });
+      if (!this.profiles.has(peer.id)) this.profiles.set(peer.id, { name: peer.name || 'Guest', audio: false, video: false, screen: 0 });
       if (!this.tiles.has(peer.id)) this._makeTile(peer.id, false); // a rebuilt link keeps its tile
       this._updateTile(peer.id);
       this._renderPeople();
@@ -91,7 +91,10 @@ export class Tiles {
         const prev = this.profiles.get(peer.id);
         const name = String(msg.name || 'Guest').slice(0, 40);
         const first = !prev || !prev.seen;
-        this.profiles.set(peer.id, { name, audio: !!msg.audio, video: !!msg.video, seen: true });
+        // screen: when their share started (room clock), 0 when they don't share. A peer is not trusted: anything
+        // but a positive finite number means "not sharing".
+        const screen = typeof msg.screen === 'number' && Number.isFinite(msg.screen) && msg.screen > 0 ? msg.screen : 0;
+        this.profiles.set(peer.id, { name, audio: !!msg.audio, video: !!msg.video, screen, seen: true });
         if (first) this._systemMessage(`${name} joined`);
         this._updateTile(peer.id);
         this._renderPeople();
@@ -195,7 +198,14 @@ export class Tiles {
       if (!p.audio) mic.classList.add('bad');
       const cam = icon(p.video ? 'cam' : 'cam-off');
       if (!p.video) cam.classList.add('bad');
-      li.append(av, who, mic, cam);
+      li.append(av, who);
+      if (p.screen) {
+        const sc = icon('screen');
+        sc.classList.add('good');
+        sc.setAttribute('aria-label', 'sharing their screen');
+        li.append(sc);
+      }
+      li.append(mic, cam);
       return li;
     }));
   }

@@ -2,6 +2,7 @@
 // Methods of the Room (installed on its prototype by app.js); `this` is the Room.
 
 import { $ } from './util.js';
+import { ScreenShare } from '../media.js';
 
 export class Keyboard {
   _initKeyboard() {
@@ -31,6 +32,10 @@ export class Keyboard {
           break;
         case 'v':
           this.toggleCam();
+          break;
+        case 's':
+          if (!ScreenShare.supported) return;
+          this.toggleScreen();
           break;
         case 'c':
           this.toggleSidebar('chat');

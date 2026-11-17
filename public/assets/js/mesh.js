@@ -44,6 +44,37 @@ function videoBudget(peerCount, lowPower) {
   return kbps * 1000;
 }
 
+// A shared screen gets most of the upload while it is on (text needs bits), and the sharer's camera less.
+export function screenBudget(peerCount, lowPower) {
+  let kbps;
+  if (peerCount <= 1) kbps = 2500;
+  else if (peerCount === 2) kbps = 1800;
+  else if (peerCount <= 4) kbps = 1000;
+  else kbps = 600;
+  if (lowPower) kbps = Math.min(kbps, 800);
+  return kbps * 1000;
+}
+const CAMERA_WHILE_SHARING = 250 * 1000;
+
+/**
+ * Tell a peer's camera from its shared screen. Both arrive as video tracks; the sender puts its camera and
+ * microphone in one stream and the screen in another, so the camera is the video track of the stream that
+ * also carries the audio. `videoBySid` maps stream id -> video track, in arrival order (latest last).
+ * Returns { camera, screen } (tracks or null).
+ */
+export function routeVideo(audioSid, videoBySid) {
+  let cameraSid;
+  if (audioSid !== null && audioSid !== undefined) cameraSid = audioSid;
+  else cameraSid = videoBySid.keys().next().value; // no audio seen yet: the first video is the camera
+  let camera = null;
+  let screen = null;
+  for (const [sid, track] of videoBySid) {
+    if (sid === cameraSid) camera = track;
+    else screen = track; // the latest other stream
+  }
+  return { camera, screen };
+}
+
 /**
  * Puts the chunks of one message back together. Strict on purpose: the first chunk of a message id fixes its
  * chunk count, every chunk must be in range with a bounded size, and unfinished messages are limited in
@@ -164,7 +195,10 @@ class Peer {
     this.polite = mesh.selfId < id;
     this.makingOffer = false;
     this.ignoreOffer = false;
-    this.stream = new MediaStream();
+    this.stream = new MediaStream(); // camera and microphone
+    this.screenStream = new MediaStream(); // a shared screen (its track stays, without frames, after a share ends)
+    this._audioSid = null; // stream id of the incoming audio
+    this._videoBySid = new Map(); // stream id -> incoming video track
     this.media = { audio: false, video: false };
     this.chunks = new Reassembler();
     this.pendingCandidates = [];
@@ -179,6 +213,10 @@ class Peer {
     this.videoTx = pc.addTransceiver('video', { direction: 'sendonly', streams: [mesh.outStream] });
     this.audioTx.sender.replaceTrack(mesh.tracks.audio || null);
     this.videoTx.sender.replaceTrack(mesh.tracks.video || null);
+    // The screen gets its transceiver the first time we share (a renegotiation), so a room where nobody shares
+    // has no extra media section. A link built during a share starts with it.
+    this.screenTx = null;
+    if (mesh.tracks.screen) this._addScreenTx();
     this._preferCodecs();
 
     this.dc = pc.createDataChannel('data', { negotiated: true, id: 0, ordered: true });
@@ -227,11 +265,22 @@ class Peer {
     };
 
     pc.ontrack = (ev) => {
-      if (!this.stream.getTracks().includes(ev.track)) {
-        for (const t of this.stream.getTracks()) if (t.kind === ev.track.kind) this.stream.removeTrack(t);
-        this.stream.addTrack(ev.track);
+      const sid = ev.streams[0]?.id ?? '';
+      if (ev.track.kind === 'audio') {
+        this._audioSid = sid;
+        this._setTrack(this.stream, 'audio', ev.track);
+      } else {
+        this._videoBySid.delete(sid); // re-insert: the latest stays last
+        this._videoBySid.set(sid, ev.track);
       }
+      const { camera, screen } = routeVideo(this._audioSid, this._videoBySid);
+      this._setTrack(this.stream, 'video', camera);
+      this._setTrack(this.screenStream, 'video', screen);
       this.mesh._emit('track', { peer: this });
+    };
+    // Encodings can be missing until a negotiation is done (e.g. for a screen transceiver just added).
+    pc.onsignalingstatechange = () => {
+      if (pc.signalingState === 'stable' && !this.closed) this.mesh._applyBitrates();
     };
     pc.onnegotiationneeded = async () => {
       try {
@@ -283,14 +332,26 @@ class Peer {
     };
   }
 
-  _preferCodecs() {
+  /** Keep at most one track of `kind` in `stream`: `track`, or none. */
+  _setTrack(stream, kind, track) {
+    for (const t of stream.getTracks()) if (t.kind === kind && t !== track) stream.removeTrack(t);
+    if (track && !stream.getTracks().includes(track)) stream.addTrack(track);
+  }
+
+  _addScreenTx() {
+    this.screenTx = this.pc.addTransceiver('video', { direction: 'sendonly', streams: [this.mesh.screenStream] });
+    this.screenTx.sender.replaceTrack(this.mesh.tracks.screen || null).catch(() => {});
+    this._preferCodecs(this.screenTx);
+  }
+
+  _preferCodecs(tx = this.videoTx) {
     // Prefer VP8/H.264 for video (hardware support everywhere), Opus for audio.
     try {
       const caps = RTCRtpReceiver.getCapabilities?.('video');
-      if (caps && this.videoTx.setCodecPreferences) {
+      if (caps && tx.setCodecPreferences) {
         const rank = (c) => (/vp8/i.test(c.mimeType) ? 0 : /h264/i.test(c.mimeType) ? 1 : /vp9/i.test(c.mimeType) ? 2 : 3);
         const codecs = [...caps.codecs].sort((a, b) => rank(a) - rank(b));
-        this.videoTx.setCodecPreferences(codecs);
+        tx.setCodecPreferences(codecs);
       }
     } catch {
       /* not supported, use defaults */
@@ -424,6 +485,28 @@ class Peer {
   }
 }
 
+/** Set the upload limit of a sender (and how it degrades), if it changed. */
+function capSender(sender, maxBitrate, degradation) {
+  try {
+    const params = sender.getParameters();
+    if (!params.encodings || !params.encodings.length) return;
+    const enc = params.encodings[0];
+    if (enc.maxBitrate === maxBitrate && (!degradation || params.degradationPreference === degradation)) return;
+    enc.maxBitrate = maxBitrate;
+    if (degradation) params.degradationPreference = degradation;
+    sender.setParameters(params).catch(() => {
+      if (!degradation) return;
+      // Not every browser takes degradationPreference: set the bitrate at least.
+      const p = sender.getParameters();
+      if (!p.encodings?.length) return;
+      p.encodings[0].maxBitrate = maxBitrate;
+      sender.setParameters(p).catch(() => {});
+    });
+  } catch {
+    /* ignore */
+  }
+}
+
 export class Mesh extends EventTarget {
   constructor(signaling, selfId, iceServers) {
     super();
@@ -431,8 +514,9 @@ export class Mesh extends EventTarget {
     this.selfId = selfId;
     this.iceServers = iceServers;
     this.peers = new Map();
-    this.tracks = { audio: null, video: null };
-    this.outStream = new MediaStream();
+    this.tracks = { audio: null, video: null, screen: null };
+    this.outStream = new MediaStream(); // camera and microphone
+    this.screenStream = new MediaStream(); // our shared screen, in a stream of its own (see routeVideo)
     this.lowPower = false;
 
     // The newcomer initiates connections to everyone already in the room;
@@ -596,6 +680,22 @@ export class Mesh extends EventTarget {
     this._applyBitrates();
   }
 
+  /** Set (or clear) the shared screen for every peer. The first share adds a transceiver to each link. */
+  async setScreenTrack(track) {
+    const old = this.tracks.screen;
+    if (old) this.screenStream.removeTrack(old);
+    this.tracks.screen = track;
+    if (track) this.screenStream.addTrack(track);
+    await Promise.all([...this.peers.values()].map((p) => {
+      if (!p.screenTx) {
+        if (track) p._addScreenTx(); // it takes the track itself
+        return null;
+      }
+      return p.screenTx.sender.replaceTrack(track).catch(() => {});
+    }));
+    this._applyBitrates();
+  }
+
   setLowPower(v) {
     this.lowPower = v;
     this._applyBitrates();
@@ -603,19 +703,13 @@ export class Mesh extends EventTarget {
 
   _applyBitrates() {
     const n = this.peers.size;
-    const max = videoBudget(n, this.lowPower);
+    const sharing = !!this.tracks.screen;
+    const camera = sharing ? Math.min(CAMERA_WHILE_SHARING, videoBudget(n, this.lowPower)) : videoBudget(n, this.lowPower);
+    const screen = screenBudget(n, this.lowPower);
     for (const p of this.peers.values()) {
-      const sender = p.videoTx.sender;
-      try {
-        const params = sender.getParameters();
-        if (!params.encodings || !params.encodings.length) continue;
-        const enc = params.encodings[0];
-        if (enc.maxBitrate === max) continue;
-        enc.maxBitrate = max;
-        sender.setParameters(params).catch(() => {});
-      } catch {
-        /* ignore */
-      }
+      capSender(p.videoTx.sender, camera);
+      // Shared text must stay readable: on a slow link, drop frames rather than resolution.
+      if (p.screenTx) capSender(p.screenTx.sender, screen, 'maintain-resolution');
     }
   }
 

@@ -131,6 +131,8 @@ export class Movie {
   }
 
   openMovieDialog() {
+    // Choosing a movie while someone shares their screen is refused (closing or joining one is not affected).
+    if (!this.sync.state.movie && !this.sync.localFile && !this._screenAllowsMovie()) return;
     this._renderMovieDialog();
     this._renderDriveSection();
     $('movie-dialog').showModal();
@@ -205,6 +207,10 @@ export class Movie {
     const s = this.sync.state;
     const quick = { name: file.name, size: file.size, duration: 0 };
     let asRoom = !s.movie;
+    if (asRoom && !this._screenAllowsMovie()) {
+      file.close?.();
+      return;
+    }
     if (s.movie && !sameMovie(quick, s.movie) && file.name !== s.movie.name) {
       $('mismatch-text').textContent = `Everyone else is watching “${s.movie.name}” (${fmtSize(s.movie.size)}), but you picked “${file.name}” (${fmtSize(file.size)}).`;
       const choice = await new Promise((resolve) => {
@@ -271,7 +277,7 @@ export class Movie {
     const active = !!s.movie || !!this.sync.localFile || !!this.loadingMovie;
     const wasHidden = $('stage').hidden;
     $('stage').hidden = !active;
-    $('main').classList.toggle('watching', active);
+    this._renderScreen(); // the screen share gives way to the movie; also sets the 'watching' layout
     if (wasHidden !== !active) this._layout();
     if (!active) this.closePip();
     this._syncMediaSession();

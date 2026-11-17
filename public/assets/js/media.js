@@ -194,6 +194,82 @@ export class LocalMedia extends EventTarget {
   }
 }
 
+// ---- Screen sharing ---------------------------------------------------------
+// The browser's own picker chooses what is shared: the entire screen, one window (an app) or a tab.
+// Video only: an audio track the browser hands over anyway is stopped at once.
+const SCREEN_CONSTRAINTS = {
+  video: { frameRate: { ideal: 15, max: 30 }, width: { max: 1920 }, height: { max: 1080 } },
+  audio: false,
+  selfBrowserSurface: 'exclude', // not this tab: it would show the call inside itself
+  surfaceSwitching: 'include',
+  monitorTypeSurfaces: 'include',
+};
+
+export class ScreenShare extends EventTarget {
+  constructor() {
+    super();
+    this.track = null;
+    this.pending = false; // the picker is open
+    this.stopped = false;
+  }
+
+  static get supported() {
+    return !!navigator.mediaDevices?.getDisplayMedia;
+  }
+
+  get active() {
+    return !!this.track;
+  }
+
+  _emit() {
+    this.dispatchEvent(new CustomEvent('change'));
+  }
+
+  /** Open the picker (needs a user gesture). Resolves to the track, or null if the share was dropped meanwhile. */
+  async start() {
+    if (this.track || this.pending || this.stopped) return this.track;
+    this.pending = true;
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getDisplayMedia(SCREEN_CONSTRAINTS);
+    } finally {
+      this.pending = false;
+    }
+    for (const t of stream.getAudioTracks()) t.stop();
+    const t = stream.getVideoTracks()[0];
+    if (!t || this.stopped || this.track) {
+      t?.stop();
+      return this.track;
+    }
+    try {
+      t.contentHint = 'detail'; // keep text sharp
+    } catch {
+      /* not supported */
+    }
+    // The browser's own "Stop sharing" button ends the track.
+    t.addEventListener('ended', () => {
+      if (this.track === t) this.stop();
+    });
+    this.track = t;
+    this._emit();
+    return t;
+  }
+
+  stop() {
+    const t = this.track;
+    if (!t) return;
+    this.track = null;
+    t.stop();
+    this._emit();
+  }
+
+  /** Leaving the room: stop, and refuse a picker that is still open. */
+  destroy() {
+    this.stopped = true;
+    this.stop();
+  }
+}
+
 // ---- Audio level metering (speaking indicators) ---------------------------
 let ctx = null;
 export function audioContext() {

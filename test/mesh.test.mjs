@@ -2,7 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import './browser-globals.mjs';
-import { Reassembler, ChunkSender } from '../public/assets/js/mesh.js';
+import { Reassembler, ChunkSender, routeVideo, screenBudget } from '../public/assets/js/mesh.js';
 
 const CHUNK = 12 * 1024;
 const chunk = (mid, i, n, d = 'x') => ({ type: '_chunk', mid, i, n, d });
@@ -222,4 +222,29 @@ test('clear() empties the queue; a failing channel does not throw', () => {
   };
   s.send('y'.repeat(CHUNK * 3));
   assert.equal(s.queue.length, 0);
+});
+
+// ---- Screen sharing: which incoming video is the camera, which the screen --------------------------------
+
+test('the camera is the video in the same stream as the audio; another stream is the screen', () => {
+  const cam = { id: 'cam' }, scr = { id: 'scr' };
+  assert.deepEqual(routeVideo('A', new Map([['A', cam]])), { camera: cam, screen: null });
+  assert.deepEqual(routeVideo('A', new Map([['A', cam], ['S', scr]])), { camera: cam, screen: scr });
+  // The screen's media section can be negotiated first (a link built during a share): order does not matter.
+  assert.deepEqual(routeVideo('A', new Map([['S', scr], ['A', cam]])), { camera: cam, screen: scr });
+  // Only a screen so far (the camera's track has not arrived yet).
+  assert.deepEqual(routeVideo('A', new Map([['S', scr]])), { camera: null, screen: scr });
+});
+
+test('without audio, the first video is taken for the camera', () => {
+  const cam = { id: 'cam' }, scr = { id: 'scr' };
+  assert.deepEqual(routeVideo(null, new Map()), { camera: null, screen: null });
+  assert.deepEqual(routeVideo(null, new Map([['A', cam]])), { camera: cam, screen: null });
+  assert.deepEqual(routeVideo(null, new Map([['A', cam], ['S', scr]])), { camera: cam, screen: scr });
+});
+
+test('a shared screen gets more upload than a camera, less with more peers and in low-power mode', () => {
+  const kbps = [1, 2, 3, 4, 5, 8].map((n) => screenBudget(n, false) / 1000);
+  assert.deepEqual(kbps, [2500, 1800, 1000, 1000, 600, 600]);
+  for (const n of [1, 2, 4, 8]) assert.ok(screenBudget(n, true) <= 800 * 1000);
 });

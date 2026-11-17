@@ -4,6 +4,7 @@ Video meetups and movie nights with friends, entirely in the browser (Chrome, Fi
 
 - **Video call**: camera, microphone, mute and camera-off, device selection, speaking indicators, and chat.
 - **Watch a movie together**: one person opens a file (or picks one from the room's Google Drive folder) and the room keeps playback in sync. Friends who don't have the file can stream it from that person's copy, or open their own. If anyone plays, pauses or seeks, it happens for everybody. Choosing an **audio track** or **subtitles** also changes it for everybody.
+- **Screen sharing**: show your entire screen, one window or a browser tab to everyone in the room. One person shares at a time, and not while a movie is open.
 - **Picture-in-picture**: pop the movie out into a small floating window and keep chatting or browsing. Our subtitles and controls come with it, and play, pause and seek in the floating window still affect the whole room.
 - **Rooms with passwords**: rooms are created on an admin page. Each one lives at `https://three-eight.example.com/ROOM_NAME`.
 - **Peer to peer**: audio, video, chat, sync messages and shared movie pieces go directly between browsers over WebRTC. The server only serves the page and relays the short connection handshake, so its CPU and bandwidth use are tiny (apart from Google Drive films, see below).
@@ -17,7 +18,7 @@ Video meetups and movie nights with friends, entirely in the browser (Chrome, Fi
 ```
 
 - **Server** (`server/`): Node.js with one dependency (`ws`). It serves the static app, stores rooms and their scrypt-hashed passwords in `/data/rooms.json`, checks the password when someone joins, relays WebRTC offers, answers and ICE candidates between members of the same room, and answers clock-sync pings. If a room has a Google Drive folder, it also reads that folder as a Google service account and streams the movies to the room's members (`server/drive.js`).
-- **Calls** (`public/assets/js/mesh.js`): a full mesh with one `RTCPeerConnection` per pair of people. Each person uploads one stream per friend, and video bitrate goes down automatically as the room grows. This works best with up to about 6–8 people.
+- **Calls** (`public/assets/js/mesh.js`): a full mesh with one `RTCPeerConnection` per pair of people. Each person uploads one stream per friend, and video bitrate goes down automatically as the room grows. This works best with up to about 6–8 people. A shared screen travels as a second video track in a stream of its own (the camera shares its stream with the microphone, which is how the receiver tells them apart); it is added to each connection the first time someone shares.
 - **Movie sync** (`public/assets/js/sync.js`): everyone shares a small playback state: playing or paused, position, timestamp on the shared server clock, audio track and subtitle track. Any change is broadcast over WebRTC data channels and the newest change wins. Each browser works out where the movie should be right now and corrects drift. It speeds up or slows down by a few percent for small offsets and seeks for large ones. In testing, browsers stayed within about 10 ms of each other.
 - **Movie files are never stored on the server.** A movie is a local file, or comes from the room's Google Drive folder, which the server reads from Google and streams on (nothing is written to its disk). Movie data now also travels *between browsers*: viewers send each other pieces of the film over a second WebRTC data channel (`public/assets/js/player/swarm.js`), and a friend without the file can stream it from someone's copy. The page compares the files (size, duration and a sampled content fingerprint) to warn when someone has a different file, and pieces are only exchanged between identical fingerprints; there are no per-piece checksums, so sharing still relies on the trust of a room of friends.
 
@@ -126,7 +127,8 @@ For local testing, `http://localhost:4567` counts as a secure context, so camera
 1. Open `https://three-eight.example.com/admin`, log in with `ADMIN_PASSWORD`, and create a room, for example `movienight`, with a password. The admin page also shows who is online in each room. From there you can change passwords (and optionally kick everyone) or delete rooms. Optionally attach a Google Drive folder to a room (see below).
 2. Send friends `https://three-eight.example.com/movienight` and the password.
 3. Each person enters a display name, which is remembered in the browser's local storage, plus the room password. They can also choose to remember the password on that device.
-4. To watch together, one person clicks **Movie** and picks a film: a file from their device, or one from the room's Google Drive folder. Everyone else gets a button to join in; see [Watching a movie](#watching-a-movie) for the options. Use the player controls, the audio (🎧) and subtitle (CC) menus, or keyboard shortcuts: `space` play/pause, `←`/`→` ±10 s (adjustable in Settings), `f` full screen, `p` picture-in-picture, `m` mic, `v` camera, `c` chat.
+4. To watch together, one person clicks **Movie** and picks a film: a file from their device, or one from the room's Google Drive folder. Everyone else gets a button to join in; see [Watching a movie](#watching-a-movie) for the options. Use the player controls, the audio (🎧) and subtitle (CC) menus, or keyboard shortcuts: `space` play/pause, `←`/`→` ±10 s (adjustable in Settings), `f` full screen, `p` picture-in-picture, `m` mic, `v` camera, `s` share screen, `c` chat.
+5. To show your screen, click **Share screen** and choose the entire screen, a window or a tab in the browser's picker. See [Sharing your screen](#sharing-your-screen).
 
 A device that is switched off in the lobby is not requested at all: with the mic off the browser never asks for (or shows an indicator for) the microphone until you turn it on.
 
@@ -137,6 +139,16 @@ Tip: use headphones during the movie, so your microphone doesn't send the film's
 Three-Eight is a Progressive Web App, so it can be installed and gets its own icon and window without browser bars. In Chrome or Edge on the desktop, use the install icon in the address bar. On Android, use **Install app** in the Chrome menu. On iPhone or iPad, tap **Share**, then **Add to Home Screen**. The installed app opens on the start page with the last room you joined already filled in. Installing needs HTTPS (or `localhost`), like the camera and mic do.
 
 A small service worker (`public/sw.js`) keeps a copy of the page's own files. It always asks the server first, so updates show up straight away, and uses the copy only when there is no connection. The app then opens and says it can't reach the server, instead of showing the browser's offline error. Calls, signaling, the API and Drive movies never go through its cache.
+
+### Sharing your screen
+
+- **What is shared:** the browser's own picker chooses the entire screen, one window (one app) or a tab. The room's own tab is left out of the list. Sound is not shared, only the picture.
+- **One at a time:** while someone shares, the **Share screen** button tells others who is sharing instead. If two people start at the same moment, the one who started later stops automatically.
+- **Not during a movie:** the shared screen and the movie use the same space, so a share can't start while a movie is open, and a movie can't be started while someone shares. Close the movie, or stop sharing, first.
+- **Stopping:** click **Stop sharing** in the toolbar or on your preview, or the browser's own *Stop sharing* bar. Leaving the room stops it too.
+- **Watching a share:** it fills the main area, with everyone's video beside it. The button in its corner (or a double-click) shows it full screen.
+- **Bandwidth:** like the camera, the screen goes directly to each friend, so the sharer uploads one copy per person. While sharing, the screen gets most of the upload (about 2.5 Mbps with one friend, down to 0.6 Mbps with five or more) and the sharer's camera drops to a low bitrate. On a slow connection the picture stays sharp and the frame rate drops.
+- **Browsers:** sharing works in desktop Chrome, Edge, Firefox and Safari. Phones and tablets can't share their screen (the button is hidden), but they can watch a share. On macOS, the browser needs the *Screen Recording* permission in System Settings → Privacy & Security.
 
 ## Watching a movie
 
