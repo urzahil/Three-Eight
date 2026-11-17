@@ -147,7 +147,7 @@ Tip: use headphones during the movie, so your microphone doesn't send the film's
 | `s` | Share screen on / off (where the browser supports it) |
 | `c` | Open / close the chat |
 
-The movie shortcuts (`space`, `k`, arrows, `p`) work only while a movie is playing that you have joined. With the movie's progress bar focused, `←` / `→` move 5 s instead. Shortcuts are ignored while you are typing in a text field or a dialog is open, and when `Ctrl`, `Alt` or `⌘` is held. They also work in the picture-in-picture window.
+The movie shortcuts (`space`, `k`, arrows, `p`) work only while a movie is playing that you have joined. Shortcuts are ignored while you are typing in a text field or a dialog is open, and when `Ctrl`, `Alt` or `⌘` is held. They also work in the picture-in-picture window.
 
 ### Installing it as an app
 

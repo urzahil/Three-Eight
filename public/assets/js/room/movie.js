@@ -434,8 +434,8 @@ export class Movie {
     });
     bar.addEventListener('pointercancel', () => { this._dragging = false; });
     bar.addEventListener('keydown', (e) => {
-      if (e.key === 'ArrowLeft') this.sync.seek(Math.max(0, this._pos() - 5));
-      else if (e.key === 'ArrowRight') this.sync.seek(this._pos() + 5);
+      if (e.key === 'ArrowLeft') this.sync.seek(Math.max(0, this._pos() - this.seekStep));
+      else if (e.key === 'ArrowRight') this.sync.seek(this._pos() + this.seekStep);
       else return;
       e.preventDefault();
       e.stopPropagation();
