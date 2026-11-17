@@ -96,3 +96,41 @@ test('MP4: a truncated 64-bit box header at the end of the file is not a RangeEr
   const bytes = new Uint8Array([0, 0, 0, 1, 0x6d, 0x64, 0x61, 0x74, 0, 0, 0, 0]); // size=1 "mdat", 12 bytes
   await assert.rejects(Mp4Demuxer.open(new Blob([bytes])), /No moov box found/);
 });
+
+test('MKV blocks(): truncated or corrupt laced blocks are skipped, not turned into garbage frames', async () => {
+  const { MkvDemuxer } = await import('../public/assets/js/player/mkv.js');
+  const el = (id, body) => [...id, 0x80 | body.length, ...body];
+  const simple = (body) => el([0xa3], body);
+  const cluster = [
+    ...el([0xe7], [0x00]), // Timecode 0
+    ...simple([0x81, 0x00]), // too short for timecode and flags
+    ...simple([0x81, 0x00, 0x01, 0x02, 0x02, 0xff, 0xff]), // Xiph lacing, sizes run off the end
+    ...simple([0x81, 0x00, 0x02, 0x06, 0x01, 0x00]), // EBML lacing, first size is not a valid number
+    ...simple([0x81, 0x00, 0x03, 0x02, 0x01, 0x10, 0xaa]), // Xiph lacing, a frame larger than the block
+    ...simple([0x81, 0x00, 0x04, 0x04, 0x05, 0xaa]), // fixed lacing, 6 frames in 1 byte
+    ...simple([0x81, 0x00, 0x32, 0x80, 0x42]), // a good one
+  ];
+  const bytes = new Uint8Array([0x1f, 0x43, 0xb6, 0x75, 0x80 | cluster.length, ...cluster]);
+  const d = new MkvDemuxer(new Blob([bytes]));
+  d.segEnd = bytes.length;
+  const got = [];
+  for await (const b of d.blocks(0, null)) got.push({ pts: b.pts, frames: b.frames.map((f) => [...f]) });
+  assert.deepStrictEqual(got, [{ pts: 50, frames: [[0x42]] }]);
+});
+
+test('MKV video: decode times keep increasing when a later GOP needs a deeper reorder delay', async () => {
+  const { MkvDemuxer } = await import('../public/assets/js/player/mkv.js');
+  const t = { id: 1, number: 1, type: 'video' };
+  const demux = { tracks: [t], timescale: 1000, reorderDelay: new Map(), frameDuration: () => 10 };
+  const cur = MkvDemuxer.prototype.createCursor.call(demux, 1);
+  const blk = (pts, key = false) => ({ track: 1, pts, key, frames: [new Uint8Array([pts & 0xff])] });
+  // GOP 1 has no B-frames; GOP 2 (in decode order I P B B) does.
+  cur.iter = (function* () {
+    yield* [blk(0, true), blk(10), blk(20), blk(30, true), blk(60), blk(40), blk(50)];
+  })();
+  const all = [];
+  for (let s; (s = await cur.next());) all.push(...s.samples);
+  assert.strictEqual(all.length, 7);
+  for (let i = 1; i < all.length; i++) assert(all[i].dts > all[i - 1].dts, `dts ${all[i].dts} after ${all[i - 1].dts}`);
+  for (const f of all) assert(f.dts <= f.pts, `dts ${f.dts} <= pts ${f.pts}`);
+});

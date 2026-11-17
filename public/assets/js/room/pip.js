@@ -101,7 +101,11 @@ export class Pip {
     } finally {
       this._pipOpening = false;
     }
-    if (win.closed) return;
+    // Leaving the room or closing the movie while the window was being set up: don't move the movie box into it.
+    if (win.closed || this.left || !this.player.loaded) {
+      win.close();
+      return;
+    }
 
     const placeholder = document.createElement('div');
     placeholder.id = 'pip-placeholder';

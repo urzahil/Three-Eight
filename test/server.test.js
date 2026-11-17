@@ -1877,3 +1877,40 @@ test('container health check: exits 0 while the server answers, 1 when it is dow
   // A plain HTTP server speaking to an HTTPS check (TLS_CERT set) fails rather than passing by accident.
   assert.strictEqual(await run({ PORT: String(PORT), HOST: '127.0.0.1', TLS_CERT: 'x', TLS_KEY: 'x' }), 1, 'TLS mismatch');
 });
+
+test('admin logout behind a TLS proxy clears a Secure cookie and ends the session (X-Forwarded-Proto in any case)', async () => {
+  const s = await spawnServer({ TRUST_PROXY: 'true' });
+  const tls = { 'content-type': 'application/json', 'X-Forwarded-Proto': 'HTTPS' };
+  const login = await fetch(s.base + '/api/admin/login', { method: 'POST', headers: tls, body: JSON.stringify({ password: 'admin-pw' }) });
+  assert.match(login.headers.get('set-cookie'), /; Secure/);
+  const ck = login.headers.get('set-cookie').split(';')[0];
+  assert.strictEqual((await fetch(s.base + '/api/admin/rooms', { headers: { cookie: ck } })).status, 200);
+  const out = await fetch(s.base + '/api/admin/logout', { method: 'POST', headers: { ...tls, cookie: ck }, body: '{}' });
+  assert.strictEqual(out.status, 200);
+  assert.match(out.headers.get('set-cookie'), /^te_admin=;.*Max-Age=0; Secure$/);
+  assert.strictEqual((await fetch(s.base + '/api/admin/rooms', { headers: { cookie: ck } })).status, 401);
+  s.stop();
+});
+
+test('a member that stops reading is dropped once too much is queued for it, not kept until the heartbeat', async () => {
+  const s = await spawnServer({});
+  const ck = await adminCookie(s.base);
+  await fetch(s.base + '/api/admin/rooms', { method: 'POST', headers: { 'content-type': 'application/json', cookie: ck }, body: JSON.stringify({ name: 'stall-room' }) });
+  const a = await wsAt(s.base);
+  const b = await wsAt(s.base);
+  a.sendJson({ type: 'join', room: 'stall-room', id: 'stallpeerA1', name: 'A' });
+  assert.strictEqual((await a.next()).type, 'welcome');
+  b.sendJson({ type: 'join', room: 'stall-room', id: 'stallpeerB1', name: 'B' });
+  assert.strictEqual((await b.next()).type, 'welcome');
+  assert.strictEqual((await a.next()).type, 'peer-joined');
+  a._socket.pause(); // A's connection stalls: it reads nothing more
+  const big = 'x'.repeat(60 * 1024);
+  for (let i = 0; i < 900; i++) b.sendJson({ type: 'signal', to: 'stallpeerA1', data: { sdp: big } });
+  const left = await Promise.race([b.next(), new Promise((r) => setTimeout(() => r({ type: 'timeout' }), 15000))]);
+  assert.deepStrictEqual({ type: left.type, id: left.id }, { type: 'peer-left', id: 'stallpeerA1' });
+  b.sendJson({ type: 'time', c: 1 });
+  assert.strictEqual((await b.next()).c, 1, 'the sender is still connected');
+  a.terminate();
+  b.close();
+  s.stop();
+});

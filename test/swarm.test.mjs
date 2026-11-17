@@ -1137,3 +1137,50 @@ test('swarm: a holder serves a want only for its own fingerprint key', async () 
   assert(!asked.some((f) => f.type === T.DATA && f.req === 3));
   net.closeAll();
 });
+
+test('a peer that switches to another movie while a piece waits for its slot is not asked for that piece', async () => {
+  const net = new Net();
+  const data = makeData(4 * P);
+  const a = net.node('alice');
+  net.node('bob');
+  net.connect('alice', 'bob');
+  driveFile(a.swarm, data, makeServer(data)).swarm.activate();
+  const film = a.swarm.film;
+  a.swarm.have.set('bob', { key: film.key, local: false });
+  film.wants.set('bob', a.swarm.maxWantsPerPeer); // bob's slots are taken: the next piece waits
+  const got = a.swarm._fromPeer(film, 'bob', 0, new AbortController().signal);
+  await sleep(5);
+  a.swarm.have.set('bob', { key: sizeKey(123456, ''), local: false }); // bob opened another movie meanwhile
+  a.swarm._unslot(film, 'bob');
+  assert.equal(await got, null);
+  assert.equal(a.mesh.out(T.WANT).length, 0, 'no WANT for the other movie\'s piece');
+  net.closeAll();
+});
+
+test('turning sharing off stops serving my file at once, including pieces already being served', async () => {
+  const net = new Net();
+  const data = makeData(4 * P);
+  const a = net.node('alice');
+  net.node('bob');
+  net.connect('alice', 'bob');
+  const file = new Blob([data]);
+  a.swarm.openLocal(file);
+  const film = a.swarm.film;
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const slice = file.slice.bind(file);
+  film.local = { size: file.size, slice: (x, y) => ({ arrayBuffer: async () => { await gate; return slice(x, y).arrayBuffer(); } }) };
+  const kid = [...film.keyIds][0];
+  a.swarm._onWant(film, { id: 'bob' }, { type: T.WANT, req: 7, key: kid, piece: 0 });
+  assert.equal(film.jobs.size, 1);
+  a.swarm.setShare(false);
+  assert.equal(film.jobs.size, 0, 'the job is cancelled');
+  release();
+  await sleep(10);
+  assert.equal(a.mesh.out(T.DATA).length, 0, 'nothing of the file is sent');
+  const deny = a.mesh.out(T.DENY);
+  assert.equal(deny.length, 1, 'bob is told at once');
+  assert.equal(deny[0].f.flags, DENIED.UNAVAILABLE);
+  assert.equal(deny[0].f.req, 7);
+  net.closeAll();
+});

@@ -445,6 +445,14 @@ export class Swarm extends EventTarget {
 
   setShare(on) {
     this.share = !!on;
+    // Stop serving my file right away, including pieces already read and queued for sending.
+    if (!this.share && this.film?.local && !this.film.closed) {
+      for (const job of [...this.film.jobs.values()]) {
+        this._cancelJob(this.film, job);
+        // Say so, as for a want that arrives now: the friend moves on at once instead of timing out on me.
+        this._deny(job.peerId, { req: job.req, key: job.key, piece: job.p }, DENIED.UNAVAILABLE);
+      }
+    }
     this._changed();
     this._emit('change');
   }
@@ -913,7 +921,8 @@ export class Swarm extends EventTarget {
     const h = this.have.get(id);
     // Waiting for a slot can take a while: the peer may have failed other pieces (or left) meanwhile, and then
     // every piece queued behind it must not pay the timeout again.
-    if (!h || !this._usable(id) || this.bad.get(id) > this.now() || film.closed) {
+    // It may also have switched to another movie: its pieces would be another film's bytes (there are no piece hashes).
+    if (!h || !film.keys.has(h.key) || !this._usable(id) || this.bad.get(id) > this.now() || film.closed) {
       this._unslot(film, id);
       return null;
     }
@@ -1028,6 +1037,7 @@ export class Swarm extends EventTarget {
     if (film.local) {
       if (!this.share) return null;
       const buf = new Uint8Array(await film.local.slice(a, b).arrayBuffer());
+      if (!this.share) return null; // sharing was turned off while reading
       return buf.length === b - a ? buf : null;
     }
     const cached = film.store?.peek?.(a, b);

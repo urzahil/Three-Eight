@@ -104,23 +104,38 @@ async function startLobby(room) {
   const media = new LocalMedia({ ...store.get('media', {}), processing: store.get('processing', true) });
   const preview = $('lobby-video');
   let stopMeter = () => {};
-  const refreshPreview = () => {
-    preview.srcObject = media.videoTrack ? new MediaStream([media.videoTrack]) : null;
-    preview.hidden = !media.videoTrack;
-    $('lobby-avatar').hidden = !!media.videoTrack;
+  // Only a different track needs a new preview stream or level meter (typing the name must not rebuild them).
+  let previewVideo;
+  let previewAudio;
+  const refreshAvatar = () => {
     $('lobby-avatar').textContent = initials($('lobby-name').value || '?');
     $('lobby-avatar').style.background = colorFor($('lobby-name').value || 'x');
+  };
+  const refreshPreview = () => {
+    if (media.videoTrack !== previewVideo) {
+      previewVideo = media.videoTrack;
+      preview.srcObject = previewVideo ? new MediaStream([previewVideo]) : null;
+    }
+    preview.hidden = !media.videoTrack;
+    $('lobby-avatar').hidden = !!media.videoTrack;
+    refreshAvatar();
     $('lobby-mic').classList.toggle('off', !media.micOn || !media.audioTrack);
     setIcon($('lobby-mic'), media.micOn && media.audioTrack ? 'mic' : 'mic-off');
     $('lobby-cam').classList.toggle('off', !media.camOn);
     setIcon($('lobby-cam'), media.camOn ? 'cam' : 'cam-off');
-    stopMeter();
-    stopMeter = watchLevel(media.audioTrack, (l) => {
-      $('lobby-meter').style.height = media.micOn ? `${Math.round(l * 100)}%` : '0';
-    });
+    if (media.audioTrack !== previewAudio) {
+      previewAudio = media.audioTrack;
+      stopMeter();
+      stopMeter = watchLevel(previewAudio, (l) => {
+        $('lobby-meter').style.height = media.micOn ? `${Math.round(l * 100)}%` : '0';
+      });
+    }
   };
   media.addEventListener('change', refreshPreview);
-  $('lobby-name').addEventListener('input', refreshPreview);
+  $('lobby-name').addEventListener('input', () => {
+    refreshAvatar();
+    audioContext(); // typing is a user gesture: lets a suspended meter's audio context resume
+  });
   const fillDevices = async () => {
     const d = await media.devices();
     for (const kind of ['audio', 'video']) {
@@ -310,6 +325,9 @@ class Room {
   leave(explicit) {
     if (this.left) return;
     this.left = true;
+    document.removeEventListener('keydown', this._onKeydown);
+    document.removeEventListener('click', this._onDocClick);
+    clearInterval(this._timeTimer);
     try {
       this.lock?.release();
     } catch {

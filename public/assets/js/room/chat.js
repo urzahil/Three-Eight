@@ -3,6 +3,8 @@
 
 import { $, toast, randomId, linkify } from './util.js';
 
+const MAX_CHAT = 500;
+
 export class Chat {
   _initChat() {
     $('chat-form').addEventListener('submit', (e) => {
@@ -23,27 +25,42 @@ export class Chat {
     });
   }
 
+  /** A chat message from the network, made safe to show. One without text is dropped by _addChat(). */
   _cleanChat(m, peer) {
+    if (!m || typeof m !== 'object') return { id: '', text: '' };
+    const ts = Number(m.ts);
+    // History is relayed by a peer who could write anything: it never counts as one of my own messages.
+    const from = peer ? peer.id : String(m.from || '').slice(0, 64);
     return {
       id: String(m.id || randomId()).slice(0, 40),
-      from: peer ? peer.id : String(m.from || ''),
+      from: !peer && from === this.id ? '' : from,
       name: String((peer ? this.profileOf(peer.id).name : m.name) || 'Guest').slice(0, 40),
       text: String(m.text || '').slice(0, 2000),
-      ts: Number(m.ts) || this.signaling.now(),
+      ts: Number.isFinite(ts) && ts > 0 && ts < 8.64e15 ? ts : this.signaling.now(),
     };
   }
 
   _addChat(m, quiet = false) {
     if (!m.text || this.chatIds.has(m.id)) return;
+    // A full log keeps the newest messages: older history (replayed by a peer) has no place in it.
+    if (this.chat.length >= MAX_CHAT && m.ts < this.chat[0].ts) return;
     this.chatIds.add(m.id);
     this.chat.push(m);
     this.chat.sort((a, b) => a.ts - b.ts);
-    if (this.chat.length > 500) this.chat.shift();
     const log = $('chat-log');
+    let evictedSelf = false;
+    while (this.chat.length > MAX_CHAT) {
+      const old = this.chat.shift();
+      this.chatIds.delete(old.id);
+      if (old === m) evictedSelf = true;
+      else log.querySelector(`.msg[data-id="${CSS.escape(old.id)}"]`)?.remove();
+    }
+    if (evictedSelf) return;
     const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
     const el = document.createElement('div');
     el.className = 'msg';
     el.dataset.ts = m.ts;
+    el.dataset.id = m.id;
     const meta = document.createElement('div');
     meta.className = 'meta';
     const b = document.createElement('b');

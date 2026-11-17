@@ -101,7 +101,7 @@ export class Movie {
     sync.addEventListener('blocked', () => this._renderStage());
     sync.addEventListener('remote-change', (e) => this._announce(e.detail));
 
-    setInterval(() => this._renderTime(), 250);
+    this._timeTimer = setInterval(() => this._renderTime(), 250);
     this._renderStage();
   }
 

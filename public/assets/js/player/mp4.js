@@ -65,7 +65,7 @@ export class Mp4Demuxer {
     let moov = null;
     while (pos + 8 <= this.file.size) {
       const h = await this.src.read(pos, 16);
-      const dv = new DataView(h.buffer);
+      const dv = new DataView(h.buffer, h.byteOffset, h.byteLength);
       let size = dv.getUint32(0);
       const type = fourcc(h, 4);
       let hdr = 8;
@@ -85,7 +85,7 @@ export class Mp4Demuxer {
     const b = await this.src.read(moov.pos, moov.size);
     const mvhd = find(b, 8, b.length, ['mvhd']);
     if (mvhd) {
-      const dv = new DataView(b.buffer, mvhd.dataStart);
+      const dv = new DataView(b.buffer, b.byteOffset + mvhd.dataStart);
       const v = b[mvhd.dataStart];
       this.movieTimescale = v === 1 ? dv.getUint32(20) : dv.getUint32(12);
       this.duration = v === 1 ? (dv.getUint32(24) * 0x100000000 + dv.getUint32(28)) / this.movieTimescale : dv.getUint32(16) / this.movieTimescale;
@@ -111,14 +111,14 @@ export class Mp4Demuxer {
     const t = {};
     {
       const v = b[tkhd.dataStart];
-      const dv = new DataView(b.buffer, tkhd.dataStart);
+      const dv = new DataView(b.buffer, b.byteOffset + tkhd.dataStart);
       t.id = v === 1 ? dv.getUint32(20) : dv.getUint32(12);
       const flags = dv.getUint32(0) & 0xffffff;
       t.isDefault = !!(flags & 1);
     }
     {
       const v = b[mdhd.dataStart];
-      const dv = new DataView(b.buffer, mdhd.dataStart);
+      const dv = new DataView(b.buffer, b.byteOffset + mdhd.dataStart);
       t.timescale = v === 1 ? dv.getUint32(20) : dv.getUint32(12);
       const langOff = v === 1 ? 32 : 20;
       const l = dv.getUint16(langOff);
@@ -139,7 +139,7 @@ export class Mp4Demuxer {
     const elst = find(b, trak.dataStart, trak.end, ['edts', 'elst']);
     if (elst) {
       const v = b[elst.dataStart];
-      const dv = new DataView(b.buffer, elst.dataStart);
+      const dv = new DataView(b.buffer, b.byteOffset + elst.dataStart);
       const n = dv.getUint32(4);
       let o = 8;
       let emptyDelay = 0;
@@ -170,7 +170,7 @@ export class Mp4Demuxer {
     const type = entry.type;
     t.fourcc = type;
     if (t.type === 'video') {
-      const dv = new DataView(b.buffer, entry.dataStart);
+      const dv = new DataView(b.buffer, b.byteOffset + entry.dataStart);
       t.width = dv.getUint16(24);
       t.height = dv.getUint16(26);
       const kids = entry.dataStart + 78;
@@ -198,7 +198,7 @@ export class Mp4Demuxer {
         t.sampleEntry = box(type, head, ...children);
       } else t.unsupported = `video codec ${type}`;
     } else if (t.type === 'audio') {
-      const dv = new DataView(b.buffer, entry.dataStart);
+      const dv = new DataView(b.buffer, b.byteOffset + entry.dataStart);
       const version = dv.getUint16(8);
       let channels = dv.getUint16(16);
       let rate = dv.getUint32(24) >>> 16;

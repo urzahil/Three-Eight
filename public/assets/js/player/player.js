@@ -100,14 +100,13 @@ export class MoviePlayer extends EventTarget {
     this.kickRenderLoop();
   }
 
-  /** (Re)start the subtitle render loop on the window that owns the overlay. */
+  /** (Re)start the subtitle render loop on the window that owns the overlay. It runs only while a film is loaded. */
   kickRenderLoop() {
-    if (this._rafWin) this._rafWin.cancelAnimationFrame(this._raf);
-    this._rafWin = null;
-    clearTimeout(this._frameTimer);
+    this._stopRenderLoop();
+    if (!this.file) return;
     const run = () => this.kickRenderLoop();
     try {
-      if (this.file) this.renderer.update(this.time);
+      this.renderer.update(this.time);
     } catch (err) {
       console.warn('Subtitle render failed', err);
     }
@@ -119,6 +118,13 @@ export class MoviePlayer extends EventTarget {
     } else {
       this._frameTimer = setTimeout(run, 100);
     }
+  }
+
+  _stopRenderLoop() {
+    if (this._rafWin) this._rafWin.cancelAnimationFrame(this._raf);
+    this._rafWin = null;
+    clearTimeout(this._frameTimer);
+    this._frameTimer = 0;
   }
 
   /** 'hidden' | 'showing': how the native caption track (used by system PiP) is displayed. */
@@ -224,6 +230,8 @@ export class MoviePlayer extends EventTarget {
     this.mode = null;
     for (const [id, s] of this.subtitles) if (s.source === 'embedded') this.subtitles.delete(id);
     this.renderer.setCues([]);
+    this.renderer.update(0); // clear the lines on screen: the loop stops with no film
+    this._stopRenderLoop();
     this.nativeCaptions.clear();
     this._emit('tracks');
   }
@@ -232,6 +240,7 @@ export class MoviePlayer extends EventTarget {
     this.unload();
     const token = ++this._loadToken;
     this.file = file;
+    this.kickRenderLoop();
     this.triedModes = new Set();
     this.diagnosed = false;
     this.sessionRetried = false;
@@ -246,7 +255,8 @@ export class MoviePlayer extends EventTarget {
     const mseOk = mseAvailable() && this.videoTrack && mseSupports(this.videoTrack.mime);
     this.audioTracks = audio.map((t, i) => {
       const mseSupported = !!t.mime && mseSupports(t.mime);
-      return { index: i, label: trackLabel(t, i + 1, 'audio'), supported: mseSupported, codec: humanCodec(t.codecString) || t.codecId || '' };
+      // `supported` is what the current mode can play; `mseSupported` stays what the built-in player can.
+      return { index: i, label: trackLabel(t, i + 1, 'audio'), supported: mseSupported, mseSupported, codec: humanCodec(t.codecString) || t.codecId || '' };
     });
     this.mseOk = !!mseOk;
     if (audioIndex >= audio.length) audioIndex = 0;
@@ -271,11 +281,16 @@ export class MoviePlayer extends EventTarget {
     }
     if (!mseOk && needSwitching) {
       // Can't remux: only the default track will play natively.
-      this.audioTracks.forEach((t, i) => { if (i !== 0) t.supported = false; t.note = 'switching unavailable'; });
+      this.audioTracks.forEach((t, i) => {
+        if (i === 0) {
+          t.supported = true; // the default track plays natively
+        } else {
+          t.supported = false;
+          t.note = 'switching unavailable';
+        }
+      });
       this.audioIndex = 0;
     }
-    if (mode === 'native' && this.nativeAudioApi) this.audioTracks.forEach((t) => { t.supported = true; });
-    if (mode === 'native' && !this.nativeAudioApi && audio.length <= 1) this.audioTracks.forEach((t) => { t.supported = true; });
 
     // Subtitle tracks from the container.
     if (demux) {
@@ -331,6 +346,8 @@ export class MoviePlayer extends EventTarget {
         this.objectUrl = URL.createObjectURL(this.file);
         this.video.src = this.objectUrl;
       }
+      // The element picks its own audio decoder: every track counts as playable when it can be selected (or is the only one).
+      if (this.nativeAudioApi || this.audioTracks.length <= 1) for (const t of this.audioTracks) t.supported = true;
       await metadata;
       if (startTime) this.video.currentTime = startTime;
       this._applyNativeAudio();
@@ -340,7 +357,9 @@ export class MoviePlayer extends EventTarget {
       this.engine = engine;
       engine.addEventListener('error', (e) => this._onEngineError(e.detail));
       const at = this.audioTrackList[this.audioIndex];
-      const audio = at && this.audioTracks[this.audioIndex]?.supported ? at : null;
+      // The built-in player can only use tracks it supports itself, whatever native playback could do.
+      for (const t of this.audioTracks) t.supported = t.mseSupported;
+      const audio = at && this.audioTracks[this.audioIndex]?.mseSupported ? at : null;
       this.mseAudio = audio;
       await engine.start(this.videoTrack, audio, startTime);
       await metadata;
@@ -365,7 +384,7 @@ export class MoviePlayer extends EventTarget {
       this._applyNativeAudio();
     } else {
       const t = this.audioTrackList[index];
-      const supported = t && this.audioTracks[index]?.supported;
+      const supported = t && this.audioTracks[index]?.mseSupported;
       const wasPaused = this.video.paused;
       const time = this.time;
       if (supported && this.mseAudio && this.engine && (await this.engine.setAudioTrack(t))) {
@@ -407,6 +426,14 @@ export class MoviePlayer extends EventTarget {
     if (this.subtitleId === id) this._showCues(true);
     this._emit('tracks');
     return id;
+  }
+
+  /** Forget an external subtitle file (the room stopped sharing it, or moved on to another movie). */
+  removeExternalSubtitle(id) {
+    if (this.subtitles.get(id)?.source !== 'external') return;
+    this.subtitles.delete(id);
+    if (this.subtitleId === id) this._showCues(true);
+    this._emit('tracks');
   }
 
   async _extractSubtitles(token) {
@@ -618,16 +645,24 @@ export class MoviePlayer extends EventTarget {
     }
     if (this.mode === 'native' && this.mseOk && !this.triedModes.has('mse')) {
       this._emit('notice', { text: 'Native playback failed, switching to the built-in player…' });
-      await this._start('mse', time);
-      this._emit('tracks');
-      return;
-    }
-    if (this.mode === 'mse' && !this.triedModes.has('native') && (!this.file.remote || this.file.nativeUrl)) {
-      await this._start('native', time);
-      this._emit('tracks');
-      return;
+      if (await this._fallback('mse', time)) return;
+    } else if (this.mode === 'mse' && !this.triedModes.has('native') && (!this.file.remote || this.file.nativeUrl)) {
+      if (await this._fallback('native', time)) return;
     }
     this._emit('fatal', { text: 'Your browser cannot play this file' + (err?.message ? `: ${err.message}` : '.') });
+  }
+
+  /** Switch to the other player after a failure. False if that failed too (nobody awaits the error handler). */
+  async _fallback(mode, time) {
+    const file = this.file;
+    try {
+      await this._start(mode, time);
+    } catch (err) {
+      console.warn(`Could not switch to ${mode} playback`, err);
+      return this.file !== file; // another film meanwhile: nothing to report
+    }
+    this._emit('tracks');
+    return true;
   }
 
   _onEngineError(err) {

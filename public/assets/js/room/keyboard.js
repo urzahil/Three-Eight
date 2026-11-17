@@ -8,6 +8,7 @@ export class Keyboard {
   _initKeyboard() {
     // Also attached to the Picture-in-Picture document while it is open.
     this._onKeydown = (e) => {
+      if (this.left) return; // the page stays open on "You left the room": no camera, mic or fullscreen from here
       if (e.target.closest('input, textarea, select, dialog') || e.metaKey || e.ctrlKey || e.altKey) return;
       const movie = !$('stage').hidden && this.sync.fileMatches;
       switch (e.key) {
