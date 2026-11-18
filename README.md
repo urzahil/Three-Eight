@@ -1,358 +1,148 @@
 # Three-Eight
 
-Video meetups and movie nights with friends, entirely in the browser (Chrome, Firefox, Safari, Edge; desktop and mobile). Nobody installs anything.
+Video calls and synchronized movie nights with friends, directly in your browser. No app installation is required.
 
-- **Video call**: camera, microphone, mute and camera-off, device selection, speaking indicators, and chat.
-- **Watch a movie together**: one person opens a file (or picks one from the room's Google Drive folder) and the room keeps playback in sync. Friends who don't have the file can stream it from that person's copy, or open their own. If anyone plays, pauses or seeks, it happens for everybody. Choosing an **audio track** or **subtitles** also changes it for everybody.
-- **Screen sharing**: show your entire screen, one window or a browser tab to everyone in the room. One person shares at a time, and not while a movie is open.
-- **Picture-in-picture**: pop the movie out into a small floating window and keep chatting or browsing. Our subtitles and controls come with it, and play, pause and seek in the floating window still affect the whole room.
-- **Rooms with passwords**: rooms are created on an admin page. Each one lives at `https://three-eight.example.com/ROOM_NAME`.
-- **Peer to peer**: audio, video, chat, sync messages and shared movie pieces go directly between browsers over WebRTC. The server only serves the page and relays the short connection handshake, so its CPU and bandwidth use are tiny (apart from Google Drive films, see below).
+- Video calls with camera, microphone, and chat.
+- Watch movies together with synchronized playback, seeking, audio tracks, and subtitles.
+- Share a movie from your device, stream it from a friend's copy, or use a room's Google Drive folder.
+- Screen sharing and picture-in-picture (browser support varies).
+- Private, password-protected rooms.
 
 ## How it works
 
-```
-             ┌──────────── signaling only (tiny JSON over WebSocket) ───────────┐
-  Browser A ─┤                                                                  ├─ Browser B
-             └─ audio · video · chat · movie sync · movie pieces (WebRTC, P2P) ─┘
-```
+Three-Eight uses a small Node.js server to host the web app, create rooms, authenticate room members, and relay WebRTC connection setup. Once connected, audio, video, chat, movie synchronization, and movie data are exchanged directly between browsers whenever possible.
 
-- **Server** (`server/`): Node.js with one dependency (`ws`). It serves the static app, stores rooms and their scrypt-hashed passwords in `/data/rooms.json`, checks the password when someone joins, relays WebRTC offers, answers and ICE candidates between members of the same room, and answers clock-sync pings. If a room has a Google Drive folder, it also reads that folder as a Google service account and streams the movies to the room's members (`server/drive.js`).
-- **Calls** (`public/assets/js/mesh.js`): a full mesh with one `RTCPeerConnection` per pair of people. Each person uploads one stream per friend, and video bitrate goes down automatically as the room grows. This works best with up to about 6–8 people. A shared screen travels as a second video track in a stream of its own (the camera shares its stream with the microphone, which is how the receiver tells them apart); it is added to each connection the first time someone shares.
-- **Movie sync** (`public/assets/js/sync.js`): everyone shares a small playback state: playing or paused, position, timestamp on the shared server clock, audio track and subtitle track. Any change is broadcast over WebRTC data channels and the newest change wins. Each browser works out where the movie should be right now and corrects drift. It speeds up or slows down by a few percent for small offsets and seeks for large ones. In testing, browsers stayed within about 10 ms of each other.
-- **Movie files are never stored on the server.** A movie is a local file, or comes from the room's Google Drive folder, which the server reads from Google and streams on (nothing is written to its disk). Movie data now also travels *between browsers*: viewers send each other pieces of the film over a second WebRTC data channel (`public/assets/js/player/swarm.js`), and a friend without the file can stream it from someone's copy. The page compares the files (size, duration and a sampled content fingerprint) to warn when someone has a different file, and pieces are only exchanged between identical fingerprints; there are no per-piece checksums, so sharing still relies on the trust of a room of friends.
+Movie files are not stored on the server. The optional Google Drive integration lets the server stream files from a room's shared Drive folder. Three-Eight uses peer-to-peer sharing to distribute movie data between participants, reducing server bandwidth.
 
-### Audio tracks and subtitles in every browser
+A full-mesh video call uploads a stream to each participant, so rooms work best with around 6–8 people. Larger rooms can use considerably more upload bandwidth.
 
-Browsers don't let a page switch the audio track of a video file, except Safari. To work around this, Three-Eight includes a small **in-browser remuxer** (`public/assets/js/player/`):
+## Deploy with Docker Compose
 
-1. It reads the container directly from the file, in pieces: from your device, from a friend's copy, or from the server. It supports **MKV/WebM** and **MP4/MOV/M4V**.
-2. It repackages the video track plus the *selected* audio track into fragmented MP4 on the fly. It then feeds that to the `<video>` element through Media Source Extensions. No re-encoding happens, so CPU use is low.
-3. It extracts embedded text subtitles (SRT, ASS/SSA, WebVTT, MP4 timed text) and draws them over the video. It can also load external `.srt`, `.vtt` and `.ass` files. A loaded subtitle file is sent to everyone in the room automatically.
+### 1. Configure
 
-Simple files with a single audio track that you open from your device play natively. Films you stream (from a friend or from Google Drive) always go through the remuxer, because their pieces arrive from other browsers.
-
-### Picture-in-picture
-
-The PiP button (or `p`) behaves differently per browser, because our subtitles are drawn by the page rather than by the video element:
-
-- **Chrome and Edge** offer two styles, chosen in *Settings* under *Picture-in-picture style* (changing it closes an open PiP window; the next click uses the new style):
-  - *Floating player* (default) uses Document Picture-in-Picture. The whole player moves into a floating window, so our subtitles, controls, audio and subtitle menus, and the seek bar keep working. Close the window or click *Bring it back* to return it to the page. The browser adds a title bar showing the site address, which pages cannot remove.
-  - *Compact video* has no title bar: the window shows only the video and our subtitles, with play/pause (shared with the room). There are no menus or seek bar in the window, so change audio and subtitle tracks from the page. This style redraws the movie frames and subtitles on a canvas and plays that in the browser's native video PiP, which costs slightly more CPU.
-- **Safari** (desktop and iOS) uses the system video PiP. Our subtitles are mirrored into a native caption track, which Safari shows as captions in the PiP window. Pausing or playing from the system PiP controls is sent to the room.
-- **Firefox** has no PiP API for pages, so use Firefox's own PiP toggle on the video. The subtitles are exposed as a caption track, which Firefox may show there (best effort).
-
-Media keys and the buttons of system PiP windows use the Media Session API and also control the room.
-
-**Codec limits** come from what browsers can decode. Video: H.264, HEVC (Safari, and Chrome/Edge with hardware support), VP9 and AV1. Audio: AAC, Opus, FLAC and MP3. **AC-3/E-AC-3** only plays in Safari. **DTS and TrueHD** play nowhere. Tracks a browser can't play are marked in the audio menu. **Image-based subtitles** (PGS/VobSub from Blu-ray/DVD rips) aren't supported, so use an `.srt` instead. If a movie only has AC-3/DTS audio, you can add an AAC track once, losslessly for the video:
+Clone the repository and create your environment file:
 
 ```bash
-ffmpeg -i movie.mkv -map 0 -c copy -map 0:a:0 -c:a:1 aac -b:a:1 384k movie-aac.mkv
+cp .env.example .env
 ```
 
-## Running it
+Edit `.env` and set a strong administrator password:
 
-### Docker (recommended)
+```dotenv
+ADMIN_PASSWORD=replace-with-a-long-random-password
+TRUST_PROXY=true
+```
+
+Keep `.env` private and never commit it.
+
+### 2. Start Three-Eight
 
 ```bash
-cp .env.example .env        # set ADMIN_PASSWORD
 docker compose up -d --build
 ```
 
-The server listens on **port 4567**, published on `127.0.0.1` only, which suits a TLS reverse proxy on the same host (see below). If your proxy runs in another container, put both on a shared Docker network and remove the `ports` entry instead of publishing the port. Only if nothing sits in front of the app, publish it on all interfaces (`"4567:4567"`) and set `TRUST_PROXY=false`. Rooms are kept in the `three-eight-data` volume.
+The app listens on port `4567`, bound to localhost (`127.0.0.1`) by default. This is intended for use behind a reverse proxy that provides HTTPS. Docker Compose stores room data in the persistent `three-eight-data` volume.
 
-The image has a health check (`node server/healthcheck.js`, which requests `/healthz` every 30 s using the same `PORT`, `HOST` and TLS settings as the server). `docker compose ps` shows the container as `healthy`, or `unhealthy` after three failed checks in a row.
-
-Or without compose:
+Check the container status:
 
 ```bash
-docker build -t three-eight .
+docker compose ps
 ```
 
-```bash
-docker run -d --name three-eight -p 127.0.0.1:4567:4567 -e ADMIN_PASSWORD=change-me -e TRUST_PROXY=true -v three-eight-data:/data three-eight
-```
+The service should report `healthy`.
 
-### HTTPS is required
+### 3. Set up HTTPS
 
-Browsers only allow camera and microphone access on HTTPS pages (or `localhost`). Put a TLS reverse proxy in front of port 4567 and make sure it forwards WebSockets (`/ws`).
+Camera and microphone access require HTTPS, except when accessing `localhost`. Put a reverse proxy in front of Three-Eight and ensure WebSocket connections to `/ws` are forwarded.
 
-**Caddy** (gets certificates automatically):
+**Caddy** (simple option):
 
-```
+```caddy
 three-eight.example.com {
     reverse_proxy 127.0.0.1:4567
 }
 ```
 
-**nginx**:
+Replace `three-eight.example.com` with your domain. Caddy obtains and renews TLS certificates automatically, provided DNS and network access are configured correctly.
 
-```nginx
-server {
-    listen 443 ssl http2;
-    listen [::]:443 ssl http2;   # mobile networks often connect over IPv6
-    server_name three-eight.example.com;
-    # ssl_certificate ...; ssl_certificate_key ...;
+If you use another reverse proxy, configure it to forward WebSocket upgrades and preserve the host header. The proxy must also be reachable over IPv6 if your domain has an IPv6 (`AAAA`) record.
 
-    location / {
-        proxy_pass http://127.0.0.1:4567;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_set_header Host $http_host;   # keeps a non-default port, so the Host matches the browser's Origin
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_read_timeout 1h;
-    }
-}
-```
+> Keep port 4567 private when using a reverse proxy. The Compose configuration binds it to localhost and uses `TRUST_PROXY=true` for a trusted local proxy. If you expose the application directly without a proxy, change the proxy setting to `TRUST_PROXY=false` and configure HTTPS separately.
 
-With `TRUST_PROXY=true` (the compose default, which assumes the app is reachable only through your proxy, as the localhost-only port mapping ensures), the server takes the client IP from `X-Forwarded-For`, which is used for login rate limiting. It also marks the admin cookie `Secure` and sends `Strict-Transport-Security`. `true` (or `1`, `yes`) means one trusted proxy: the server uses the last entry of `X-Forwarded-For`, the one your proxy appended, and ignores anything the client put before it. If there are several proxies in a row (say a CDN in front of nginx), set `TRUST_PROXY` to their number, e.g. `TRUST_PROXY=2`: the client address is then the second entry from the right. Setting it higher than the real number of proxies lets clients spoof their address.
+## Create a room and invite friends
 
-Browsers must open the WebSocket from the same host as the page: the `Origin` header must match the `Host` header your proxy passes on. Use `proxy_set_header Host $http_host;` (as above): `$host` drops the port, so on a non-default port (say `https://calls.example.com:8443`) the two would differ. As a fallback, while `TRUST_PROXY` is on the server also accepts an Origin whose host name equals the Host header's host name, provided the Origin's scheme matches the one the proxy forwards (`X-Forwarded-Proto: https` for an `https://` page) and its port is the default one for that scheme or the one in the Host header; a Host header that is not a plain `name[:port]` is never trusted. Without a trusted proxy the comparison is strict (host and port). Anything else, such as a non-default port while the proxy drops the port from Host, has to be listed in `ALLOWED_ORIGINS`. If the address people use is different from the `Host` header altogether, list it in `ALLOWED_ORIGINS` (e.g. `https://calls.example.com`; a default port or a trailing slash is fine, and entries that are not valid origins are ignored with a warning at startup). If you publish port 4567 directly to the internet without a proxy, set `TRUST_PROXY=false` (the compose file already binds the port to localhost only).
+1. Open `https://your-domain.example/admin`.
+2. Sign in using the `ADMIN_PASSWORD` configured in `.env`.
+3. Create a room and set its room password.
+4. Share the room link and password with your friends. A room named `movienight` is available at `https://your-domain.example/movienight`.
+5. Participants enter a display name and room password, then enable their camera or microphone as needed.
 
-**Works on Wi-Fi but not on mobile data?** If the lobby says *Can’t reach the server, retrying…* and then *Could not connect to the server*, the page loaded but the WebSocket (`/ws`) did not get through. Mobile networks (4G/5G) usually connect over IPv6. If your domain has an `AAAA` record, the proxy must forward WebSockets on its IPv6 listener too. Test with `curl -6 -i -N -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' https://three-eight.example.com/ws`, which should answer `101 Switching Protocols`. If you get into the room but a friend's tile stays on *connecting…* / *connection failed*, the problem is the carrier's NAT instead; see [Do I need TURN?](#do-i-need-turn).
+The admin page lets you manage rooms, change room passwords, remove participants, and delete rooms. You can also attach a Google Drive folder to a room (optional).
 
-### Without Docker
+## Watch a movie
 
-```bash
-npm ci
-ADMIN_PASSWORD=change-me npm start
-```
+Click **Movie** in the room. You can:
 
-For local testing, `http://localhost:4567` counts as a secure context, so camera and mic work.
+- **Use your own file:** choose the movie from your device. Friends can open their own copy or stream from yours.
+- **Stream from a friend's copy:** join the movie without having the file. Your browser receives movie data from other participants over WebRTC.
+- **Google Drive:** if an administrator has attached a Drive folder to the room, select a movie from it. The server streams it from Drive, and participants may share the movie data between browsers.
 
-## Using it
+Playback is synchronized for the room, including play/pause, seeking, audio-track selection, and subtitles. Headphones are recommended to prevent movie audio from feeding back through your microphone.
 
-1. Open `https://three-eight.example.com/admin`, log in with `ADMIN_PASSWORD`, and create a room, for example `movienight`, with a password. The admin page also shows who is online in each room. From there you can change passwords (and optionally kick everyone) or delete rooms. Optionally attach a Google Drive folder to a room (see below).
-2. Send friends `https://three-eight.example.com/movienight` and the password.
-3. Each person enters a display name, which is remembered in the browser's local storage, plus the room password. They can also choose to remember the password on that device.
-4. To watch together, one person clicks **Movie** and picks a film: a file from their device, or one from the room's Google Drive folder. Everyone else gets a button to join in; see [Watching a movie](#watching-a-movie) for the options. Use the player controls, the audio (🎧) and subtitle (CC) menus, or the [keyboard shortcuts](#keyboard-shortcuts).
-5. To show your screen, click **Share screen** and choose the entire screen, a window or a tab in the browser's picker. See [Sharing your screen](#sharing-your-screen).
+For screen sharing, click **Share screen** and choose a screen, window, or browser tab. Screen sharing is available on desktop browsers and cannot be used at the same time as the movie player.
 
-A device that is switched off in the lobby is not requested at all: with the mic off the browser never asks for (or shows an indicator for) the microphone until you turn it on.
+## Google Drive (optional)
 
-Tip: use headphones during the movie, so your microphone doesn't send the film's sound to your friends. Movie volume is per person.
+To enable Drive movies:
 
-### Keyboard shortcuts
+1. Create a Google Cloud project and enable the Google Drive API.
+2. Create a service account and download a JSON key. The service account does not need project roles.
+3. Keep the key file private on your server. Do not commit it to Git.
+4. Configure `GOOGLE_SERVICE_ACCOUNT` to the key file's path. With Docker Compose, mount the file read-only into the container and set the variable in `.env` to the mounted path.
+5. Share the Drive folder with the service account email as **Viewer**.
+6. In `/admin`, attach that folder to the room.
 
-| Key | Action |
-| --- | --- |
-| `space` or `k` | Play / pause the movie |
-| `←` / `→` | Back / forward 10 s (the step is adjustable in Settings: 5, 10, 15, 30 or 60 s) |
-| `f` | Full screen on / off |
-| `p` | Picture-in-picture on / off |
-| `m` | Mic on / off |
-| `v` | Camera on / off |
-| `s` | Share screen on / off (where the browser supports it) |
-| `c` | Open / close the chat |
-
-The movie shortcuts (`space`, `k`, arrows, `p`) work only while a movie is playing that you have joined. Shortcuts are ignored while you are typing in a text field or a dialog is open, and when `Ctrl`, `Alt` or `⌘` is held. They also work in the picture-in-picture window.
-
-### Installing it as an app
-
-Three-Eight is a Progressive Web App, so it can be installed and gets its own icon and window without browser bars. In Chrome or Edge on the desktop, use the install icon in the address bar. On Android, use **Install app** in the Chrome menu. On iPhone or iPad, tap **Share**, then **Add to Home Screen**. The installed app opens on the start page with the last room you joined already filled in. Installing needs HTTPS (or `localhost`), like the camera and mic do.
-
-A small service worker (`public/sw.js`) keeps a copy of the page's own files. It always asks the server first, so updates show up straight away, and uses the copy only when there is no connection. The app then opens and says it can't reach the server, instead of showing the browser's offline error. Calls, signaling, the API and Drive movies never go through its cache.
-
-### Sharing your screen
-
-- **What is shared:** the browser's own picker chooses the entire screen, one window (one app) or a tab. The room's own tab is left out of the list. Sound is not shared, only the picture.
-- **One at a time:** while someone shares, the **Share screen** button tells others who is sharing instead. If two people start at the same moment, the one who started later stops automatically.
-- **Not during a movie:** the shared screen and the movie use the same space, so a share can't start while a movie is open, and a movie can't be started while someone shares. Close the movie, or stop sharing, first.
-- **Stopping:** click **Stop sharing** in the toolbar or on your preview, or the browser's own *Stop sharing* bar. Leaving the room stops it too.
-- **Watching a share:** it fills the main area, with everyone's video beside it. The button in its corner (or a double-click) shows it full screen.
-- **Bandwidth:** like the camera, the screen goes directly to each friend, so the sharer uploads one copy per person. While sharing, the screen gets most of the upload (about 2.5 Mbps with one friend, down to 0.6 Mbps with five or more) and the sharer's camera drops to a low bitrate. On a slow connection the picture stays sharp and the frame rate drops.
-- **Browsers:** sharing works in desktop Chrome, Edge, Firefox and Safari. Phones and tablets can't share their screen (the button is hidden), but they can watch a share. On macOS, the browser needs the *Screen Recording* permission in System Settings → Privacy & Security.
-
-## Watching a movie
-
-Whatever the source, playback is the same: everyone sees the same moment of the film, and play, pause, seek, audio track and subtitles are shared by the room. There are three ways to have the film in your browser, and people in the same room can use different ones.
-
-| | Your own copy | A friend's copy | The room's Google Drive folder |
-|---|---|---|---|
-| **You need** | the same file on your device | nothing | nothing (the admin attaches the folder) |
-| **How to start** | **Movie → Choose movie file…**, or **Use my own copy…** when a film is already playing | **Stream from <name>'s copy** | **Movie → From Google Drive**, or **Stream from Google Drive** when a film is already playing |
-| **Where the film comes from** | your disk | the friend's browser, and other friends who already have the pieces | the Three-Eight server (which reads Google Drive), and other friends who already have the pieces |
-| **Upload it costs** | nothing (others may stream from you, see below) | each viewer passes on roughly its share | each viewer passes on roughly its share; the server sends about one copy |
-| **Browsers** | all | with Media Source Extensions (Chrome, Edge, Firefox, current Safari) | all (without Media Source Extensions it plays straight from the server) |
-| **People list shows** | own copy | streaming (from <name>) | streaming (Drive) |
-
-### Your own copy
-
-Everyone opens their own copy of the same file, and only play/pause/seek and track choices travel between browsers. This is the original Three-Eight way and the lightest one: nothing is uploaded or downloaded. The page compares the files (size and duration, plus a fingerprint of the file's content when the browser can compute one; a renamed copy still matches), and warns when someone picks a different file (you can then use it just for yourself, or switch everyone to it). Opening your own copy is always possible, even when friends are streaming, and saves your connection if you have the file anyway.
-
-### Streaming from a friend's copy
-
-When someone has the room's film open from their device, everyone else is offered **Stream from <name>'s copy** (with several people sharing: **Stream from a friend's copy**). The film goes browser to browser over WebRTC; nothing passes through the server, and the room doesn't need a Google Drive folder.
-
-- **Upload:** the person sharing sends about one copy of the film in total, however many friends stream it. Each piece of the film is fetched from them once by one friend, who passes it on to the others, so every friend uploads roughly its share. (Measured with three friends: the sharer uploaded about 1.0–1.2 × the part of the film they watched, instead of 3 × when everyone downloaded from the sharer.) The sharer's connection still has to carry the film's bitrate about once: 2 Mbps is plenty for a typical 1080p file, a 4K remux needs much more.
-- **When the sharer leaves:** friends keep watching what they already have, and parts nobody has loaded can't be played. They see a message instead of a frozen player.
-- **Opting out:** sharing is automatic while someone has the room's film open from a file. Turn it off in **Settings → Share my movie file with the room**; friends are then not offered your copy, and your file is not read for them.
-- **Browsers:** streaming from a copy needs Media Source Extensions. A browser without them (old iOS) has to open its own file.
-
-### From the room's Google Drive folder
-
-If the admin attached a Google Drive folder to the room ([setup below](#google-drive-folders)), the **Movie** dialog lists it under **From Google Drive**, with its subfolders. Picking a film streams it for you and makes it the room's film; everyone else gets **Stream from Google Drive** (or can still use their own copy).
-
-- The Three-Eight server reads the folder from Google; browsers never contact Google.
-- Viewers share pieces with each other just like with a friend's copy, so the server sends each part of a film about once, however many people watch. If a friend stops answering or leaves, the others fetch the missing pieces from the server instead.
-- A browser without Media Source Extensions (old iOS) plays the film straight from the server and doesn't take part in sharing; that costs the server a full copy for that viewer.
-- If Google temporarily blocks a heavily downloaded file ("download quota exceeded"), people see that message; use a local copy until it clears.
-- Limits: a folder listing shows at most 5000 items (a note appears when a folder is larger); one room can have at most 3 × `MAX_ROOM_SIZE` film streams open at once, and at most 64 requests wait for a free connection to Google before the server answers "busy, try again shortly". Listings are remembered for 45 seconds in the browser (the reload button next to **From Google Drive** asks again) and 60 seconds on the server, and the server believes "this file is inside the room's folder" for 60 seconds. Every partial answer from Google is checked to be the byte range that was asked for.
-
-### Mixing sources
-
-People in one room can mix the three: some open their own copy, some stream. Anyone who has the film open from their device is also a source for the others, including for Drive films (when the files match, see below), which takes load off the server. A viewer can switch at any time: open the **Movie** dialog to use their own copy, or **Stop using my file** to go back to streaming.
-
-Files are matched by size and a **content fingerprint**: a SHA-256 over the size and three 64 KiB samples (the start, the middle and the end of the file). A local file computes it from the file on your device; a Drive film reads the same three ranges from the server, once, and only when a friend has a copy of the same size to compare with. Viewers exchange film pieces only when the fingerprints are equal, so a different file that happens to have the same size is never mixed in (it is just not used as a source), and renaming a file doesn't matter. This is a sample, not a checksum of every byte: it catches a different file, not one that differs only between the samples, and pieces have no individual hashes. A friend who deliberately sends wrong bytes can still make your player show garbage, so sharing relies on the trust of a room of friends. Without a secure context (plain `http`) the browser has no `crypto.subtle`; viewers then fall back to matching by size alone, and only with each other.
-
-### Subtitles
-
-Subtitles are shared by the room like the audio track: turning them on or off changes it for everybody (each person can still adjust the subtitle delay in Settings).
-
-- **Subtitle files** (`.srt`, `.vtt`, `.ass`): load one with **CC → Load subtitle file…**. It is sent to everyone in the room, including people who join later, whatever way they watch.
-- **From the Drive folder:** a subtitle file next to the film with a matching name loads automatically for everyone when someone starts the film from Drive. Names like `Arrival.srt`, `Arrival.en.srt` or `Arrival ENG.srt` count; with several matches, the one without a language suffix wins, then the one in the browser's language. The other matching files are listed under **From Google Drive** in the CC menu. Subtitle files of other films in the same folder are not listed there, but you can still pick any file from the **Movie** dialog.
-- **Embedded subtitles** (inside the film file): someone who has the file reads the track from it. People who are streaming receive the extracted subtitle text from them, so it appears for everyone at about the same time. If nobody has loaded the track yet, a streaming viewer reads it from the stream itself (slowly, a little at a time), or, for MKV files that don't index their subtitles, sees a message that it will appear once someone in the room has loaded it. A separate `.srt` next to the film is always the fastest option.
-- **Image-based subtitles** (PGS/VobSub from Blu-ray/DVD rips) aren't supported; use an `.srt` instead.
-
-## Google Drive folders
-
-An admin can attach one Google Drive folder to a room. Rooms without a folder look the same as before.
-
-How it works: the Three-Eight server signs in to Google as a **service account** and reads the folder. Members never contact Google: their browsers fetch folder listings and movie data from the Three-Eight server, which only answers requests that carry a token it handed out when they joined the room (the token is tied to the room, its password and its folder, and expires after 12 hours; connected members get a fresh one every 10 hours, so a long session never loses Drive). The token travels in an `Authorization` header, never in a URL: for native playback (a `<video>` element cannot send headers) the browser first posts it to `/api/rooms/<room>/drive/session`, which answers with an `HttpOnly`, `SameSite=Strict` cookie (`Secure` over HTTPS) that only the Drive file endpoints of that room accept (it is cleared when you leave the room; otherwise it expires with the token). So tokens do not show up in reverse-proxy access logs. It only serves files inside the room's folder (and its subfolders), even though the service account may be able to read more. Movies are not stored on disk. The server keeps a short-lived cache in memory (`DRIVE_CACHE_MB`) and fetches each part of a film from Google about once.
-
-Setup:
-
-1. In the [Google Cloud console](https://console.cloud.google.com/), create a dedicated project. Do **not** attach a billing account.
-2. Enable the **Google Drive API** for that project.
-3. Create a **service account** (*IAM & Admin → Service accounts*). It needs no roles.
-4. Open the service account, go to *Keys → Add key → Create new key → JSON*, and put the downloaded file on the server. Set `GOOGLE_SERVICE_ACCOUNT` to its path (the path of the file, not the service account's email) and restart. With Docker Compose, save the file next to `docker-compose.yml` as `google-service-account.json`, uncomment the `volumes` line that mounts it (read-only), and add `GOOGLE_SERVICE_ACCOUNT=/run/secrets/google-service-account.json` to `.env`:
-
-   ```yaml
-   volumes:
-     - ./google-service-account.json:/run/secrets/google-service-account.json:ro
-   ```
-
-5. In Google Drive, share each room's folder with the service account's email address (it looks like `name@project.iam.gserviceaccount.com`) as **Viewer**. One service account serves all rooms; each room only sees its own folder. The folders don't need to be public ("Anyone with the link" can be turned off).
-6. On the admin page, click **Drive…** next to the room and paste the folder link. The dialog shows the email to share with. After saving, the server checks that it can read the folder and tells you.
-
-Notes:
-
-- **Bandwidth:** thanks to sharing between viewers, the server's upload only needs to carry the film's bitrate about once, plus a little more when someone seeks to a part nobody has yet. Without sharing (only one person watching, or a browser without Media Source Extensions) it sends one copy per viewer.
-- **Security:** keep the key file private (don't commit it; it is in `.gitignore`). It can read whatever is shared with that service account, so share only what you want available. To revoke access, delete the key in Google Cloud (*Service accounts → Keys*), or stop sharing the folder with the service account.
-- In Docker the server runs as the `node` user, so the mounted key file must be readable by it (for example `chmod 644 google-service-account.json` on a single-user host).
-- If `GOOGLE_SERVICE_ACCOUNT` is set but the file cannot be read, the server logs why and runs with Drive disabled. The admin dialog then says that the variable is not set.
+See the repository's existing Google Drive documentation/details for the full Docker mount example and security notes.
 
 ## Configuration
 
-| Variable | Default | Description |
+| Variable | Default | Purpose |
 |---|---|---|
-| `PORT` | `4567` | HTTP port (`1`–`65535`) |
-| `ADMIN_PASSWORD` | random, printed at start | Password for `/admin` |
-| `DATA_DIR` | `./data` (`/data` in Docker) | Where `rooms.json` is stored |
-| `TRUST_PROXY` | `false` (`true` in compose) | Trust `X-Forwarded-For` / `X-Forwarded-Proto`: `true`/`1`/`yes` for one proxy, a number for that many proxies in a row |
-| `ALLOWED_ORIGINS` | — | Comma-separated extra origins allowed to open the WebSocket (the page's own host is always allowed); entries are normalised like a browser's Origin, invalid ones are ignored with a warning |
-| `MAX_ROOM_SIZE` | `12` | Max participants per room (`1`–`100`; each person sends video to everyone else, so more than about 8 gets heavy) |
-| `STUN_URLS` | Google + Cloudflare STUN | Comma-separated STUN URLs |
-| `TURN_URLS` | — | Comma-separated TURN URLs (optional) |
-| `TURN_SECRET` | — | coturn `static-auth-secret` (ephemeral credentials) |
-| `TURN_USERNAME` / `TURN_PASSWORD` | — | Static TURN credentials (alternative to the secret) |
-| `GOOGLE_SERVICE_ACCOUNT` | — | Path to a Google service account JSON key, for room Drive folders (optional, see above) |
-| `DRIVE_CACHE_MB` | `256` | Memory for the movie cache while streaming from Drive (minimum `32`; lower values are raised) |
-| `TLS_CERT` / `TLS_KEY` | — | Serve HTTPS directly instead of using a proxy |
+| `PORT` | `4567` | HTTP port |
+| `ADMIN_PASSWORD` | Random if unset | Admin login password; set this explicitly |
+| `DATA_DIR` | `./data` (Docker: `/data`) | Room storage location |
+| `TRUST_PROXY` | `false` (Compose: `true`) | Trust proxy headers; use only behind a trusted proxy |
+| `ALLOWED_ORIGINS` | — | Additional allowed WebSocket origins |
+| `MAX_ROOM_SIZE` | `12` | Room capacity (1–100); large rooms use more bandwidth |
+| `STUN_URLS` | Built-in STUN servers | STUN server list |
+| `TURN_URLS` | — | Optional TURN server URLs for difficult network connections |
+| `TURN_SECRET` | — | TURN shared secret for coturn's secret-based authentication |
+| `TURN_USERNAME` / `TURN_PASSWORD` | — | Alternative static TURN credentials |
+| `GOOGLE_SERVICE_ACCOUNT` | — | Service-account JSON key path for Drive integration |
+| `DRIVE_CACHE_MB` | `256` | Drive streaming cache size in memory |
+| `TLS_CERT` / `TLS_KEY` | — | Optional direct TLS certificate/key if not using a proxy |
 
-A setting that is set but unusable (say `MAX_ROOM_SIZE=twelve` or `TRUST_PROXY=on`) stops the server at startup with a message naming it, instead of being quietly replaced. A Google service account key must use Google's own token endpoint (as keys downloaded from Google Cloud do); pointing Drive at other endpoints (`token_uri`, `GOOGLE_API_BASE`) is for the test suite only and needs `DRIVE_DEBUG=1`.
+For advanced proxy, TURN, Drive, player, and development options, refer to the detailed documentation/source comments in the repository.
 
-### Do I need TURN?
+## Troubleshooting
 
-Usually not. STUN is enough for most home connections. Some friends may be behind very strict NAT, like certain mobile carriers or corporate networks. Their tile then shows "connection failed", and only they are affected. A TURN server ([coturn](https://github.com/coturn/coturn)) fixes this by relaying *their* media. That uses bandwidth on whatever host runs coturn, so it's opt-in. Configure coturn with `use-auth-secret` and `static-auth-secret=...`, then set `TURN_URLS` and `TURN_SECRET`. `docker-compose.yml` has a ready-made, commented-out `turn` service with the steps to enable it.
+- **Camera or microphone unavailable:** use HTTPS (or `localhost`) and check browser permissions.
+- **Can't connect to the room/server:** check that your reverse proxy forwards WebSockets on `/ws`, and that the proxy's host/origin settings match the address you use.
+- **Works on Wi-Fi but not mobile data:** check IPv6 and ensure your proxy has an IPv6 listener if your domain has an `AAAA` record.
+- **A participant can't connect to another participant:** some networks have restrictive NAT/firewalls. Configure an optional TURN server (coturn) and set `TURN_URLS` and `TURN_SECRET` or the static credential pair.
+- **Container status:** run `docker compose ps` and `docker compose logs -f three-eight` to inspect service health and logs.
 
-## Customizing the look
+## Update
 
-### Interface styles
+From the repository directory, pull the latest changes and rebuild:
 
-Everyone can pick an interface style for their own device: on the start page, under *Appearance* in the lobby, or in *Settings* in a room. The choice is saved in the browser and also applies to the admin page and the picture-in-picture window. All styles are dark:
-
-- **Three-Eight** (default): the original look.
-- **CossUI**, **AlignUI**, **DaisyUI**, **HeroUI** and **AntUI**: re-skins inspired by those UI libraries' dark themes (colors, radii, buttons, inputs, tabs).
-
-They are pure CSS in `public/assets/css/themes.css`: each one overrides the variables described below under `:root[data-ui="<id>"]`, plus a few component rules. No library code or web font is loaded (the Content-Security-Policy allows only same-origin scripts and fonts). The list of styles, with each one's `theme-color`, is in `public/assets/js/theme.js`; `public/assets/js/theme-boot.js` applies the saved style before the page is drawn. To add a style, add a block to `themes.css` and an entry to `THEMES`.
-
-### Colors
-
-All colors are CSS variables at the top of `public/assets/css/style.css` (the `:root` block). The admin page uses the same stylesheet.
-
-To change the accent color (yellow/orange by default), edit:
-
-```css
---accent: #f2a541;      /* buttons, logo, seek bar, highlights, links, focus rings */
---accent-ink: #1b1305;  /* text drawn on top of the accent (e.g. primary buttons) */
-```
-
-If you pick a darker accent, set `--accent-ink` to a light color (e.g. `#ffffff`) so button text stays readable.
-
-Two places can't read CSS variables, so change them by hand to match:
-
-- The icon `public/assets/icon.svg` has both colors hard-coded: `fill="#f2a541"` (the accent background) and `fill="#1b1305"` (the `--accent-ink` text). Change both.
-- The `theme-color` meta tag in `public/index.html` (`#0f1115`, the color some mobile browsers paint their toolbar) matches `--bg`: change it if you change `--bg`.
-
-Other variable groups in the same block:
-
-- Backgrounds: `--bg`, `--bg-2`, `--bg-3`; borders: `--line`; text: `--text`, `--muted`.
-- Danger: `--danger`, `--danger-text`, `--danger-border` (leave/delete, muted mic and camera, errors); `--hover` (button hover).
-- Warning (pill and toast): `--warn-bg`, `--warn-text`, `--warn-border`.
-- `--ok`: speaking indicator and mic level meter.
-- Subtitles: `--sub-text`, `--sub-outline`. These are also used by the compact picture-in-picture window.
-- Avatars: `--avatar-1` ... `--avatar-10` (each participant gets one by hashing their id), plus `--avatar-fallback` and `--on-color` (text on avatars and badges).
-- Radii: `--r-card` (cards, dialogs), `--r-btn` (buttons, toolbar, menus), `--r-control` (inputs, icon buttons, tabs), `--r-sm` (labels, menu items), `--radius`, `--tile-radius`; `--btn-weight` (button font weight).
-- Overlays and video: `--video-bg` (behind video), `--label-bg`, `--backdrop`, `--movie-overlay`, `--controls-scrim`, `--tooltip-bg`, `--round-bg`, `--meter-bg`, `--hover-overlay`, `--seek-track`, `--seek-buffered`, `--time-text`, `--shadow-color`.
-
-When running with Docker, rebuild the image after editing: `docker compose up -d --build`.
-
-## Development and tests
 
 ```bash
-npm ci
-ADMIN_PASSWORD=test npm start
+git pull
+docker compose up -d --build
 ```
 
-The tests drive real Chromium with Playwright and generate media with ffmpeg:
-
-```bash
-bash test/make-fixtures.sh
-```
-
-```bash
-node test/player-check.js test/fixtures/multi.mkv test/fixtures/multi.mp4
-```
-
-```bash
-node test/e2e.js
-```
-
-```bash
-node test/pip-check.js
-```
-
-```bash
-node test/drive-check.js
-```
-
-```bash
-node test/share-check.js
-```
-
-To run all of the browser checks in one go (it generates the fixtures if they are missing, starts a server for each script that needs one, and prints one PASS/FAIL line per script):
-
-```bash
-npx playwright install chromium   # once
-npm run test:browser              # or name some: npm run test:browser -- e2e lobby-check
-```
-
-It needs ffmpeg and Playwright's Chromium. Each script gets 5 minutes before it counts as failed. CI runs the same command in the `browser` job.
-
-`drive-check.js` starts its own server as a service account against a fake Google (`test/fake-google.js`): browsing a folder and its subfolders, streaming a movie through the remuxer and natively (without MSE), room sync while streaming, subtitles from the folder, a download quota error, two viewers sharing one fetch from Google, three viewers sharing a film (it counts the bytes our server sends, which should be about one copy; one viewer then freezes and leaves, and the others keep playing), a token refresh on reconnect, live changes to the room's folder, and a check that the browser never contacts Google. `share-check.js` tests a room without Drive: one person opens a file, a friend streams it from their copy, with sync, seeking and audio changes, and the Settings opt-out. `npm test` also runs unit tests for the sharing protocol (`test/swarm.test.mjs`). `player-check.js` tests the in-browser player on its own: native or remux mode, audio track switching, seeking and subtitles. `e2e.js` tests the whole flow: the admin creates a room, a wrong password is rejected, two people join with fake cameras, video flows peer to peer, mute and camera state and chat arrive on the other side, and the movie syncs. The movie part covers play, pause, seeking, audio and subtitle changes, a shared subtitle file, and a late joiner. Finally the admin deletes the room and everyone is disconnected. `pip-check.js` tests picture-in-picture: the Document PiP window (the movie box moves there, subtitles still render, controls inside it drive the other person, and closing it brings the player back), the native-PiP fallback (the subtitles are mirrored into a caption track, and a pause made directly on the `<video>` reaches the room), and the compact style (chosen in Settings: the canvas stream is in native PiP, the subtitles and video are drawn on the canvas, a pause on the PiP element reaches the room, and leaving PiP cleans up).
+Room data persists in the Docker volume across container rebuilds. Back up your volume regularly.
 
 ## License
 
