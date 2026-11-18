@@ -2,7 +2,6 @@
 
 Three-Eight is a Node.js application with the `ws` runtime dependency and Playwright-based browser tests. Node.js 18 or newer is required (the Docker image uses Node 22).
 
-
 ## Local development
 
 ```bash
@@ -21,7 +20,6 @@ npm test
 ```
 
 The browser checks use Playwright and Chromium. Install Chromium once:
-
 
 ```bash
 npx playwright install chromium
@@ -56,7 +54,11 @@ The browser suite requires ffmpeg and Playwright's Chromium. Each browser script
 | `test/pip-check.js` | Document PiP, native PiP fallback, compact PiP and room controls. |
 | `test/drive-check.js` | Drive integration against fake Google, streaming, caching, subtitles, quota handling and reconnects. |
 | `test/share-check.js` | Peer movie sharing, synchronization, seeking, audio changes and sharing opt-out. |
-| `test/swarm.test.mjs` | Unit tests for the movie-sharing protocol; included by `npm test`. |
+| `test/screen-check.js` | Screen sharing, a late joiner seeing the share, one sharer at a time, share/movie exclusion and stopping. |
+| `test/reconnect-check.js` | Peer links and chat recovering after a lost signaling connection or a server restart. |
+| `test/lobby-check.js` | Joining while the camera/microphone prompt is unanswered, with devices attaching later. |
+
+`npm test` runs the unit tests, including `test/swarm.test.mjs` for the movie-sharing protocol.
 
 Some checks can also be run directly:
 

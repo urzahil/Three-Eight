@@ -2,7 +2,6 @@
 
 A room can have one Google Drive folder attached to it. Three-Eight's server accesses Drive using a Google service account; room members do not connect to Google directly. Movies are streamed and cached in memory, not saved to the server's disk.
 
-
 ## Set up a Google service account
 
 1. In the [Google Cloud Console](https://console.cloud.google.com/), create a dedicated project. Do not attach a billing account for this integration.
@@ -11,11 +10,9 @@ A room can have one Google Drive folder attached to it. Three-Eight's server acc
 4. Open the service account, choose **Keys → Add key → Create new key → JSON**, and download the key. Treat this JSON as a secret.
 5. Configure the Three-Eight server to use the key.
 
-
 ## Docker Compose setup
 
-Save the downloaded file beside `docker-compose.yml` as `google-service-account.json`. Add a read-only mount to the app service's `volumes`:
-
+Save the downloaded file beside `docker-compose.yml` as `google-service-account.json`. In `docker-compose.yml`, uncomment the read-only mount already present under the app service's `volumes`:
 
 ```yaml
 volumes:
@@ -23,7 +20,6 @@ volumes:
 ```
 
 Set the following in `.env`:
-
 
 ```dotenv
 GOOGLE_SERVICE_ACCOUNT=/run/secrets/google-service-account.json
@@ -53,10 +49,12 @@ Each room is associated with its own Drive folder. The service account may have 
 ## Limits and troubleshooting
 
 - Folder listings support up to 5,000 items; large folders display a notice.
-- Per-room concurrent Drive streams are limited relative to `MAX_ROOM_SIZE`; requests waiting for a Google connection are also bounded.
-- Folder listings and folder membership checks are cached briefly. Use the reload control in the Drive picker to refresh a listing.
+- A room can have at most 3 × `MAX_ROOM_SIZE` Drive streams open at once, and at most 64 requests wait for a free connection to Google before the server answers "busy, try again shortly".
+- Folder listings are cached for 45 seconds in the browser and 60 seconds on the server, and folder membership checks for 60 seconds. Use the reload button (↻) next to **From Google Drive** to refresh a listing.
+- Browsers without Media Source Extensions (such as old iOS versions) play Drive movies straight from the server and do not take part in peer sharing, which costs the server a full copy for that viewer.
 - Google may enforce download quotas on some files. If a quota error appears, use a local copy until it clears.
-- If `GOOGLE_SERVICE_ACCOUNT` is set but the key cannot be read, the server logs the issue and disables Drive integration.
+- If `GOOGLE_SERVICE_ACCOUNT` is set but the key cannot be read, the server logs the issue and disables Drive integration; the admin dialog then reports that Drive is not configured.
+- The key must use Google's own token endpoint, as keys downloaded from Google Cloud do. Pointing Drive at other endpoints (`token_uri`, `GOOGLE_API_BASE`) is for the test suite only and requires `DRIVE_DEBUG=1`.
 
 ## Revoking access and security
 
