@@ -2,7 +2,6 @@
 
 Playback controls are synchronized for the room: play/pause, seeking, audio track and subtitle selection. Each browser corrects playback drift using shared state and timestamps.
 
-
 ## Choose a movie source
 
 Participants in the same room can use different sources:
@@ -13,20 +12,24 @@ Participants in the same room can use different sources:
 | Friend's file | A viewer streams from another participant's local copy | Movie data travels peer-to-peer using WebRTC; the source's upload and viewer connections still matter. |
 | Google Drive | The room's attached Drive folder is streamed by the server | Requires the administrator to configure Drive. See [Google Drive setup](google-drive.md). |
 
-Open the **Movie** dialog to select a local file or Drive movie. If someone else has a compatible source open, the player offers the option to stream from that participant or Drive. Viewers can switch sources during playback.
+Open the **Movie** dialog to select a local file (**Choose movie file…**) or a Drive movie (**From Google Drive**). When a movie is already playing, others are offered **Stream from *name*'s copy** (or **Stream from a friend's copy** when several people share), **Stream from Google Drive**, or **Use my own copy…**. Viewers can switch sources during playback; **Stop using my file** goes back to streaming.
 
 ## Peer-to-peer movie sharing
 
 Movie pieces can be exchanged between browsers using WebRTC data channels. Three-Eight compares file size, duration and a sampled SHA-256 content fingerprint (file size plus three 64 KiB samples) before using copies as sources. The fingerprint is a useful mismatch check, not a full-file integrity hash. There are no per-piece checksums, so use file sharing only among people you trust.
 
-Movie data is not stored on the Three-Eight server. In peer sharing, the source and other peers upload pieces directly to browsers. A source still needs enough upload bandwidth to send the movie's bitrate to the peer network. Streaming from a friend's copy requires Media Source Extensions (MSE); browsers without MSE may need to open their own file.
+Movie data is not stored on the Three-Eight server. In peer sharing, the source and other peers upload pieces directly to browsers. A source still needs enough upload bandwidth to send the movie's bitrate to the peer network. Streaming from a friend's copy requires Media Source Extensions (MSE); browsers without MSE may need to open their own file. Drive movies still play in such browsers, straight from the server.
+
+Sharing is automatic while you have the room's movie open from a file. To opt out, turn off **Settings → Share my movie file with the room**: friends are then not offered your copy, and your file is not read for them.
+
+If the person sharing leaves, friends keep watching what they have already received; parts nobody has loaded cannot be played, and a message explains why.
 
 ## Container and track support
 
 Three-Eight includes a browser-side remuxer for MKV/WebM and MP4/MOV/M4V. It repackages the video and selected audio into fragmented MP4 for playback through Media Source Extensions. It does not re-encode the movie. Simple local files with a single audio track can use native playback; streamed movies use the remuxer.
 
 Browser decoder support varies:
-- Video: H.264, VP9 and AV1 are broadly dependent on browser/device support; HEVC availability is browser and hardware dependent (notably Safari and some Chrome/Edge systems).
+- Video: H.264, VP9 and AV1 wherever the browser and device can decode them; HEVC only in Safari and in Chrome/Edge with hardware support.
 - Audio: AAC, Opus, FLAC and MP3 are commonly supported, but support depends on browser/device. AC-3/E-AC-3 support is limited (Safari is the supported case); DTS and TrueHD are not supported by the player.
 - Unsupported tracks are indicated in the audio menu where detected.
 
@@ -57,19 +60,19 @@ Media keys and supported system PiP controls use the Media Session API and contr
 
 | Key | Action |
 |---|---|
-| `Space` or `k` | Play / pause |
-| `←` / `→` | Seek backward / forward (default 10 seconds; configurable to 5, 10, 15, 30 or 60 seconds) |
+| `Space` or `k` | Play / pause \* |
+| `←` / `→` | Seek backward / forward \* (default 10 seconds; configurable in Settings to 5, 10, 15, 30 or 60 seconds) |
+| `p` | Toggle picture-in-picture \* |
 | `f` | Toggle fullscreen |
-| `p` | Toggle picture-in-picture |
 | `m` | Toggle microphone |
 | `v` | Toggle camera |
 | `s` | Toggle screen share where supported |
 | `c` | Toggle chat |
 
-Movie shortcuts are active when you have joined a movie. They are ignored while typing in text fields, while dialogs are open, or when Ctrl/Alt/Command is held. They also work in supported PiP windows.
+\* Movie shortcuts (`Space`, `k`, the arrows and `p`) are active only when you have joined the movie that is playing; `p` also needs a picture-in-picture style your browser supports. All shortcuts are ignored while typing in text fields, while dialogs are open, or when Ctrl/Alt/Command is held. They also work in supported PiP windows.
 
 ## Screen sharing
 
-Screen sharing is available in desktop browsers. The browser picker selects a screen, window or tab; audio is not shared. Only one person can share at a time. Screen sharing and movie playback are mutually exclusive: stop the share or close the movie before switching. Mobile browsers can view a share but cannot initiate it.
+Screen sharing is available in desktop browsers. The browser picker selects a screen, window or tab; audio is not shared. Only one person can share at a time. Screen sharing and movie playback are mutually exclusive: stop the share or close the movie before switching. Mobile browsers can view a share but cannot initiate it. Double-click a shared screen, or the movie, to show it full screen.
 
 On macOS, the browser may need Screen Recording permission in System Settings → Privacy & Security. Screen share is sent peer-to-peer to each participant, so upload bandwidth increases with room size.
