@@ -1075,7 +1075,7 @@ async function adminCookie(base) {
 }
 
 test('room password limit: a burst of wrong passwords cannot get past it, and open rooms cost nothing', async () => {
-  const s = await spawnServer({ TRUST_PROXY: '1', MAX_ROOM_SIZE: '100' });
+  const s = await spawnServer({ TRUST_PROXY: '1', MAX_ROOM_SIZE: '50' });
   const ck = await adminCookie(s.base);
   const post = (body) => fetch(s.base + '/api/admin/rooms', { method: 'POST', headers: { 'content-type': 'application/json', cookie: ck }, body: JSON.stringify(body) });
   assert.strictEqual((await post({ name: 'locked', password: 'right' })).status, 201);
@@ -1580,6 +1580,7 @@ test('config: an unusable setting stops the server with a message naming it', as
   for (const [env, re] of [
     [{ MAX_ROOM_SIZE: 'invalid' }, /MAX_ROOM_SIZE=invalid is not a whole number/],
     [{ MAX_ROOM_SIZE: '0' }, /MAX_ROOM_SIZE=0 is out of range/],
+    [{ MAX_ROOM_SIZE: '51' }, /MAX_ROOM_SIZE=51 is out of range \(expected 1 to 50\)/],
     [{ PORT: '70000' }, /PORT=70000 is out of range/],
     [{ TRUST_PROXY: 'on' }, /TRUST_PROXY=on is not valid/],
     [{ DRIVE_CACHE_MB: 'lots' }, /DRIVE_CACHE_MB=lots is not a number/],
@@ -1963,7 +1964,7 @@ async function nextMatching(ws, pred, ms = 15000) {
 }
 
 test('several members flooding one (each within its own budget): the flooders are cut off, the receiver stays', { timeout: 60000 }, async () => {
-  const s = await spawnServer({ MAX_ROOM_SIZE: '100' });
+  const s = await spawnServer({ MAX_ROOM_SIZE: '50' }); // the receiver, an honest member and 48 flooders: a full room
   const ck = await adminCookie(s.base);
   await fetch(s.base + '/api/admin/rooms', { method: 'POST', headers: { 'content-type': 'application/json', cookie: ck }, body: JSON.stringify({ name: 'stall-room' }) });
   const online = async () => (await (await fetch(s.base + '/api/admin/rooms', { headers: { cookie: ck } })).json()).rooms[0].online;
@@ -2014,8 +2015,9 @@ test('a member that stops reading is dropped by the heartbeat, and the others ar
 });
 
 test('the signal budget grows with MAX_ROOM_SIZE: a newcomer in a big room can send an offer to everyone', { timeout: 30000 }, async () => {
-  // About 10 KB (an offer with a shared screen) to each of 90 members, all at once. Signals to someone who is not in the
-  // room still count against the sender's budget, so the members do not have to exist here.
+  // About 15 KB (an offer with a shared screen, and its candidates) to each of the 49 others in a full room of 50, all at
+  // once. Signals to someone who is not in the room still count against the sender's budget, so the members do not
+  // have to exist here.
   const burst = async (maxRoomSize) => {
     const s = await spawnServer({ MAX_ROOM_SIZE: maxRoomSize });
     const ck = await adminCookie(s.base);
@@ -2024,15 +2026,15 @@ test('the signal budget grows with MAX_ROOM_SIZE: a newcomer in a big room can s
     ws.sendJson({ type: 'join', room: 'big-room', id: 'newcomer01', name: 'N' });
     assert.strictEqual((await ws.next()).type, 'welcome');
     const closed = new Promise((r) => ws.once('close', (code) => r(code)));
-    const offer = 'o'.repeat(10 * 1024);
-    for (let i = 0; i < 90; i++) ws.sendJson({ type: 'signal', to: `member${String(i).padStart(4, '0')}`, data: { sdp: offer } });
+    const offer = 'o'.repeat(15 * 1024);
+    for (let i = 0; i < 49; i++) ws.sendJson({ type: 'signal', to: `member${String(i).padStart(4, '0')}`, data: { sdp: offer } });
     ws.sendJson({ type: 'time', c: 1 });
     const answer = await Promise.race([nextMatching(ws, (m) => m.type === 'time', 5000), closed.then((code) => ({ type: 'closed', code }))]);
     ws.terminate();
     s.stop();
     return answer;
   };
-  assert.strictEqual((await burst('100')).type, 'time', 'MAX_ROOM_SIZE=100: still connected');
+  assert.strictEqual((await burst('50')).type, 'time', 'MAX_ROOM_SIZE=50: still connected');
   assert.deepStrictEqual(await burst('12'), { type: 'closed', code: 1008 }, 'MAX_ROOM_SIZE=12: that much is a flood');
 });
 

@@ -131,7 +131,7 @@ See [Google Drive integration](docs/google-drive.md) for the full Docker mount e
 | `DATA_DIR` | `./data` (Docker: `/data`) | Room storage location |
 | `TRUST_PROXY` | `false` (Compose: `true`) | Trust proxy headers; use only behind a trusted proxy |
 | `ALLOWED_ORIGINS` | — | Additional allowed WebSocket origins |
-| `MAX_ROOM_SIZE` | `12` | Room capacity (1–100); large rooms use more bandwidth |
+| `MAX_ROOM_SIZE` | `12` | Room capacity (1–50); large rooms use more bandwidth |
 | `STUN_URLS` | Built-in STUN servers | STUN server list |
 | `TURN_URLS` | — | Optional TURN server URLs for difficult network connections |
 | `TURN_SECRET` | — | TURN shared secret for coturn's secret-based authentication |

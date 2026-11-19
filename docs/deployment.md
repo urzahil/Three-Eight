@@ -120,7 +120,7 @@ With Docker Compose, `.env` is only used to fill in the values `docker-compose.y
 | `DATA_DIR` | `./data` locally; `/data` in Docker | Directory containing room data |
 | `TRUST_PROXY` | `false` locally; `true` in Compose | Trust proxy headers. `true`, `1`, or `yes` means one proxy; a number specifies the proxy count. |
 | `ALLOWED_ORIGINS` | — | Comma-separated additional WebSocket origins |
-| `MAX_ROOM_SIZE` | `12` | Maximum participants per room (1–100). Mesh calls become demanding above roughly 6–8 participants. |
+| `MAX_ROOM_SIZE` | `12` | Maximum participants per room (1–50). Mesh calls become demanding above roughly 6–8 participants. |
 | `STUN_URLS` | Google and Cloudflare STUN | Comma-separated STUN URLs |
 | `TURN_URLS` | — | Optional comma-separated TURN URLs |
 | `TURN_SECRET` | — | coturn shared secret for temporary credentials |

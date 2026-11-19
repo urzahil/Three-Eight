@@ -32,8 +32,9 @@ let PORT, MAX_ROOM_SIZE, TRUSTED_HOPS, DRIVE_CACHE_SETTING_MB, ADMIN_PASSWORD;
 try {
   ADMIN_PASSWORD = adminPassword(process.env);
   PORT = intSetting(process.env, 'PORT', 4567, 1, 65535);
-  // Each person sends video to everyone else, so the mesh gets heavy well before this upper bound.
-  MAX_ROOM_SIZE = intSetting(process.env, 'MAX_ROOM_SIZE', 12, 1, 100);
+  // Each person sends video to everyone else, so the mesh gets heavy well before this upper bound. The bound also keeps
+  // the relay limits below sound (see RELAY_FAIR_BYTES).
+  MAX_ROOM_SIZE = intSetting(process.env, 'MAX_ROOM_SIZE', 12, 1, 50);
   // Number of trusted reverse proxies in front of the server (0 = none, use the socket's address).
   // TRUST_PROXY=true/1/yes means one hop; a larger number (e.g. 2 for CDN + proxy) means that many.
   TRUSTED_HOPS = trustedHops(process.env);
@@ -1147,7 +1148,9 @@ const SIGNAL_BYTES_PER_SEC = 64 * 1024;
 // is past RELAY_BACKLOG, every member that sent it more than RELAY_FAIR_BYTES in the window is cut off, rather than the
 // receiver being dropped as stalled for what others sent it. An honest member sends one peer an offer and its
 // candidates (about 9 KB), a few times at most in a window. A receiver that really stopped reading is still dropped:
-// by the heartbeat, or by the MAX_WS_BUFFERED guard in send().
+// by the heartbeat, or by the MAX_WS_BUFFERED guard in send(). With at most 49 others in a room (MAX_ROOM_SIZE <= 50),
+// colluding members can add at most 49 x 48 KB past RELAY_BACKLOG in a window: about 3.4 MB in all, under the 4 MB at
+// which send() drops a receiver.
 const RELAY_WINDOW_MS = 10 * 1000;
 const RELAY_BACKLOG = 1024 * 1024;
 const RELAY_FAIR_BYTES = 48 * 1024;
