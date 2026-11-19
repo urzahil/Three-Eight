@@ -61,8 +61,8 @@ for (const entry of (process.env.ALLOWED_ORIGINS || '').split(',').map((o) => o.
 }
 const DRIVE_DEBUG = process.env.DRIVE_DEBUG === '1';
 // Test knobs, honoured only together with DRIVE_DEBUG=1: how old a member's Drive token may get before a new one is
-// pushed, and how often the housekeeping tick (which does that) runs. Production uses 10 h and 30 s.
-const TOKEN_REFRESH_MS = (DRIVE_DEBUG && parseInt(process.env.DRIVE_TOKEN_REFRESH_MS, 10)) || 10 * 3600 * 1000;
+// pushed, and how often the housekeeping tick (which does that) runs. Production uses 45 min (a token lives 1 h) and 30 s.
+const TOKEN_REFRESH_MS = (DRIVE_DEBUG && parseInt(process.env.DRIVE_TOKEN_REFRESH_MS, 10)) || 45 * 60 * 1000;
 const HEARTBEAT_MS = (DRIVE_DEBUG && parseInt(process.env.HEARTBEAT_MS, 10)) || 30000;
 const MAX_MESSAGE_BYTES = 64 * 1024;
 const MAX_WS_BUFFERED = 4 * 1024 * 1024; // bytes queued for one client before it counts as gone
@@ -122,14 +122,21 @@ const GOOGLE_API_BASE = 'https://www.googleapis.com';
 }
 
 // ---- Room tokens for the Drive endpoints -----------------------------------------
-// A token proves that its holder joined a room (it is only sent over the member's WebSocket, after the
-// password check: in the welcome message, and again before it expires or when the room's access changes). Format: base64url(JSON {r: room key, e: expiry ms, v: room version}) + '.' +
-// base64url(HMAC-SHA256 of the first part). The secret is random per process, so tokens do not
-// survive a restart (clients get a fresh one when they reconnect, and every TOKEN_REFRESH_MS while connected). The version is a hash of the
-// room's creation time, password hash and Drive folder: changing the password or the folder
-// invalidates every token issued before.
+// A token proves that its holder joined a room as a given member: each member gets its own, only over its WebSocket,
+// after the password check (in the welcome message, and again before it expires or when the room's access changes).
+// Format: base64url(JSON {r: room key, m: member id, i: issued ms, e: expiry ms, v: room version}) + '.' +
+// base64url(HMAC-SHA256 of the first part). The secret is random per process, so tokens do not survive a restart
+// (clients get a fresh one when they reconnect, and every TOKEN_REFRESH_MS while connected). The version is a hash of
+// the room's creation time, password hash and Drive folder: changing the password or the folder invalidates every
+// token issued before. Removing one member (admin page) invalidates the tokens issued to that member before the
+// removal (see revokeMember); if it joins again, its new token works.
 const TOKEN_SECRET = crypto.randomBytes(32);
-const TOKEN_TTL_MS = 12 * 3600 * 1000;
+// Short-lived, so that someone who left the room loses access soon; members get a new one every TOKEN_REFRESH_MS.
+const TOKEN_TTL_MS = 3600 * 1000;
+/** room key + '\0' + member id -> when the admin removed that member. Kept for TOKEN_TTL_MS (older tokens have expired). */
+const revokedMembers = new Map();
+
+const revocationKey = (roomKey, id) => `${roomKey}\0${id}`;
 
 function roomVersion(r) {
   return crypto.createHash('sha256').update(`${r.createdAt}\0${r.passwordHash || ''}\0${r.drive?.folderId || ''}`).digest('base64url').slice(0, 16);
@@ -139,12 +146,19 @@ function tokenSignature(body) {
   return crypto.createHmac('sha256', TOKEN_SECRET).update(body).digest('base64url');
 }
 
-function issueToken(r) {
-  const body = Buffer.from(JSON.stringify({ r: RoomStore.key(r.name), e: Date.now() + TOKEN_TTL_MS, v: roomVersion(r) })).toString('base64url');
+function issueToken(r, memberId) {
+  const now = Date.now();
+  const body = Buffer.from(JSON.stringify({ r: RoomStore.key(r.name), m: memberId, i: now, e: now + TOKEN_TTL_MS, v: roomVersion(r) })).toString('base64url');
   return `${body}.${tokenSignature(body)}`;
 }
 
-/** The room a valid token belongs to and the time it expires, or null. */
+/** Was this token issued to a member before the admin removed it? */
+function revoked(claim) {
+  const at = revokedMembers.get(revocationKey(claim.r, claim.m));
+  return at !== undefined && claim.i <= at;
+}
+
+/** A valid token's room, expiry and claims ({ room, exp, claim }), or null. */
 function checkToken(token) {
   if (typeof token !== 'string' || token.length > 600) return null;
   const dot = token.indexOf('.');
@@ -159,15 +173,17 @@ function checkToken(token) {
   } catch {
     return null;
   }
-  if (!claim || typeof claim.r !== 'string' || typeof claim.e !== 'number' || claim.e < Date.now()) return null;
+  if (!claim || typeof claim.r !== 'string' || typeof claim.m !== 'string' || typeof claim.i !== 'number'
+    || typeof claim.e !== 'number' || claim.e < Date.now() || revoked(claim)) return null;
   const room = store.get(claim.r);
   if (!room || !room.drive || claim.v !== roomVersion(room)) return null;
-  return { room, exp: claim.e };
+  return { room, exp: claim.e, claim };
 }
 
-/** The room a valid token belongs to, or null. */
-function verifyToken(token) {
-  return checkToken(token)?.room ?? null;
+/** Does a token checkToken() accepted still hold (room unchanged, member not removed)? For after an await. */
+function stillValid(checked) {
+  const now = store.get(checked.room.name);
+  return !!now && roomVersion(now) === roomVersion(checked.room) && !revoked(checked.claim);
 }
 
 // ---- ICE (STUN/TURN) configuration ---------------------------------------
@@ -584,35 +600,43 @@ function roomMembers(name) {
 // What room members need to browse the room's Google Drive folder: a token for our endpoints and the
 // folder's ID. null when the room has no folder or the server has no service account. In a room without a password
 // that is anyone who knows the room's name: the admin page warns about it.
-function driveInfo(r) {
+function driveInfo(r, memberId) {
   if (!r || !r.drive || !driveApi) return null;
-  return { token: issueToken(r), folder: r.drive.folderId };
+  return { token: issueToken(r, memberId), folder: r.drive.folderId };
 }
 
 function pushDrive(name) {
   const members = roomMembers(name);
   if (!members) return;
-  const info = driveInfo(store.get(name));
-  for (const m of members.values()) {
-    send(m.ws, { type: 'drive', drive: info });
+  const room = store.get(name);
+  for (const [id, m] of members) {
+    send(m.ws, { type: 'drive', drive: driveInfo(room, id) });
     m.driveAt = Date.now();
   }
 }
 
-/** Hand a fresh token to the members whose last one is older than TOKEN_REFRESH_MS (a token lives 12 h). */
+/** Hand a fresh token to the members whose last one is older than TOKEN_REFRESH_MS (a token lives TOKEN_TTL_MS). */
 function refreshDriveTokens() {
   if (!driveApi) return;
   const now = Date.now();
   for (const [key, members] of live) {
-    let info; // one token per room and tick
-    for (const m of members.values()) {
+    let room; // looked up once per room and tick
+    for (const [id, m] of members) {
       if (now - m.driveAt < TOKEN_REFRESH_MS) continue;
-      info ??= driveInfo(store.get(key));
+      room ??= store.get(key) || null;
+      const info = driveInfo(room, id);
       if (!info) break; // no folder (any more): nothing to refresh
       send(m.ws, { type: 'drive', drive: info });
       m.driveAt = now;
     }
   }
+}
+
+/** The admin removed a member: the tokens issued to it until now stop working, and its open Drive file responses are cut. */
+function revokeMember(roomKey, id) {
+  revokedMembers.set(revocationKey(roomKey, id), Date.now());
+  const set = driveStreams.get(roomKey);
+  if (set) for (const entry of [...set]) if (entry.member === id) entry.abort();
 }
 
 function kickRoom(name, code, message) {
@@ -627,10 +651,11 @@ function kickRoom(name, code, message) {
 }
 
 // ---- Google Drive endpoints --------------------------------------------------------
-// Open Drive file responses per room (roomKey -> Set of { version, abort }). A token is checked once, before a
+// Open Drive file responses per room (roomKey -> Set of { version, member, abort }). A token is checked once, before a
 // response starts; when the room's access changes (deleted, password, folder) the responses still streaming under the
-// old version are cut, so a client that asked for a whole film in one request cannot keep downloading it.
-/** @type {Map<string, Set<{version: string, abort: () => void}>>} */
+// old version are cut, and so are a member's when the admin removes it, so a client that asked for a whole film in
+// one request cannot keep downloading it.
+/** @type {Map<string, Set<{version: string, member: string, abort: () => void}>>} */
 const driveStreams = new Map();
 
 // At most this many file responses are open per room at once (a viewer has a few in flight; members x 3 is generous).
@@ -638,19 +663,19 @@ const driveStreams = new Map();
 const MAX_DRIVE_STREAMS_PER_ROOM = 3 * MAX_ROOM_SIZE;
 
 /**
- * Register a streaming response of `room` (the room object its token was verified against). Returns the function that
- * unregisters it, null when the room is gone or changed since the token was checked (nothing is registered then), or
- * 'busy' when the room already has too many open file responses.
+ * Register a streaming response under a token checkToken() accepted. Returns the function that unregisters it, null
+ * when the token no longer holds (room gone or changed, member removed: nothing is registered then), or 'busy' when
+ * the room already has too many open file responses.
  */
-function trackDriveStream(room, abort) {
-  const now = store.get(room.name);
+function trackDriveStream(checked, abort) {
+  if (!stillValid(checked)) return null;
+  const { room } = checked;
   const version = roomVersion(room);
-  if (!now || roomVersion(now) !== version) return null;
   const key = RoomStore.key(room.name);
   let set = driveStreams.get(key);
   if ((set?.size || 0) >= MAX_DRIVE_STREAMS_PER_ROOM) return 'busy';
   if (!set) driveStreams.set(key, (set = new Set()));
-  const entry = { version, abort };
+  const entry = { version, member: checked.claim.m, abort };
   set.add(entry);
   return () => {
     set.delete(entry);
@@ -727,7 +752,7 @@ function driveCookie(req, roomKey) {
 
 // POST   /api/rooms/:room/drive/session   Authorization: Bearer <room token>  ->  204 + the room's token cookie
 // DELETE /api/rooms/:room/drive/session   (no authentication)                 ->  204 + the cookie cleared
-// The cookie outlives the page (up to the token's 12 h), so a member who leaves clears it: on a shared computer the next
+// The cookie outlives the page (up to the token's hour), so a member who leaves clears it: on a shared computer the next
 // user must not inherit it. Clearing needs no token (it only removes the caller's own cookie), works for rooms that no
 // longer exist and does not depend on Drive being set up.
 function handleDriveSession(req, res, parts) {
@@ -765,7 +790,8 @@ async function handleDrive(req, res, url, parts) {
   if (!driveApi) return sendJson(res, 503, { error: 'Google Drive is not set up on this server.' }, DRIVE_HEADERS);
 
   const bearer = /^Bearer\s+(\S+)$/i.exec(String(req.headers.authorization || ''));
-  const room = verifyToken(bearer ? bearer[1] : driveCookie(req, RoomStore.key(parts[2])));
+  const checked = checkToken(bearer ? bearer[1] : driveCookie(req, RoomStore.key(parts[2])));
+  const room = checked?.room;
   if (!room || RoomStore.key(parts[2]) !== RoomStore.key(room.name)) {
     return sendJson(res, 401, { error: 'Your Drive session is missing or has expired. Rejoin the room.' }, DRIVE_HEADERS);
   }
@@ -777,24 +803,25 @@ async function handleDrive(req, res, url, parts) {
   try {
     // Only the room's folder and what is below it: the service account may be able to read much more.
     if (!(await driveApi.inTree(root, id))) return sendJson(res, 404, { error: 'Not found in this room\'s folder.' }, DRIVE_HEADERS);
-    // The room may have changed (password, folder, deleted) while Drive was asked: the token only counts for the room it was issued for.
+    // The room may have changed (password, folder, deleted), or its member been removed, while Drive was asked: the
+    // token only counts for the room and member it was issued to.
     if (res.destroyed) return; // the client went away while Drive was asked: nothing to do
-    const now = store.get(room.name);
-    if (!now || roomVersion(now) !== roomVersion(room)) return sendJson(res, 401, { error: 'Your Drive session is missing or has expired. Rejoin the room.' }, DRIVE_HEADERS);
+    if (!stillValid(checked)) return sendJson(res, 401, { error: 'Your Drive session is missing or has expired. Rejoin the room.' }, DRIVE_HEADERS);
     if (!isFiles) {
       const [info, { items, truncated }] = await Promise.all([driveApi.folderInfo(id), driveApi.listing(id)]);
+      if (!stillValid(checked)) return sendJson(res, 401, { error: 'Your Drive session is missing or has expired. Rejoin the room.' }, DRIVE_HEADERS);
       if (info.mimeType !== FOLDER) return sendJson(res, 404, { error: 'That is not a folder.' }, DRIVE_HEADERS);
       driveApi.markInTree(root, items.map((f) => f.id));
       // `truncated`: the folder is larger than the server lists (the rest is not shown).
       return sendJson(res, 200, { id, name: info.name, items, ...(truncated && { truncated: true }) }, DRIVE_HEADERS);
     }
-    await serveFile(req, res, id, room);
+    await serveFile(req, res, id, checked);
   } catch (err) {
     driveFail(res, err);
   }
 }
 
-async function serveFile(req, res, id, room) {
+async function serveFile(req, res, id, checked) {
   const meta = await driveApi.fileMeta(id);
   const kind = kindOf(meta);
   if (meta.trashed || (kind !== 'video' && kind !== 'subtitle') || !Number.isSafeInteger(meta.size) || meta.size < 0) {
@@ -827,7 +854,7 @@ async function serveFile(req, res, id, room) {
   // Stop upstream work when the client goes away.
   const ctrl = new AbortController();
   // Registered once streaming is about to start; fileMeta above was awaited, so the room may have changed since handleDrive checked the token.
-  const untrack = trackDriveStream(room, () => {
+  const untrack = trackDriveStream(checked, () => {
     ctrl.abort();
     res.destroy(); // the client sees the connection cut, not a clean end
   });
@@ -991,6 +1018,7 @@ async function handleApi(req, res, url) {
       const entry = roomMembers(name)?.get(parts[5]);
       if (!entry) return sendJson(res, 404, { error: 'That person is not in the room (any more).' });
       const { ws } = entry;
+      revokeMember(RoomStore.key(name), parts[5]); // its Drive token and downloads stop working first
       send(ws, { type: 'error', code: 'kicked', message: 'The administrator removed you from the room.' });
       leave(ws); // the others get peer-left now, not when the socket has closed
       ws.close(4001, 'kicked');
@@ -1313,7 +1341,7 @@ async function handleJoin(ws, msg) {
   try {
     // resumed: this join took over the live entry of the same participant (a reconnect).
     const welcome = { type: 'welcome', id, room: room.name, peers, resumed: !!existing, iceServers: iceServers() };
-    const drive = driveInfo(room);
+    const drive = driveInfo(room, id);
     if (drive) {
       welcome.drive = drive;
       member.driveAt = Date.now();
@@ -1535,6 +1563,7 @@ const heartbeat = setInterval(() => {
   lookupLimiter.sweep();
   const now = Date.now();
   for (const [t, exp] of adminSessions) if (exp < now) adminSessions.delete(t);
+  for (const [k, at] of revokedMembers) if (now - at > TOKEN_TTL_MS) revokedMembers.delete(k); // older tokens have expired
   refreshDriveTokens();
   refreshIce();
 }, HEARTBEAT_MS);

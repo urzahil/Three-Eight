@@ -110,11 +110,11 @@ async function refresh() {
   $('empty').hidden = data.rooms.length > 0;
 }
 
-/** Disconnect one person from a room. It does not keep them out: the password (or, for an open room, the link) still works. */
+/** Disconnect one person from a room and end their Drive access. It does not keep them out: the password (or, for an open room, the link) still works. */
 async function removeMember(room, m) {
   const after = room.hasPassword
-    ? 'They can join again with the room password. To keep them out, change the password (that also ends their access to the room\'s Google Drive folder).'
-    : 'This room has no password, so they can join again with its link. Give the room a password to keep them out.';
+    ? 'Their access to the room\'s Google Drive folder ends now too. They can join again with the room password: to keep them out, change it.'
+    : 'Their access to the room\'s Google Drive folder ends now too. This room has no password, so they can join again with its link: give the room a password to keep them out.';
   if (!confirm(`Remove “${m.name}” from “${room.name}”?\n\n${after}`)) return;
   try {
     await api('DELETE', `/rooms/${encodeURIComponent(room.name)}/members/${encodeURIComponent(m.id)}`, {});

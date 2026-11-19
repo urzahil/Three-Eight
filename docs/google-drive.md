@@ -43,7 +43,8 @@ Each room is associated with its own Drive folder. The service account may have 
 
 - The server reads the folder and streams requested movie ranges to participants.
 - Browser clients request Drive data from Three-Eight; they do not call Google Drive themselves.
-- Room-scoped tokens are sent in authorization headers. For native video playback, the browser exchanges the token for a restricted cookie because a video element cannot add authorization headers.
+- Each member gets its own token for the room's folder, sent in authorization headers. For native video playback, the browser exchanges the token for a restricted cookie because a video element cannot add authorization headers.
+- A token is valid for one hour and renewed while the member stays in the room, so someone who leaves loses access within the hour. Removing someone in `/admin` ends their access at once, including downloads in progress; changing the room password ends everyone's (members still in the room get a new token).
 - Movies are not persisted on the server's disk. Stream data may be cached in memory for performance.
 - The integration uses a short-lived in-memory cache controlled by `DRIVE_CACHE_MB` (default 256 MB; values below 32 MB are raised to the minimum).
 

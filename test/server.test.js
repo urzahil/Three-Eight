@@ -312,9 +312,11 @@ test('drive: the welcome message carries { token, folder } after the password ch
   const [body, sig] = tokA.split('.');
   assert(/^[A-Za-z0-9_-]+$/.test(body) && /^[A-Za-z0-9_-]{43}$/.test(sig), 'base64url(payload).base64url(HMAC-SHA256)');
   const claims = JSON.parse(Buffer.from(body, 'base64url'));
-  assert.deepStrictEqual(Object.keys(claims).sort(), ['e', 'r', 'v']);
+  assert.deepStrictEqual(Object.keys(claims).sort(), ['e', 'i', 'm', 'r', 'v']);
   assert.strictEqual(claims.r, 'drive-a');
-  assert(Math.abs(claims.e - (Date.now() + 12 * 3600 * 1000)) < 60000, 'expires in 12 hours');
+  assert.strictEqual(claims.m, 'eeeeeeee2', 'issued to this member');
+  assert(Math.abs(claims.e - (Date.now() + 3600 * 1000)) < 60000, 'expires in 1 hour');
+  assert(Math.abs(claims.i - Date.now()) < 60000);
 
   const b = await join('drive-b', 'pb', 'eeeeeeee3', 'Bob');
   tokB = b.welcome.drive.token;
@@ -374,7 +376,7 @@ test('drive: POST .../drive/session sets a per-room, HttpOnly, SameSite=Strict c
   assert.match(set, /; SameSite=Strict/);
   assert.doesNotMatch(set, /Secure/, 'plain http');
   const maxAge = Number(/Max-Age=(\d+)/.exec(set)[1]);
-  assert(maxAge > 11.9 * 3600 && maxAge <= 12 * 3600, `Max-Age ${maxAge}`);
+  assert(maxAge > 0.9 * 3600 && maxAge <= 3600, `Max-Age ${maxAge}`); // the token lives 1 h
   assert.strictEqual(res.headers.get('cache-control'), 'private, no-store');
   // The room's name in another case: the same room, the same cookie.
   assert.strictEqual(cookiePair(await api('/api/rooms/Drive-A/drive/session', tokA, { method: 'POST' })), cookiePair(res));
@@ -1951,6 +1953,17 @@ test('admin logout behind a TLS proxy clears a Secure cookie and ends the sessio
   s.stop();
 });
 
+/** What `read()` resolves to once it deep-equals `want`, or its last value after `ms` (a client sees its socket close a
+ * moment before the server has processed it, so lists of members lag behind by a few milliseconds). */
+async function settled(read, want, ms = 5000) {
+  const deadline = Date.now() + ms;
+  for (;;) {
+    const got = await read();
+    if (JSON.stringify(got) === JSON.stringify(want) || Date.now() > deadline) return got;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+}
+
 /** The next message `pred` accepts (others are skipped); { type: 'timeout' } after `ms`. */
 async function nextMatching(ws, pred, ms = 15000) {
   const deadline = Date.now() + ms;
@@ -1987,7 +2000,8 @@ test('several members flooding one (each within its own budget): the flooders ar
   const codes = await Promise.race([Promise.all(closes), new Promise((r) => setTimeout(() => r(null), 20000))]);
   assert(codes, 'every flooder was cut off');
   assert(codes.every((c) => c === 1008), JSON.stringify(codes));
-  assert.deepStrictEqual((await online()).sort(), ['honestpeer1', 'stallpeerA1'], 'the receiver and the honest member are still in the room');
+  const stayed = ['honestpeer1', 'stallpeerA1'];
+  assert.deepStrictEqual(await settled(async () => (await online()).sort(), stayed), stayed, 'the receiver and the honest member are still in the room');
   honest.sendJson({ type: 'signal', to: 'stallpeerA1', data: { sdp: 'another honest offer' } });
   honest.sendJson({ type: 'time', c: 1 });
   assert.strictEqual((await nextMatching(honest, (m) => m.type === 'time')).c, 1, 'the honest member is still connected');
@@ -2062,7 +2076,7 @@ test('signals: one member cannot flood another off the server; oversized signals
   const big = 'x'.repeat(30 * 1024);
   for (let i = 0; i < 300; i++) attacker.sendJson({ type: 'signal', to: 'floodvict1', data: { sdp: big } });
   assert.strictEqual(await closed, 1008, 'the flooding sender is closed as rate limited');
-  assert.deepStrictEqual(await online(), ['Victim'], 'the victim is still in the room');
+  assert.deepStrictEqual(await settled(online, ['Victim']), ['Victim'], 'the victim is still in the room');
   victim._socket.resume();
   victim.terminate();
   s.stop();
@@ -2270,4 +2284,58 @@ test('admin: one member can be removed; the others stay and are told, and the ro
   assert.strictEqual(again.welcome.type, 'welcome');
   for (const c of [alice, again]) c.ws.close();
   assert.strictEqual((await json('DELETE', '/api/admin/rooms/kick-room', {})).status, 200);
+});
+
+test('drive: removing a member ends its Drive access at once (token, cookie, open download); the others keep theirs', { timeout: 60000 }, async () => {
+  const F = 'REVOKE_FOLDER_0001', BIG = 'REVOKE_BIG_FILE_01';
+  google.addFolder(F, 'Revoke folder');
+  google.addFile(BIG, 'big.mp4', F, bytes(48 * MiB), 'video/mp4');
+  const s = await spawnServer({ GOOGLE_SERVICE_ACCOUNT: google.writeAccount(keyDir), GOOGLE_API_BASE: google.url, DRIVE_DEBUG: '1' });
+  const ck = await adminCookie(s.base);
+  const admin = (method, p, body) => fetch(s.base + p, { method, headers: { 'content-type': 'application/json', cookie: ck }, body: body && JSON.stringify(body) });
+  assert.strictEqual((await admin('POST', '/api/admin/rooms', { name: 'revoke', password: 'rp' })).status, 201);
+  assert.strictEqual((await admin('PUT', '/api/admin/rooms/revoke/drive', { link: F })).status, 200);
+  const member = async (id) => {
+    const ws = await wsAt(s.base);
+    ws.sendJson({ type: 'join', room: 'revoke', id, name: id, password: 'rp', secret: secretOf(id) });
+    const welcome = await nextMatching(ws, (m) => m.type === 'welcome');
+    return { ws, token: welcome.drive.token };
+  };
+  const status = (token, headers = {}) => fetch(`${s.base}/api/rooms/revoke/drive/folders/root`, { headers: { ...(token && { Authorization: `Bearer ${token}` }), ...headers } }).then((r) => r.status);
+  const streams = async () => (await (await fetch(`${s.base}/api/debug/drive-streams`)).json()).streams;
+
+  const alice = await member('revokealic1');
+  const mallory = await member('revokemall1');
+  assert.notStrictEqual(alice.token, mallory.token, 'every member has its own token');
+  // Mallory's native-playback cookie, and a whole-film download she does not read, so it stays open.
+  const session = await fetch(`${s.base}/api/rooms/revoke/drive/session`, { method: 'POST', headers: { Authorization: `Bearer ${mallory.token}` } });
+  const cookie = session.headers.get('set-cookie').split(';')[0];
+  assert.strictEqual(await status(null, { cookie }), 200);
+  const download = await new Promise((resolve, reject) => {
+    const req = http.get(`${s.base}/api/rooms/revoke/drive/files/${BIG}`, { headers: { Authorization: `Bearer ${mallory.token}` } }, (res) => {
+      res.pause();
+      resolve({ req, res });
+    });
+    req.on('error', reject);
+  });
+  download.req.on('error', () => {}); // the server cuts it below
+  download.res.on('error', () => {});
+  assert.strictEqual(download.res.statusCode, 200);
+  assert.strictEqual(await streams(), 1);
+
+  assert.strictEqual((await admin('DELETE', '/api/admin/rooms/revoke/members/revokemall1', {})).status, 200);
+  for (let i = 0; i < 50 && (await streams()) > 0; i++) await new Promise((r) => setTimeout(r, 50));
+  assert.strictEqual(await streams(), 0, 'her download was cut');
+  assert.strictEqual(await status(mallory.token), 401, 'her token');
+  assert.strictEqual(await status(null, { cookie }), 401, 'her cookie');
+  assert.strictEqual((await fetch(`${s.base}/api/rooms/revoke/drive/session`, { method: 'POST', headers: { Authorization: `Bearer ${mallory.token}` } })).status, 401, 'no new cookie from it');
+  assert.strictEqual(await status(alice.token), 200, 'Alice keeps hers');
+
+  // Removing does not keep anyone out: joining again with the password gives a new token that works; the old one stays void.
+  const back = await member('revokemall1');
+  assert.strictEqual(await status(back.token), 200);
+  assert.strictEqual(await status(mallory.token), 401);
+  download.req.destroy();
+  for (const ws of [alice.ws, back.ws]) ws.close();
+  s.stop();
 });
