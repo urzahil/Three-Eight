@@ -36,4 +36,32 @@ function driveCacheMb(env, def) {
   return mb;
 }
 
-module.exports = { ConfigError, intSetting, trustedHops, driveCacheMb };
+const MIN_ADMIN_PASSWORD = 12;
+// Example values from .env.example and the documentation: a copy that was never edited must not become the password.
+const EXAMPLE_PASSWORDS = new Set([
+  'change-me-to-something-long',
+  'change-me',
+  'replace-with-a-long-random-password',
+  'replace-with-a-strong-password',
+]);
+
+/**
+ * The admin password: '' when ADMIN_PASSWORD is unset or empty (the caller then generates one). A password that is
+ * still an example value from the documentation, or shorter than MIN_ADMIN_PASSWORD characters, stops the server: the
+ * admin page is on the internet, guarded only by this password and a per-address attempt limit. The message never
+ * contains the value.
+ */
+function adminPassword(env) {
+  const raw = String(env.ADMIN_PASSWORD ?? '');
+  if (raw === '') return '';
+  if (!raw.trim()) throw new ConfigError('ADMIN_PASSWORD contains only spaces. Set a real password (at least 12 characters).');
+  if (EXAMPLE_PASSWORDS.has(raw.trim().toLowerCase())) {
+    throw new ConfigError('ADMIN_PASSWORD is still the example value from the documentation. Set a password of your own (at least 12 characters).');
+  }
+  if (raw.length < MIN_ADMIN_PASSWORD) {
+    throw new ConfigError(`ADMIN_PASSWORD is too short (${raw.length} characters). Use at least ${MIN_ADMIN_PASSWORD}.`);
+  }
+  return raw;
+}
+
+module.exports = { ConfigError, intSetting, trustedHops, driveCacheMb, adminPassword, MIN_ADMIN_PASSWORD };

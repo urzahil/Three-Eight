@@ -33,8 +33,9 @@ Do not commit the key. Keep it outside public folders and backups that are share
 
 1. In Google Drive, share each room's folder with the service account email address (ending in `iam.gserviceaccount.com`) as **Viewer**. The folder does not need to be public.
 2. Open Three-Eight's `/admin` page and sign in.
-3. Click **Drive…** beside the room and paste the folder URL. The dialog displays the service account email for sharing.
-4. Save. Three-Eight checks that the account can access the folder and reports the result.
+3. Make sure the room has a password. A Drive folder can only be attached to a room with a password: in an open room, anyone who knows or guesses the room's name could stream the whole folder. For the same reason, a room's password can't be removed while it has a folder.
+4. Click **Drive…** beside the room and paste the folder URL. The dialog displays the service account email for sharing.
+5. Save. Three-Eight checks that the account can access the folder and reports the result.
 
 Each room is associated with its own Drive folder. The service account may have access to other folders, but Three-Eight serves only the folder attached to the room and its subfolders.
 
@@ -53,6 +54,7 @@ Each room is associated with its own Drive folder. The service account may have 
 - Folder listings are cached for 45 seconds in the browser and 60 seconds on the server, and folder membership checks for 60 seconds. Use the reload button (↻) next to **From Google Drive** to refresh a listing.
 - Browsers without Media Source Extensions (such as old iOS versions) play Drive movies straight from the server and do not take part in peer sharing, which costs the server a full copy for that viewer.
 - Google may enforce download quotas on some files. If a quota error appears, use a local copy until it clears.
+- A room without a password that has a folder from an older version is shown as "off" in `/admin`: its members don't get the folder until the room has a password.
 - If `GOOGLE_SERVICE_ACCOUNT` is set but the key cannot be read, the server logs the issue and disables Drive integration; the admin dialog then reports that Drive is not configured.
 - The key must use Google's own token endpoint, as keys downloaded from Google Cloud do. Pointing Drive at other endpoints (`token_uri`, `GOOGLE_API_BASE`) is for the test suite only and requires `DRIVE_DEBUG=1`.
 

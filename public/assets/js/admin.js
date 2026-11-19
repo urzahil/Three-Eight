@@ -56,6 +56,11 @@ async function refresh() {
     const tdDrive = document.createElement('td');
     tdDrive.textContent = r.drive ? (driveNames.get(r.name + '|' + r.drive.folderId) || 'linked') : '—';
     if (!r.drive) tdDrive.className = 'muted';
+    else if (!r.hasPassword) {
+      // Saved before the server required a password for it: members do not get the folder until the room has one.
+      tdDrive.textContent += ' (off: the room needs a password)';
+      tdDrive.className = 'error';
+    }
     const tdOnline = document.createElement('td');
     tdOnline.textContent = r.online.length ? r.online.join(', ') : '—';
     if (!r.online.length) tdOnline.className = 'muted';
@@ -68,8 +73,8 @@ async function refresh() {
         prompt('Room link', roomUrl(r.name));
       }
     });
-    const pw = button('Password…', () => changePassword(r.name));
-    const drv = button('Drive…', () => changeDrive(r.name, r.drive));
+    const pw = button('Password…', () => changePassword(r.name, !!r.drive));
+    const drv = button('Drive…', () => changeDrive(r.name, r.drive, r.hasPassword));
     const del = button('Delete', async () => {
       if (!confirm(`Delete room “${r.name}”? Anyone inside will be disconnected.`)) return;
       try {
@@ -97,10 +102,12 @@ function button(label, onClick) {
   return b;
 }
 
-function changePassword(name) {
+function changePassword(name, hasDrive) {
   const d = $('pw-dialog');
   $('pw-room').textContent = name;
   $('pw-new').value = '';
+  $('pw-new').required = hasDrive; // the server refuses to remove the password of a room with a Drive folder
+  $('pw-drive').hidden = !hasDrive;
   $('pw-kick').checked = false;
   d.returnValue = 'cancel';
   d.showModal();
@@ -116,8 +123,9 @@ function changePassword(name) {
   }, { once: true });
 }
 
-function changeDrive(name, current) {
+function changeDrive(name, current, hasPassword) {
   const d = $('drive-dialog');
+  $('drive-nopw').hidden = hasPassword;
   $('drive-room').textContent = name;
   $('drive-link').value = current ? driveLink(current) : '';
   $('drive-share').hidden = !serviceAccount;

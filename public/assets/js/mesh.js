@@ -721,6 +721,21 @@ export class Mesh extends EventTarget {
     this._applyBitrates();
   }
 
+  /**
+   * New ICE servers (renewed TURN credentials): new links use them, and existing ones for their next ICE restart
+   * (a TURN allocation made with expired credentials cannot be renewed).
+   */
+  setIceServers(iceServers) {
+    this.iceServers = iceServers;
+    for (const p of this.peers.values()) {
+      try {
+        p.pc.setConfiguration({ iceServers, bundlePolicy: 'max-bundle' }); // as the link was created (see Peer)
+      } catch {
+        /* closed, or the browser refuses the change: the link keeps its servers */
+      }
+    }
+  }
+
   setLowPower(v) {
     this.lowPower = v;
     this._applyBitrates();

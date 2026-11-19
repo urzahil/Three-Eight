@@ -12,7 +12,7 @@ const assert = require('assert');
 const { startFakeGoogle } = require('./fake-google');
 
 const FIX = path.resolve(__dirname, 'fixtures');
-const ADMIN = 'test';
+const ADMIN = 'test-admin-password';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const stamp = Date.now().toString(36);
 const ROOM = 'drive-' + stamp;

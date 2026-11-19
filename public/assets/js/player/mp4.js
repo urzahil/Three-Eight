@@ -5,6 +5,15 @@ import { audioSampleEntry, box } from './fmp4.js';
 import { avcCodecString, hevcCodecString, av1CodecString, vp9CodecString, aacCodecString } from './codecs.js';
 
 const td = new TextDecoder();
+// Sample tables allocate several arrays per sample (about 30 bytes each). The counts come from the file, which may be
+// damaged or crafted by whoever shares it: a count the box cannot hold, or more samples than any real track has
+// (18 h at 60 frames per second), makes the track unusable instead of exhausting memory.
+const MAX_SAMPLES = 4_000_000;
+/** A count read from a table box, checked against the entries that box can hold and the sample cap. */
+function checkedCount(n, dv, headerBytes, entryBytes, what) {
+  if (n > MAX_SAMPLES || n * entryBytes > Math.max(0, dv.byteLength - headerBytes)) throw new Error(`${what}: impossible entry count ${n}`);
+  return n;
+}
 const fourcc = (b, o) => String.fromCharCode(b[o], b[o + 1], b[o + 2], b[o + 3]);
 
 function* boxes(b, start, end) {
@@ -260,6 +269,10 @@ export class Mp4Demuxer {
       const dv = dvAt(stsz);
       const fixed = dv.getUint32(4);
       const n = dv.getUint32(8);
+      if (fixed) {
+        // No table holds the entries, but every sample still takes `fixed` bytes of the file.
+        if (n > MAX_SAMPLES || n * fixed > this.file.size) throw new Error(`stsz: impossible sample count ${n}`);
+      } else checkedCount(n, dv, 12, 4, 'stsz');
       sizes = new Uint32Array(n);
       if (fixed) sizes.fill(fixed);
       else for (let i = 0; i < n; i++) sizes[i] = dv.getUint32(12 + i * 4);
@@ -267,6 +280,8 @@ export class Mp4Demuxer {
       const dv = dvAt(stz2);
       const fs = dv.getUint8(7);
       const n = dv.getUint32(8);
+      if (fs !== 4 && fs !== 8 && fs !== 16) throw new Error(`stz2: field size ${fs}`);
+      checkedCount(n, dv, 12, fs / 8, 'stz2');
       sizes = new Uint32Array(n);
       for (let i = 0; i < n; i++) {
         if (fs === 16) sizes[i] = dv.getUint16(12 + i * 2);
@@ -284,12 +299,12 @@ export class Mp4Demuxer {
     const co64 = get('co64');
     if (stco) {
       const dv = dvAt(stco);
-      const c = dv.getUint32(4);
+      const c = checkedCount(dv.getUint32(4), dv, 8, 4, 'stco');
       chunkOffsets = new Float64Array(c);
       for (let i = 0; i < c; i++) chunkOffsets[i] = dv.getUint32(8 + i * 4);
     } else if (co64) {
       const dv = dvAt(co64);
-      const c = dv.getUint32(4);
+      const c = checkedCount(dv.getUint32(4), dv, 8, 8, 'co64');
       chunkOffsets = new Float64Array(c);
       for (let i = 0; i < c; i++) chunkOffsets[i] = dv.getUint32(8 + i * 8) * 0x100000000 + dv.getUint32(12 + i * 8);
     }

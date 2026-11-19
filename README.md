@@ -27,7 +27,7 @@ Clone the repository and create your environment file:
 cp .env.example .env
 ```
 
-Edit `.env` and set a strong administrator password:
+Edit `.env` and set a strong administrator password (at least 12 characters; the server refuses to start with the example value):
 
 ```dotenv
 ADMIN_PASSWORD=replace-with-a-long-random-password
@@ -73,7 +73,7 @@ If you use another reverse proxy, configure it to forward WebSocket upgrades and
 
 1. Open `https://your-domain.example/admin`.
 2. Sign in using the `ADMIN_PASSWORD` configured in `.env`.
-3. Create a room and give it a password (leaving it empty creates a room anyone with the link can join).
+3. Create a room and give it a password (leaving it empty creates a room anyone with the link can join; a room needs a password to get a Google Drive folder).
 4. Share the room link and password with your friends. A room named `movienight` is available at `https://your-domain.example/movienight`.
 5. Participants enter a display name and the room password, choose their camera and microphone, and join. The name, and optionally the password, are remembered on that device. A camera or microphone switched off in the lobby is not requested from the browser until it is turned on.
 
@@ -117,7 +117,7 @@ To enable Drive movies:
 3. Keep the key file private on your server. Do not commit it to Git.
 4. Configure `GOOGLE_SERVICE_ACCOUNT` to the key file's path. With Docker Compose, uncomment the read-only key mount in `docker-compose.yml` and set the variable in `.env` to the mounted path.
 5. Share the Drive folder with the service account email as **Viewer**.
-6. In `/admin`, attach that folder to the room.
+6. In `/admin`, attach that folder to the room. The room must have a password.
 
 See [Google Drive integration](docs/google-drive.md) for the full Docker mount example and security notes.
 
@@ -127,7 +127,7 @@ See [Google Drive integration](docs/google-drive.md) for the full Docker mount e
 |---|---|---|
 | `PORT` | `4567` | HTTP port |
 | `HOST` | `0.0.0.0` | Address the server listens on |
-| `ADMIN_PASSWORD` | Random if unset | Admin login password; set this explicitly |
+| `ADMIN_PASSWORD` | Random if unset | Admin login password, at least 12 characters; set this explicitly |
 | `DATA_DIR` | `./data` (Docker: `/data`) | Room storage location |
 | `TRUST_PROXY` | `false` (Compose: `true`) | Trust proxy headers; use only behind a trusted proxy |
 | `ALLOWED_ORIGINS` | — | Additional allowed WebSocket origins |

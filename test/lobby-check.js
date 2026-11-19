@@ -11,7 +11,7 @@ const assert = require('assert');
 
 const PORT = Number(process.env.PORT || 4753);
 const BASE = `http://127.0.0.1:${PORT}`;
-const ADMIN = 'test';
+const ADMIN = 'test-admin-password';
 const ROOM = 'lobby-' + Date.now().toString(36);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const waitFor = (page, fn, arg, timeout = 15000) => page.waitForFunction(fn, arg, { timeout, polling: 100 });

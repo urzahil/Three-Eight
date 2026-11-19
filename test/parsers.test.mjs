@@ -134,3 +134,79 @@ test('MKV video: decode times keep increasing when a later GOP needs a deeper re
   for (let i = 1; i < all.length; i++) assert(all[i].dts > all[i - 1].dts, `dts ${all[i].dts} after ${all[i - 1].dts}`);
   for (const f of all) assert(f.dts <= f.pts, `dts ${f.dts} <= pts ${f.pts}`);
 });
+
+// ---- Sizes from the file are not trusted --------------------------------------------------------------------------
+/** A file of `size` bytes whose content is `bytes` (zeros after them), failing any read larger than `maxRead`. */
+function guardedFile(bytes, size, maxRead = 4 * 1024 * 1024) {
+  return {
+    size,
+    slice(a, b) {
+      if (b - a > maxRead) throw new Error(`read of ${b - a} bytes`);
+      const out = new Uint8Array(Math.max(0, Math.min(b, size) - a));
+      if (a < bytes.length) out.set(bytes.subarray(a, Math.min(b, bytes.length)));
+      return new Blob([out]);
+    },
+  };
+}
+
+test('MKV blocks(): a block with an impossible size is skipped to the next cluster, not read into memory', async () => {
+  const { MkvDemuxer } = await import('../public/assets/js/player/mkv.js');
+  const el = (id, body) => [...id, 0x80 | body.length, ...body];
+  const GiB = [0x01, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00]; // an 8-byte EBML size of 1 GiB
+  const bytes = new Uint8Array([
+    0x1f, 0x43, 0xb6, 0x75, 0xff, // Cluster of unknown size
+    ...el([0xe7], [0x00]),
+    0xa3, ...GiB, 0x81, 0x00, 0x00, 0x80, // a SimpleBlock that claims 1 GiB
+    0x1f, 0x43, 0xb6, 0x75, 0xff,
+    0xe7, 0x89, 0, 0, 0, 0, 0, 0, 0, 0, 0, // a Timecode of 9 bytes (at most 8 exist)
+    0x1f, 0x43, 0xb6, 0x75, 0xff,
+    ...el([0xe7], [0x05]),
+    ...el([0xa3], [0x81, 0x00, 0x02, 0x80, 0x42]), // a good block
+  ]);
+  const d = new MkvDemuxer(guardedFile(bytes, 4 * 1024 ** 3)); // the file claims 4 GiB, so the block "fits"
+  d.segEnd = bytes.length;
+  const got = [];
+  for await (const b of d.blocks(0, null)) got.push({ pts: b.pts, frames: b.frames.map((f) => [...f]) });
+  assert.deepStrictEqual(got, [{ pts: 7, frames: [[0x42]] }]);
+});
+
+test('MKV inflate: corrupt data and decompression bombs give null, real blocks their bytes', async () => {
+  const { inflate } = await import('../public/assets/js/player/mkv.js');
+  const zlib = await import('node:zlib');
+  const text = new TextEncoder().encode('Hello, subtitles');
+  assert.deepStrictEqual([...(await inflate(zlib.deflateSync(text)))], [...text]);
+  assert.strictEqual(await inflate(new Uint8Array([1, 2, 3, 4, 5])), null, 'not zlib');
+  const bomb = zlib.deflateSync(Buffer.alloc(8 * 1024 * 1024)); // 8 MiB of zeros in a few KB
+  assert(bomb.length < 64 * 1024);
+  assert.strictEqual(await inflate(bomb), null, 'stops at the limit');
+});
+
+test('MP4: sample counts the file cannot hold make the track unusable instead of allocating them', async () => {
+  const { Mp4Demuxer } = await import('../public/assets/js/player/mp4.js');
+  const u32 = (n) => [(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255];
+  const box = (type, ...body) => {
+    const flat = body.flat();
+    return [...u32(8 + flat.length), ...[...type].map((c) => c.charCodeAt(0)), ...flat];
+  };
+  const fullZeros = (n) => new Array(n).fill(0);
+  const movie = (stbl) => new Uint8Array(box('moov', box('trak',
+    box('tkhd', fullZeros(84)),
+    box('mdia', box('mdhd', fullZeros(24)), box('hdlr', [0, 0, 0, 0, 0, 0, 0, 0, ...'vide'].map((c) => (typeof c === 'string' ? c.charCodeAt(0) : c)), fullZeros(13)),
+      box('minf', box('stbl', stbl))))));
+  const cases = {
+    'fixed sample size, 50 million samples in a tiny file': box('stsz', [0, 0, 0, 0], u32(1), u32(50_000_000)),
+    'a table of 100 million entries in a 20-byte box': box('stsz', [0, 0, 0, 0], u32(0), u32(100_000_000)),
+    'a chunk table larger than its box': [...box('stsz', [0, 0, 0, 0], u32(0), u32(0)), ...box('co64', [0, 0, 0, 0], u32(30_000_000))],
+  };
+  const warn = console.warn;
+  try {
+    for (const [name, stbl] of Object.entries(cases)) {
+      const logged = [];
+      console.warn = (...a) => logged.push(a.map(String).join(' '));
+      await assert.rejects(Mp4Demuxer.open(new Blob([movie(stbl)])), /No tracks/, name);
+      assert.match(logged.join('\n'), /impossible (sample|entry) count/, name);
+    }
+  } finally {
+    console.warn = warn;
+  }
+});

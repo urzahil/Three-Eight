@@ -2,13 +2,13 @@
 // controls and drives the room; without it, the native video PiP gets the
 // subtitles as a caption track; the compact style draws video + subtitles on a
 // canvas that plays in native PiP.
-// Usage: node test/pip-check.js   (server on BASE, default http://localhost:4567, ADMIN_PASSWORD=test)
+// Usage: node test/pip-check.js   (server on BASE, default http://localhost:4567, ADMIN_PASSWORD=test-admin-password)
 const { chromium } = require('playwright');
 const path = require('path');
 const assert = require('assert');
 
 const BASE = process.env.BASE || 'http://localhost:4567';
-const ADMIN = process.env.ADMIN_PASSWORD || 'test';
+const ADMIN = process.env.ADMIN_PASSWORD || 'test-admin-password';
 const MOVIE = path.resolve(__dirname, 'fixtures', 'multi.mkv');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const waitFor = (page, fn, arg, timeout = 15000) => page.waitForFunction(fn, arg, { timeout, polling: 200 });

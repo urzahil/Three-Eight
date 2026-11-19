@@ -11,7 +11,7 @@ Three-Eight is a Node.js web app. Docker Compose is the recommended deployment m
    cp .env.example .env
    ```
 
-   Edit `.env` and set `ADMIN_PASSWORD` to a unique, strong password.
+   Edit `.env` and set `ADMIN_PASSWORD` to a unique, strong password of at least 12 characters. The server refuses to start with a shorter one or with the example value from `.env.example`.
 3. Start the app:
 
    ```bash
@@ -37,7 +37,7 @@ docker build -t three-eight .
 ```
 
 ```bash
-docker run -d --name three-eight -p 127.0.0.1:4567:4567 -e ADMIN_PASSWORD=change-me -e TRUST_PROXY=true -v three-eight-data:/data three-eight
+docker run -d --name three-eight -p 127.0.0.1:4567:4567 -e ADMIN_PASSWORD='replace-with-a-long-random-password' -e TRUST_PROXY=true -v three-eight-data:/data three-eight
 ```
 
 ## HTTPS and reverse proxy
@@ -116,7 +116,7 @@ With Docker Compose, `.env` is only used to fill in the values `docker-compose.y
 |---|---|---|
 | `PORT` | `4567` | HTTP port (`1`–`65535`) |
 | `HOST` | `0.0.0.0` | Address the server listens on |
-| `ADMIN_PASSWORD` | Random value printed at startup if unset | Password for `/admin` |
+| `ADMIN_PASSWORD` | Random value printed at startup if unset | Password for `/admin`, at least 12 characters (example values from the documentation are refused) |
 | `DATA_DIR` | `./data` locally; `/data` in Docker | Directory containing room data |
 | `TRUST_PROXY` | `false` locally; `true` in Compose | Trust proxy headers. `true`, `1`, or `yes` means one proxy; a number specifies the proxy count. |
 | `ALLOWED_ORIGINS` | — | Comma-separated additional WebSocket origins |
@@ -135,13 +135,15 @@ Invalid values for supported settings cause startup to fail with an error rather
 
 The Compose configuration assumes the app is only reachable through the local reverse proxy and sets `TRUST_PROXY=true`. With one proxy, the server uses the proxy-appended client address from `X-Forwarded-For` for rate limiting and uses forwarded HTTPS information for secure-cookie and security-header handling. If there are multiple proxies, set `TRUST_PROXY` to the actual number of trusted hops. Do not set it higher than the real proxy count, or client IPs can be spoofed.
 
+Behind a proxy without `TRUST_PROXY`, every visitor appears to come from the proxy's address, so per-address limits apply to all of them together: the password attempt limits, the limit on looking up rooms that don't exist (30 in 10 minutes, so room names can't be found by trying many), and the limit of 64 open connections per address (twice `MAX_ROOM_SIZE` if that is higher). The server logs a warning when it refuses a connection for that reason.
+
 If exposing port `4567` directly without a reverse proxy, edit `docker-compose.yml`: set `TRUST_PROXY: "false"` and change the `ports` mapping to publish on the interface you intend (for example `"4567:4567"`). Setting `TRUST_PROXY` in `.env` has no effect with Compose. HTTPS is still recommended and required for camera/microphone on non-localhost origins.
 
 ## Do I need TURN?
 
 Usually, no. STUN is enough for many home connections. TURN can help a participant whose network or carrier NAT prevents peer-to-peer media connections. That participant may see a connection failure while others work. TURN relays that participant's traffic and consumes bandwidth on the TURN host.
 
-Three-Eight's Compose file includes a commented coturn service with step-by-step instructions. To use it, uncomment it and set `TURN_SECRET`, `TURN_REALM` (the TURN host name) and `TURN_URLS` in `.env` (see `.env.example`). For a separate coturn server, configure it with `use-auth-secret` and `static-auth-secret`, then set `TURN_URLS` and `TURN_SECRET` in Three-Eight. See the coturn documentation for firewall and relay-port requirements. Avoid enabling TURN unless needed, because relay traffic can be substantial.
+Three-Eight's Compose file includes a commented coturn service with step-by-step instructions. To use it, uncomment it and set `TURN_SECRET`, `TURN_REALM` (the TURN host name) and `TURN_URLS` in `.env` (see `.env.example`). For a separate coturn server, configure it with `use-auth-secret` and `static-auth-secret`, then set `TURN_URLS` and `TURN_SECRET` in Three-Eight. TURN credentials are handed out only to room members, after the password check, and are renewed while they stay connected; the public `/api/config` lists STUN servers only. See the coturn documentation for firewall and relay-port requirements. Avoid enabling TURN unless needed, because relay traffic can be substantial.
 
 ## Updating
 

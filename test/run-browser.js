@@ -11,7 +11,7 @@ const TEST_DIR = __dirname;
 const ROOT = path.resolve(TEST_DIR, '..');
 const FIXTURES = path.join(TEST_DIR, 'fixtures');
 const TIMEOUT_MS = Number(process.env.BROWSER_TEST_TIMEOUT_MS || 5 * 60 * 1000); // per script: a hang fails instead of stalling
-const ADMIN_PASSWORD = 'test';
+const ADMIN_PASSWORD = 'test-admin-password';
 
 // kind 'server': needs a server at BASE (the runner starts one on a free port, with its own empty data dir).
 // kind 'self':   starts its own server (and picks its own data dir); `port` scripts read PORT from the environment.

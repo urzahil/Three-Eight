@@ -13,7 +13,7 @@ const assert = require('assert');
 
 const FIX = path.resolve(__dirname, 'fixtures');
 const MOVIE = path.join(FIX, 'multi.mkv');
-const ADMIN = 'test';
+const ADMIN = 'test-admin-password';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const ROOM = 'share-' + Date.now().toString(36);
 const ROOM2 = ROOM + '-relay';
