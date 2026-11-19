@@ -780,13 +780,13 @@ test('drive: without a service account there is no drive field and no endpoint',
   const login = await fetch(s.base + '/api/admin/login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password: 'admin-pw-for-tests' }) });
   const ck = login.headers.get('set-cookie').split(';')[0];
   const call = (method, p, body) => fetch(s.base + p, { method, headers: { 'content-type': 'application/json', cookie: ck }, body: body ? JSON.stringify(body) : undefined });
-  assert.strictEqual((await call('POST', '/api/admin/rooms', { name: 'nodrive', password: 'nd' })).status, 201);
+  assert.strictEqual((await call('POST', '/api/admin/rooms', { name: 'nodrive', password: '' })).status, 201);
   const put = await (await call('PUT', '/api/admin/rooms/nodrive/drive', { link: D.rootA })).json();
   assert.deepStrictEqual(put, { ok: true, drive: { folderId: D.rootA } }, 'saved, but no check without a service account');
   assert.strictEqual((await (await call('GET', '/api/admin/rooms')).json()).serviceAccount, '');
   const ws = new WebSocket(s.base.replace('http', 'ws') + '/ws');
   const msg = await new Promise((resolve) => {
-    ws.on('open', () => ws.send(JSON.stringify({ type: 'join', room: 'nodrive', id: 'gggggggg1', name: 'X', password: 'nd' })));
+    ws.on('open', () => ws.send(JSON.stringify({ type: 'join', room: 'nodrive', id: 'gggggggg1', name: 'X', password: '' })));
     ws.on('message', (m) => resolve(JSON.parse(m.toString())));
   });
   assert.strictEqual(msg.type, 'welcome');
@@ -1879,13 +1879,13 @@ test('drive: `truncated` reaches the folders endpoint, and a room has a cap on o
   });
   const login = await fetch(s.base + '/api/admin/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password: 'admin-pw-for-tests' }) });
   const admin = { 'Content-Type': 'application/json', cookie: login.headers.get('set-cookie').split(';')[0] };
-  assert.strictEqual((await fetch(s.base + '/api/admin/rooms', { method: 'POST', headers: admin, body: JSON.stringify({ name: 'limits', password: 'lp' }) })).status, 201);
+  assert.strictEqual((await fetch(s.base + '/api/admin/rooms', { method: 'POST', headers: admin, body: JSON.stringify({ name: 'limits' }) })).status, 201);
   const put = await fetch(s.base + '/api/admin/rooms/limits/drive', { method: 'PUT', headers: admin, body: JSON.stringify({ link: F }) });
   assert.deepStrictEqual((await put.json()).check, { name: 'Limits folder', items: 3, truncated: true });
 
   const ws = new WebSocket(s.base.replace('http', 'ws') + '/ws');
   const welcome = await new Promise((resolve) => {
-    ws.on('open', () => ws.send(JSON.stringify({ type: 'join', room: 'limits', id: 'llllllll1', name: 'L', password: 'lp' })));
+    ws.on('open', () => ws.send(JSON.stringify({ type: 'join', room: 'limits', id: 'llllllll1', name: 'L' })));
     ws.on('message', (m) => resolve(JSON.parse(m.toString())));
   });
   const token = welcome.drive.token;
@@ -2059,7 +2059,8 @@ test('ADMIN_PASSWORD: an example value, a short one or only spaces stops the ser
   assert.strictEqual(adminPassword({}), '', 'unset: the server generates one');
   assert.strictEqual(adminPassword({ ADMIN_PASSWORD: '' }), '');
   assert.strictEqual(adminPassword({ ADMIN_PASSWORD: 'a-long-enough-pw' }), 'a-long-enough-pw');
-  for (const bad of ['change-me-to-something-long', ' Change-Me-To-Something-Long ', 'replace-with-a-long-random-password', 'short', '11-chars-xx', ' '.repeat(20)]) {
+  assert.strictEqual(adminPassword({ ADMIN_PASSWORD: 'nine-char' }), 'nine-char', '9 characters is the minimum');
+  for (const bad of ['change-me-to-something-long', ' Change-Me-To-Something-Long ', 'replace-with-a-long-random-password', 'short', '8-chars!', ' '.repeat(20)]) {
     assert.throws(() => adminPassword({ ADMIN_PASSWORD: bad }), ConfigError, JSON.stringify(bad));
   }
   const exitOf = async (password) => {
@@ -2127,43 +2128,29 @@ test('open sockets per client address are capped (an IPv4 address or an IPv6 /64
   s.stop();
 });
 
-// ---- Drive needs a room password -------------------------------------------------------------------------------------
-test('drive: a folder needs a room password, and a folder saved for an open room (older rooms.json) is not served', async () => {
-  // The admin API keeps the two together.
+// ---- Drive in a room without a password ------------------------------------------------------------------------------
+test('drive: a room without a password can have a folder (the admin page warns), and removing a password keeps it working', async () => {
+  // An open room gets a folder: allowed, and every member (anyone with the link) gets a token.
   assert.strictEqual((await json('POST', '/api/admin/rooms', { name: 'open-drive', password: '' })).status, 201);
-  const put = await json('PUT', '/api/admin/rooms/open-drive/drive', { link: D.rootA });
-  assert.strictEqual(put.status, 400);
-  assert.match((await put.json()).error, /needs a password/);
-  assert.strictEqual((await json('PUT', '/api/admin/rooms/open-drive', { password: 'odp' })).status, 200);
   assert.strictEqual((await json('PUT', '/api/admin/rooms/open-drive/drive', { link: D.rootA })).status, 200);
-  const unset = await json('PUT', '/api/admin/rooms/open-drive', { password: '' });
-  assert.strictEqual(unset.status, 400);
-  assert.match((await unset.json()).error, /Remove the folder first/);
-  assert.strictEqual((await (await fetch(BASE + '/api/rooms/open-drive')).json()).passwordRequired, true, 'the password stayed');
-  assert.strictEqual((await json('PUT', '/api/admin/rooms/open-drive/drive', { link: '' })).status, 200);
-  assert.strictEqual((await json('PUT', '/api/admin/rooms/open-drive', { password: '' })).status, 200, 'without the folder it may be open');
+  const listed = (await (await json('GET', '/api/admin/rooms')).json()).rooms.find((r) => r.name === 'open-drive');
+  assert.deepStrictEqual({ drive: listed.drive, hasPassword: listed.hasPassword }, { drive: { folderId: D.rootA }, hasPassword: false }, 'what the admin page warns about');
+  const open = await join('open-drive', '', 'opendrive1');
+  assert.strictEqual(open.welcome.drive.folder, D.rootA);
+  assert.strictEqual((await api('/api/rooms/open-drive/drive/folders/root', open.welcome.drive.token)).status, 200);
+  open.ws.close();
 
-  // A rooms.json from before the rule: the folder is kept, but nobody gets it until the room has a password.
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'three-eight-legacy-'));
-  const now = Date.now();
-  fs.writeFileSync(path.join(dir, 'rooms.json'), JSON.stringify({ version: 1, rooms: { legacy: { name: 'legacy', passwordHash: '', createdAt: now, updatedAt: now, drive: { folderId: D.rootA } } } }));
-  const s = await spawnServer({ DATA_DIR: dir, GOOGLE_SERVICE_ACCOUNT: google.writeAccount(keyDir), GOOGLE_API_BASE: google.url, DRIVE_DEBUG: '1' });
-  const ck = await adminCookie(s.base);
-  const ws = await wsAt(s.base);
-  ws.sendJson({ type: 'join', room: 'legacy', id: 'legacy0001', name: 'L' });
-  const welcome = await ws.next();
-  assert.strictEqual(welcome.type, 'welcome');
-  assert(!('drive' in welcome), 'no Drive token for an open room');
-  const listed = (await (await fetch(s.base + '/api/admin/rooms', { headers: { cookie: ck } })).json()).rooms[0];
-  assert.deepStrictEqual({ drive: listed.drive, hasPassword: listed.hasPassword }, { drive: { folderId: D.rootA }, hasPassword: false });
-  // Once the admin sets a password (without disconnecting anyone), the members in the room get the folder.
-  assert.strictEqual((await fetch(s.base + '/api/admin/rooms/legacy', { method: 'PUT', headers: { 'content-type': 'application/json', cookie: ck }, body: JSON.stringify({ password: 'now-locked' }) })).status, 200);
-  const pushed = await nextMatching(ws, (m) => m.type === 'drive');
-  assert.strictEqual(pushed.drive.folder, D.rootA);
-  assert.strictEqual((await fetch(`${s.base}/api/rooms/legacy/drive/folders/root`, { headers: { Authorization: `Bearer ${pushed.drive.token}` } })).status, 200);
-  ws.close();
-  s.stop();
-  fs.rmSync(dir, { recursive: true, force: true });
+  // A room with a password and a folder may lose its password: members get a new token (the old one stopped working).
+  assert.strictEqual((await json('PUT', '/api/admin/rooms/open-drive', { password: 'odp' })).status, 200);
+  const member = await join('open-drive', 'odp', 'opendrive2');
+  const before = member.welcome.drive.token;
+  assert.strictEqual((await json('PUT', '/api/admin/rooms/open-drive', { password: '' })).status, 200);
+  const pushed = await nextMatching(member.ws, (m) => m.type === 'drive');
+  assert.notStrictEqual(pushed.drive.token, before);
+  assert.strictEqual((await api('/api/rooms/open-drive/drive/folders/root', before)).status, 401);
+  assert.strictEqual((await api('/api/rooms/open-drive/drive/folders/root', pushed.drive.token)).status, 200);
+  member.ws.close();
+  assert.strictEqual((await json('DELETE', '/api/admin/rooms/open-drive', {})).status, 200);
 });
 
 // ---- Admin routes match their exact path ---------------------------------------------------------------------------------

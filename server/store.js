@@ -72,10 +72,6 @@ class RoomError extends Error {
   }
 }
 
-// A Drive folder needs a room password (see server.js driveAllowed): the store keeps that true with every change.
-const DRIVE_NEEDS_PASSWORD = 'A room needs a password to have a Google Drive folder: in a room without one, anyone who knows its name could stream the whole folder.';
-const PASSWORD_KEEPS_DRIVE = 'This room has a Google Drive folder, which needs a room password. Remove the folder first, or set a new password instead.';
-
 class RoomStore {
   constructor(dataDir) {
     this.file = path.join(dataDir, 'rooms.json');
@@ -161,11 +157,9 @@ class RoomStore {
   async setPassword(name, password) {
     if (!this.get(name)) throw new RoomError('No such room.', 404);
     if (typeof password !== 'string') throw new RoomError('The password must be text.');
-    if (!password && this.get(name).drive) throw new RoomError(PASSWORD_KEEPS_DRIVE);
     const passwordHash = password ? await hashPassword(password) : '';
-    // The room may have been deleted (or given a folder) while hashing.
+    // The room may have been deleted while hashing.
     if (!this.get(name)) throw new RoomError('No such room.', 404);
-    if (!passwordHash && this.get(name).drive) throw new RoomError(PASSWORD_KEEPS_DRIVE);
     const next = this._draft();
     const r = next[RoomStore.key(name)];
     r.passwordHash = passwordHash;
@@ -175,7 +169,6 @@ class RoomStore {
 
   setDrive(name, drive) {
     if (!this.get(name)) throw new RoomError('No such room.', 404);
-    if (drive && !this.get(name).passwordHash) throw new RoomError(DRIVE_NEEDS_PASSWORD);
     const next = this._draft();
     const r = next[RoomStore.key(name)];
     if (drive) r.drive = { folderId: drive.folderId };

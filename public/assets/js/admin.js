@@ -1,8 +1,8 @@
 const $ = (id) => document.getElementById(id);
 
-function toast(text, ms = 3000) {
+function toast(text, ms = 3000, kind = '') {
   const el = document.createElement('div');
-  el.className = 'toast';
+  el.className = kind ? `toast ${kind}` : 'toast';
   el.textContent = text;
   $('toasts').appendChild(el);
   setTimeout(() => el.remove(), ms);
@@ -57,9 +57,10 @@ async function refresh() {
     tdDrive.textContent = r.drive ? (driveNames.get(r.name + '|' + r.drive.folderId) || 'linked') : '—';
     if (!r.drive) tdDrive.className = 'muted';
     else if (!r.hasPassword) {
-      // Saved before the server required a password for it: members do not get the folder until the room has one.
-      tdDrive.textContent += ' (off: the room needs a password)';
-      tdDrive.className = 'error';
+      // Anyone who knows the room's name can join, and so stream the folder.
+      tdDrive.textContent += ' · no password';
+      tdDrive.title = 'This room has no password: anyone with its link can stream this folder.';
+      tdDrive.className = 'warning';
     }
     const tdOnline = document.createElement('td');
     tdOnline.textContent = r.online.length ? r.online.join(', ') : '—';
@@ -106,8 +107,7 @@ function changePassword(name, hasDrive) {
   const d = $('pw-dialog');
   $('pw-room').textContent = name;
   $('pw-new').value = '';
-  $('pw-new').required = hasDrive; // the server refuses to remove the password of a room with a Drive folder
-  $('pw-drive').hidden = !hasDrive;
+  $('pw-drive').hidden = !hasDrive; // a warning: without a password, anyone with the link can stream the folder
   $('pw-kick').checked = false;
   d.returnValue = 'cancel';
   d.showModal();
@@ -115,7 +115,8 @@ function changePassword(name, hasDrive) {
     if (d.returnValue !== 'save') return;
     try {
       await api('PUT', '/rooms/' + encodeURIComponent(name), { password: $('pw-new').value, kick: $('pw-kick').checked });
-      toast('Password updated');
+      if (hasDrive && !$('pw-new').value) toast(`Password removed. Anyone with the link to “${name}” can now stream its Google Drive folder.`, 10000, 'warn');
+      else toast('Password updated');
     } catch (err) {
       toast(err.message);
     }
@@ -152,6 +153,7 @@ function changeDrive(name, current, hasPassword) {
       driveNames.set(name + '|' + drive.folderId, check.name);
       toast(`Folder “${check.name}” linked: ${check.items} items${check.truncated ? ' (very large: only the first part is listed)' : ''}`);
     }
+    if (drive && !hasPassword) toast(`“${name}” has no password: anyone with its link can stream this folder.`, 10000, 'warn');
     refresh();
   }, { once: true });
 }

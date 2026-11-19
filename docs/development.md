@@ -9,7 +9,7 @@ npm ci
 ADMIN_PASSWORD=local-dev-password npm start
 ```
 
-`ADMIN_PASSWORD` must be at least 12 characters (the browser checks use `test-admin-password`).
+`ADMIN_PASSWORD` must be at least 9 characters (the browser checks use `test-admin-password`).
 
 The app starts on port 4567 by default. Open `http://localhost:4567`; localhost is treated as a secure context by browsers for camera/microphone access.
 

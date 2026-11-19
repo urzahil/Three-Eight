@@ -36,7 +36,7 @@ function driveCacheMb(env, def) {
   return mb;
 }
 
-const MIN_ADMIN_PASSWORD = 12;
+const MIN_ADMIN_PASSWORD = 9;
 // Example values from .env.example and the documentation: a copy that was never edited must not become the password.
 const EXAMPLE_PASSWORDS = new Set([
   'change-me-to-something-long',
@@ -54,9 +54,9 @@ const EXAMPLE_PASSWORDS = new Set([
 function adminPassword(env) {
   const raw = String(env.ADMIN_PASSWORD ?? '');
   if (raw === '') return '';
-  if (!raw.trim()) throw new ConfigError('ADMIN_PASSWORD contains only spaces. Set a real password (at least 12 characters).');
+  if (!raw.trim()) throw new ConfigError(`ADMIN_PASSWORD contains only spaces. Set a real password (at least ${MIN_ADMIN_PASSWORD} characters).`);
   if (EXAMPLE_PASSWORDS.has(raw.trim().toLowerCase())) {
-    throw new ConfigError('ADMIN_PASSWORD is still the example value from the documentation. Set a password of your own (at least 12 characters).');
+    throw new ConfigError(`ADMIN_PASSWORD is still the example value from the documentation. Set a password of your own (at least ${MIN_ADMIN_PASSWORD} characters).`);
   }
   if (raw.length < MIN_ADMIN_PASSWORD) {
     throw new ConfigError(`ADMIN_PASSWORD is too short (${raw.length} characters). Use at least ${MIN_ADMIN_PASSWORD}.`);

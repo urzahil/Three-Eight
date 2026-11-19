@@ -160,7 +160,7 @@ function checkToken(token) {
   }
   if (!claim || typeof claim.r !== 'string' || typeof claim.e !== 'number' || claim.e < Date.now()) return null;
   const room = store.get(claim.r);
-  if (!room || !driveAllowed(room) || claim.v !== roomVersion(room)) return null;
+  if (!room || !room.drive || claim.v !== roomVersion(room)) return null;
   return { room, exp: claim.e };
 }
 
@@ -580,17 +580,11 @@ function roomMembers(name) {
   return live.get(RoomStore.key(name));
 }
 
-// A Drive folder only counts in a room with a password: anyone who knows (or guesses) an open room's name could
-// otherwise stream the whole folder through the server, on its bandwidth and the service account's quota. The admin
-// API refuses that combination; this also covers a rooms.json written before it did.
-function driveAllowed(r) {
-  return !!(r && r.drive && r.passwordHash);
-}
-
 // What room members need to browse the room's Google Drive folder: a token for our endpoints and the
-// folder's ID. null when the room has no (usable) folder or the server has no service account.
+// folder's ID. null when the room has no folder or the server has no service account. In a room without a password
+// that is anyone who knows the room's name: the admin page warns about it.
 function driveInfo(r) {
-  if (!driveAllowed(r) || !driveApi) return null;
+  if (!r || !r.drive || !driveApi) return null;
   return { token: issueToken(r), folder: r.drive.folderId };
 }
 
