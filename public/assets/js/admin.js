@@ -63,8 +63,24 @@ async function refresh() {
       tdDrive.className = 'warning';
     }
     const tdOnline = document.createElement('td');
-    tdOnline.textContent = r.online.length ? r.online.join(', ') : '—';
-    if (!r.online.length) tdOnline.className = 'muted';
+    const members = r.members || [];
+    if (!members.length) {
+      tdOnline.textContent = '—';
+      tdOnline.className = 'muted';
+    }
+    for (const m of members) {
+      const chip = document.createElement('span');
+      chip.className = 'member';
+      const remove = document.createElement('button');
+      remove.type = 'button';
+      remove.className = 'member-remove';
+      remove.textContent = '×';
+      remove.title = `Remove ${m.name} from the room`;
+      remove.setAttribute('aria-label', remove.title);
+      remove.onclick = () => removeMember(r, m);
+      chip.append(m.name, remove);
+      tdOnline.append(chip);
+    }
     const tdAct = document.createElement('td');
     const copy = button('Copy link', async () => {
       try {
@@ -92,6 +108,21 @@ async function refresh() {
     return tr;
   }));
   $('empty').hidden = data.rooms.length > 0;
+}
+
+/** Disconnect one person from a room. It does not keep them out: the password (or, for an open room, the link) still works. */
+async function removeMember(room, m) {
+  const after = room.hasPassword
+    ? 'They can join again with the room password. To keep them out, change the password (that also ends their access to the room\'s Google Drive folder).'
+    : 'This room has no password, so they can join again with its link. Give the room a password to keep them out.';
+  if (!confirm(`Remove “${m.name}” from “${room.name}”?\n\n${after}`)) return;
+  try {
+    await api('DELETE', `/rooms/${encodeURIComponent(room.name)}/members/${encodeURIComponent(m.id)}`, {});
+    toast(`${m.name} was removed from the room`);
+  } catch (err) {
+    toast(err.message);
+  }
+  refresh();
 }
 
 function button(label, onClick) {

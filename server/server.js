@@ -932,7 +932,8 @@ async function handleApi(req, res, url) {
     if (parts.length === 3 && req.method === 'GET') {
       const rooms = store.list().map((r) => {
         const m = roomMembers(r.name);
-        return { ...r, online: m ? [...m.values()].map((x) => x.name) : [] };
+        // online: the names (as before); members: who is in the room, with the ids the admin can remove them by.
+        return { ...r, online: m ? [...m.values()].map((x) => x.name) : [], members: m ? [...m].map(([id, x]) => ({ id, name: x.name })) : [] };
       });
       return sendJson(res, 200, { rooms, serviceAccount: driveApi ? driveApi.account.email : '' });
     }
@@ -981,6 +982,17 @@ async function handleApi(req, res, url) {
       if (body.kick === true) kickRoom(name, 'kicked', 'The room password was changed. Please rejoin.');
       else pushDrive(name); // everyone's old Drive token just stopped working: hand out the new one
       dropDriveStreams(name);
+      return sendJson(res, 200, { ok: true });
+    }
+    if (parts.length === 6 && parts[4] === 'members' && req.method === 'DELETE') {
+      req.resume(); // the body is not needed
+      // Remove one person from the room now. They can join again with the password: to keep them out, change it.
+      const entry = roomMembers(name)?.get(parts[5]);
+      if (!entry) return sendJson(res, 404, { error: 'That person is not in the room (any more).' });
+      const { ws } = entry;
+      send(ws, { type: 'error', code: 'kicked', message: 'The administrator removed you from the room.' });
+      leave(ws); // the others get peer-left now, not when the socket has closed
+      ws.close(4001, 'kicked');
       return sendJson(res, 200, { ok: true });
     }
     if (parts.length === 4 && req.method === 'DELETE') {
@@ -1121,13 +1133,41 @@ const MAX_SOCKETS_PER_CLIENT = Math.max(64, 2 * MAX_ROOM_SIZE);
 const socketsPerClient = new Map();
 let lastSocketCapLog = 0;
 
-// Relayed signals: one is at most MAX_SIGNAL_BYTES (an SDP offer with every transceiver is about 12 KB), and each socket
-// has a byte budget for what it makes the server send to others (a token bucket: a burst, then a steady rate). Without
-// it, a member with a fast uplink could fill another member's send buffer until that member counts as stalled and is
-// dropped. A full room's join (an offer and candidates for every peer) or an ICE restart stays far below it.
+// Relayed signals: one is at most MAX_SIGNAL_BYTES (a Chromium offer is about 6 KB, 10 KB while sharing a screen), and
+// each socket has a byte budget for what it makes the server send to others (a token bucket: a burst, then a steady
+// rate). Without it, a member with a fast uplink could fill another member's send buffer until that member counts as
+// stalled and is dropped. A newcomer sends about 9 KB per member (an offer and its candidates), and so does starting a
+// screen share: the burst covers that for a full room of MAX_ROOM_SIZE.
 const MAX_SIGNAL_BYTES = 32 * 1024;
-const SIGNAL_BYTES_BURST = 512 * 1024;
+const SIGNAL_BYTES_BURST = Math.max(512 * 1024, MAX_ROOM_SIZE * 16 * 1024);
 const SIGNAL_BYTES_PER_SEC = 64 * 1024;
+
+// Several members together can still send one member more than its link carries, each within its own budget. So the
+// relayed bytes are also counted per receiver and sender (in windows of RELAY_WINDOW_MS); once a receiver's send buffer
+// is past RELAY_BACKLOG, every member that sent it more than RELAY_FAIR_BYTES in the window is cut off, rather than the
+// receiver being dropped as stalled for what others sent it. An honest member sends one peer an offer and its
+// candidates (about 9 KB), a few times at most in a window. A receiver that really stopped reading is still dropped:
+// by the heartbeat, or by the MAX_WS_BUFFERED guard in send().
+const RELAY_WINDOW_MS = 10 * 1000;
+const RELAY_BACKLOG = 1024 * 1024;
+const RELAY_FAIR_BYTES = 48 * 1024;
+
+/**
+ * Count a relay of `bytes` from socket `from` to socket `to`. When `to` is behind, cut off whoever sent it more than a
+ * fair share in this window. False when `from` is cut off (then the signal is not delivered).
+ */
+function relayAllowed(from, to, bytes, now) {
+  let inbound = to.inbound;
+  if (!inbound || now - inbound.since > RELAY_WINDOW_MS) inbound = to.inbound = { since: now, bytes: new Map() };
+  inbound.bytes.set(from, (inbound.bytes.get(from) || 0) + bytes);
+  if (to.bufferedAmount <= RELAY_BACKLOG) return true;
+  for (const [sender, n] of inbound.bytes) {
+    if (n <= RELAY_FAIR_BYTES) continue;
+    inbound.bytes.delete(sender);
+    sender.cutOff?.();
+  }
+  return !from.limited;
+}
 
 function armJoinDeadline(ws) {
   clearTimeout(ws.joinDeadline);
@@ -1363,21 +1403,23 @@ wss.on('connection', (ws, req) => {
   let refilled = Date.now();
   let signalBytes = SIGNAL_BYTES_BURST;
   let signalRefilled = refilled;
-  let limited = false;
-  const cutOff = () => {
-    limited = true;
+  ws.limited = false;
+  // Also called by relayAllowed() for a member that floods another one.
+  ws.cutOff = () => {
+    if (ws.limited) return;
+    ws.limited = true;
     ws.close(1008, 'rate-limited');
     // A flooding peer will not finish the close handshake: drop the connection shortly after the close frame went out.
     setTimeout(() => ws.terminate(), 200).unref();
   };
 
   ws.on('message', (raw, isBinary) => {
-    if (limited) return; // already cut off: ignore whatever is still in flight
+    if (ws.limited) return; // already cut off: ignore whatever is still in flight
     const now = Date.now();
     tokens = Math.min(MSG_BURST, tokens + ((now - refilled) / 1000) * MSG_REFILL_PER_SEC);
     refilled = now;
     if (--tokens < 0) {
-      cutOff();
+      ws.cutOff();
       return;
     }
     if (isBinary) return;
@@ -1423,11 +1465,11 @@ wss.on('connection', (ws, req) => {
           signalRefilled = now;
           signalBytes -= raw.length;
           if (signalBytes < 0) {
-            cutOff();
+            ws.cutOff();
             return;
           }
           const target = live.get(ws.room)?.get(msg.to);
-          if (target) send(target.ws, { type: 'signal', from: ws.id, data: msg.data });
+          if (target && relayAllowed(ws, target.ws, raw.length, now)) send(target.ws, { type: 'signal', from: ws.id, data: msg.data });
           break;
         }
 

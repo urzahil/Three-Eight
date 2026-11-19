@@ -1962,33 +1962,78 @@ async function nextMatching(ws, pred, ms = 15000) {
   }
 }
 
-test('a member that stops reading is dropped once too much is queued for it, not kept until the heartbeat', async () => {
+test('several members flooding one (each within its own budget): the flooders are cut off, the receiver stays', { timeout: 60000 }, async () => {
   const s = await spawnServer({ MAX_ROOM_SIZE: '100' });
   const ck = await adminCookie(s.base);
   await fetch(s.base + '/api/admin/rooms', { method: 'POST', headers: { 'content-type': 'application/json', cookie: ck }, body: JSON.stringify({ name: 'stall-room' }) });
-  const a = await wsAt(s.base);
-  a.sendJson({ type: 'join', room: 'stall-room', id: 'stallpeerA1', name: 'A' });
-  assert.strictEqual((await a.next()).type, 'welcome');
-  // Many members, each within its own signal budget (see the next test): together they queue far more than A takes.
+  const online = async () => (await (await fetch(s.base + '/api/admin/rooms', { headers: { cookie: ck } })).json()).rooms[0].online;
+  const joinAs = async (id) => {
+    const ws = await wsAt(s.base);
+    ws.sendJson({ type: 'join', room: 'stall-room', id, name: id });
+    assert.strictEqual((await nextMatching(ws, (m) => m.type === 'welcome')).type, 'welcome');
+    return ws;
+  };
+  const a = await joinAs('stallpeerA1');
+  const honest = await joinAs('honestpeer1');
   const senders = [];
-  for (let i = 0; i < 48; i++) {
-    const b = await wsAt(s.base);
-    b.sendJson({ type: 'join', room: 'stall-room', id: `stallsend${String(i).padStart(2, '0')}`, name: 'B' });
-    assert.strictEqual((await nextMatching(b, (m) => m.type === 'welcome')).type, 'welcome');
-    senders.push(b);
-  }
-  a._socket.pause(); // A's connection stalls: it reads nothing more
+  for (let i = 0; i < 48; i++) senders.push(await joinAs(`stallsend${String(i).padStart(2, '0')}`));
+  const closes = senders.map((b) => new Promise((r) => b.once('close', (code) => r(code))));
+  honest.sendJson({ type: 'signal', to: 'stallpeerA1', data: { sdp: 'an honest offer' } });
+  // A's link is slow (here: it stops reading); together the senders queue far more than it takes.
+  a._socket.pause();
   const big = 'x'.repeat(30 * 1024);
   for (const b of senders) for (let i = 0; i < 16; i++) b.sendJson({ type: 'signal', to: 'stallpeerA1', data: { sdp: big } });
-  const left = await nextMatching(senders[0], (m) => m.type === 'peer-left');
-  assert.deepStrictEqual({ type: left.type, id: left.id }, { type: 'peer-left', id: 'stallpeerA1' });
-  for (const b of senders) {
-    b.sendJson({ type: 'time', c: 1 });
-    assert.strictEqual((await nextMatching(b, (m) => m.type === 'time')).c, 1, 'the senders are still connected');
-  }
+  const codes = await Promise.race([Promise.all(closes), new Promise((r) => setTimeout(() => r(null), 20000))]);
+  assert(codes, 'every flooder was cut off');
+  assert(codes.every((c) => c === 1008), JSON.stringify(codes));
+  assert.deepStrictEqual((await online()).sort(), ['honestpeer1', 'stallpeerA1'], 'the receiver and the honest member are still in the room');
+  honest.sendJson({ type: 'signal', to: 'stallpeerA1', data: { sdp: 'another honest offer' } });
+  honest.sendJson({ type: 'time', c: 1 });
+  assert.strictEqual((await nextMatching(honest, (m) => m.type === 'time')).c, 1, 'the honest member is still connected');
   a.terminate();
-  for (const b of senders) b.close();
+  honest.close();
   s.stop();
+});
+
+test('a member that stops reading is dropped by the heartbeat, and the others are told', { timeout: 30000 }, async () => {
+  const s = await spawnServer({ DRIVE_DEBUG: '1', HEARTBEAT_MS: '200' });
+  const ck = await adminCookie(s.base);
+  await fetch(s.base + '/api/admin/rooms', { method: 'POST', headers: { 'content-type': 'application/json', cookie: ck }, body: JSON.stringify({ name: 'stuck-room' }) });
+  const a = await wsAt(s.base);
+  a.sendJson({ type: 'join', room: 'stuck-room', id: 'stuckpeerA1', name: 'A' });
+  assert.strictEqual((await a.next()).type, 'welcome');
+  const b = await wsAt(s.base);
+  b.sendJson({ type: 'join', room: 'stuck-room', id: 'stuckpeerB1', name: 'B' });
+  assert.strictEqual((await b.next()).type, 'welcome');
+  a._socket.pause(); // A's connection stalls: no more pongs either
+  const left = await nextMatching(b, (m) => m.type === 'peer-left', 10000);
+  assert.deepStrictEqual({ type: left.type, id: left.id }, { type: 'peer-left', id: 'stuckpeerA1' });
+  a.terminate();
+  b.close();
+  s.stop();
+});
+
+test('the signal budget grows with MAX_ROOM_SIZE: a newcomer in a big room can send an offer to everyone', { timeout: 30000 }, async () => {
+  // About 10 KB (an offer with a shared screen) to each of 90 members, all at once. Signals to someone who is not in the
+  // room still count against the sender's budget, so the members do not have to exist here.
+  const burst = async (maxRoomSize) => {
+    const s = await spawnServer({ MAX_ROOM_SIZE: maxRoomSize });
+    const ck = await adminCookie(s.base);
+    await fetch(s.base + '/api/admin/rooms', { method: 'POST', headers: { 'content-type': 'application/json', cookie: ck }, body: JSON.stringify({ name: 'big-room' }) });
+    const ws = await wsAt(s.base);
+    ws.sendJson({ type: 'join', room: 'big-room', id: 'newcomer01', name: 'N' });
+    assert.strictEqual((await ws.next()).type, 'welcome');
+    const closed = new Promise((r) => ws.once('close', (code) => r(code)));
+    const offer = 'o'.repeat(10 * 1024);
+    for (let i = 0; i < 90; i++) ws.sendJson({ type: 'signal', to: `member${String(i).padStart(4, '0')}`, data: { sdp: offer } });
+    ws.sendJson({ type: 'time', c: 1 });
+    const answer = await Promise.race([nextMatching(ws, (m) => m.type === 'time', 5000), closed.then((code) => ({ type: 'closed', code }))]);
+    ws.terminate();
+    s.stop();
+    return answer;
+  };
+  assert.strictEqual((await burst('100')).type, 'time', 'MAX_ROOM_SIZE=100: still connected');
+  assert.deepStrictEqual(await burst('12'), { type: 'closed', code: 1008 }, 'MAX_ROOM_SIZE=12: that much is a flood');
 });
 
 test('signals: one member cannot flood another off the server; oversized signals are not relayed', { timeout: 30000 }, async () => {
@@ -2194,4 +2239,33 @@ test('guessing room names is slow: after 30 misses a client gets 429 for every l
   assert.strictEqual(await look('real-room', '10.7.7.8'), 200, 'other clients are not affected');
   ws.close();
   s.stop();
+});
+
+// ---- Removing one member ---------------------------------------------------------------------------------------------
+test('admin: one member can be removed; the others stay and are told, and the room list has the ids to do it', async () => {
+  assert.strictEqual((await json('POST', '/api/admin/rooms', { name: 'kick-room', password: 'kp' })).status, 201);
+  const room = async () => (await (await json('GET', '/api/admin/rooms')).json()).rooms.find((r) => r.name === 'kick-room');
+  const alice = await join('kick-room', 'kp', 'kickalice1', 'Alice');
+  const bob = await join('kick-room', 'kp', 'kickbob001', 'Bob');
+  await alice.ws.next(); // peer-joined
+  const listed = await room();
+  assert.deepStrictEqual(listed.online.sort(), ['Alice', 'Bob'], 'online keeps listing names');
+  assert.deepStrictEqual(listed.members.sort((x, y) => x.name.localeCompare(y.name)), [{ id: 'kickalice1', name: 'Alice' }, { id: 'kickbob001', name: 'Bob' }]);
+
+  const url = '/api/admin/rooms/kick-room/members/kickbob001';
+  assert.strictEqual((await json('DELETE', url, {}, { cookie: '' })).status, 401, 'admins only');
+  const closed = new Promise((r) => bob.ws.once('close', (code) => r(code)));
+  assert.strictEqual((await json('DELETE', url, {})).status, 200);
+  assert.deepStrictEqual(await bob.ws.next(), { type: 'error', code: 'kicked', message: 'The administrator removed you from the room.' });
+  assert.strictEqual(await closed, 4001);
+  assert.deepStrictEqual(await alice.ws.next(), { type: 'peer-left', id: 'kickbob001' });
+  assert.deepStrictEqual((await room()).online, ['Alice']);
+  assert.strictEqual((await json('DELETE', url, {})).status, 404, 'not in the room any more');
+  assert.strictEqual((await json('DELETE', '/api/admin/rooms/no-such-room/members/kickalice1', {})).status, 404);
+  assert.strictEqual((await json('DELETE', '/api/admin/rooms/kick-room/members/kickalice1/extra', {})).status, 404);
+  // It does not keep anyone out: with the password, Bob can join again.
+  const again = await join('kick-room', 'kp', 'kickbob001', 'Bob');
+  assert.strictEqual(again.welcome.type, 'welcome');
+  for (const c of [alice, again]) c.ws.close();
+  assert.strictEqual((await json('DELETE', '/api/admin/rooms/kick-room', {})).status, 200);
 });

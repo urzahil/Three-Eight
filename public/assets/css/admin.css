@@ -10,6 +10,10 @@
 .rooms td { overflow-wrap: anywhere; }
 .rooms td:last-child { overflow-wrap: normal; }
 .rooms .btn { padding: 6px 10px; font-size: 13px; }
+/* Who is online: one chip per person, with a button that removes them from the room. */
+.rooms .member { display: inline-flex; align-items: center; gap: 2px; margin: 2px 6px 2px 0; padding: 1px 2px 1px 8px; border: 1px solid var(--line); border-radius: 999px; font-size: 13px; overflow-wrap: anywhere; }
+.rooms .member-remove { flex: none; border: 0; background: none; color: var(--muted); cursor: pointer; padding: 0 6px; font-size: 16px; line-height: 1.2; border-radius: 999px; }
+.rooms .member-remove:hover, .rooms .member-remove:focus-visible { color: var(--danger-text); background: var(--hover); }
 code { background: var(--bg); border: 1px solid var(--line); border-radius: var(--r-sm); padding: 1px 6px; font-size: 13px; }
 @media (max-width: 640px) {
   .create-form { grid-template-columns: 1fr; }

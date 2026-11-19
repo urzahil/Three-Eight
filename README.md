@@ -77,7 +77,7 @@ If you use another reverse proxy, configure it to forward WebSocket upgrades and
 4. Share the room link and password with your friends. A room named `movienight` is available at `https://your-domain.example/movienight`.
 5. Participants enter a display name and the room password, choose their camera and microphone, and join. The name, and optionally the password, are remembered on that device. A camera or microphone switched off in the lobby is not requested from the browser until it is turned on.
 
-The admin page shows who is online in each room and lets you create and delete rooms, change room passwords (optionally disconnecting everyone currently in the room), and attach a Google Drive folder to a room (optional).
+The admin page shows who is online in each room and lets you remove someone from a room, create and delete rooms, change room passwords (optionally disconnecting everyone currently in the room), and attach a Google Drive folder to a room (optional).
 
 ## Watch a movie
 
