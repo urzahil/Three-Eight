@@ -60,23 +60,27 @@ export class MovieMenus {
       : [this._menuItem(this.player.loaded ? 'Default' : 'Load the movie first', true, () => {}, '', true)]));
     $('m-audio').hidden = audioTracks.length < 2;
 
-    // Subtitles
+    // Subtitles: the room's choice, then our own (which only changes what this browser shows).
     const sm = $('m-subs-menu');
     const sh = document.createElement('h4');
     sh.textContent = 'Subtitles (changes it for everyone)';
-    const items = [this._menuItem('Off', !s.sub, () => this.sync.setSubtitle(null))];
+    const tracks = [];
     for (const t of info?.subtitleTracks || []) {
       let note = '';
       if (t.unsupported) note = ['not available when streaming', 'could not be loaded'].includes(t.unsupported) ? t.unsupported : 'not supported';
       else if (t.waiting) note = 'loads when selected'; // streaming: read on demand
       else if (t.progress < 1) note = `loading ${Math.round(t.progress * 100)}%`;
       else if (t.source === 'external') note = 'file';
-      items.push(this._menuItem(t.label, s.sub === t.id, () => this.sync.setSubtitle(t.id), note, !!t.unsupported));
+      else if (t.source === 'private') note = 'only for you';
+      tracks.push({ id: t.id, label: t.label, note, disabled: !!t.unsupported, mine: t.source === 'private' });
     }
     // Shared subtitle files we haven't received yet.
     for (const f of s.subFiles) {
-      if (!info?.subtitleTracks.some((t) => t.id === f.id)) items.push(this._menuItem(f.name, s.sub === f.id, () => this.sync.setSubtitle(f.id), 'receiving…', true));
+      if (!info?.subtitleTracks.some((t) => t.id === f.id)) tracks.push({ id: f.id, label: f.name, note: 'receiving…', disabled: true });
     }
+    const items = [this._menuItem('Off', !s.sub, () => this.sync.setSubtitle(null))];
+    // Files loaded just for us stay out of the room's list: nobody else could show them.
+    for (const t of tracks) if (!t.mine) items.push(this._menuItem(t.label, s.sub === t.id, () => this.sync.setSubtitle(t.id), t.note, t.disabled));
     // Subtitle files next to the movie on Drive (ones already shared show up above as normal entries).
     const dsubs = this._driveSubtitles();
     if (dsubs) {
@@ -97,14 +101,32 @@ export class MovieMenus {
         items.push(lh);
       }
     }
-    const load = document.createElement('button');
-    load.type = 'button';
-    load.append(icon('folder'), document.createTextNode('Load subtitle file (.srt, .vtt, .ass)…'));
-    load.onclick = (e) => {
+    items.push(this._loadButton('Load subtitle file (.srt, .vtt, .ass)…', 'sub-file'));
+
+    // Just for me: follow the room, turn subtitles off, pick another track, or load a file nobody else gets.
+    if (info) {
+      const mine = this.sync.mySub;
+      const mh = document.createElement('h4');
+      mh.textContent = 'Just for me';
+      items.push(mh, this._menuItem('Same as everyone', mine === undefined, () => this.sync.setMySubtitle(undefined)));
+      if (s.sub) items.push(this._menuItem('Off', mine === null, () => this.sync.setMySubtitle(null)));
+      for (const t of tracks) {
+        if (t.id !== s.sub) items.push(this._menuItem(t.label, mine === t.id, () => this.sync.setMySubtitle(t.id), t.note, t.disabled));
+      }
+      items.push(this._loadButton('Load a file just for me…', 'my-sub-file'));
+    }
+    sm.replaceChildren(sh, ...items);
+  }
+
+  _loadButton(label, inputId) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.append(icon('folder'), document.createTextNode(label));
+    b.onclick = (e) => {
       e.stopPropagation();
-      sm.hidden = true;
-      $('sub-file').click();
+      $('m-subs-menu').hidden = true;
+      $(inputId).click();
     };
-    sm.replaceChildren(sh, ...items, load);
+    return b;
   }
 }

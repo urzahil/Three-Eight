@@ -123,6 +123,11 @@ export class MovieSync extends EventTarget {
     this.state = emptyState();
     this.subTexts = new Map(); // external subtitle id -> {id, name, text}, only for files the room shares now
     this.subEarly = new Map(); // files that arrived before the state that lists them (the sharer sends the file first)
+    // Our own subtitle choice, never shared: undefined follows the room, null is off just for us, otherwise a
+    // track id. It lasts until the room picks another subtitle or another movie.
+    this.mySub = undefined;
+    // Subtitle files we loaded only for ourselves (id -> {id, name}): never sent to peers, dropped with the movie.
+    this.myFiles = new Map();
     this.peerStatus = new Map(); // peerId -> {file, ready, buffering}
     this.localFile = null; // {name, size, duration} of the file we loaded
     this.useAnyway = false; // user accepted a file that doesn't match
@@ -179,6 +184,19 @@ export class MovieSync extends EventTarget {
     return d ? Math.min(t, d) : t;
   }
 
+  /** The subtitle this browser shows: our own choice if we made one, else the room's. */
+  get subtitle() {
+    return this.mySub !== undefined ? this.mySub : this.state.sub;
+  }
+
+  /** Forget our own subtitle choice when the room moves on (another subtitle or movie). True if there was one. */
+  _resetMySub(prev, next) {
+    if (!sameMovie(prev.movie, next.movie)) this._dropMyFiles();
+    if (this.mySub === undefined || (prev.sub === next.sub && sameMovie(prev.movie, next.movie))) return false;
+    this.mySub = undefined;
+    return true;
+  }
+
   get fileMatches() {
     return !!this.localFile && (this.useAnyway || sameMovie(this.localFile, this.state.movie));
   }
@@ -189,6 +207,7 @@ export class MovieSync extends EventTarget {
     const next = { ...this.state, ...patch, seq: Math.min(this.state.seq + 1, MAX_SEQ), by: this.selfId };
     next.pos = clamp(next.pos, 0, MAX_POS);
     next.at = clamp(next.at, 0, MAX_AT);
+    this._resetMySub(this.state, next);
     this.state = next;
     this.mesh.broadcast({ type: 'sync-state', state: next });
     this._syncSubtitles();
@@ -248,8 +267,29 @@ export class MovieSync extends EventTarget {
     this._commit({ audio: index });
   }
 
+  /** Change the subtitle for everyone. */
   setSubtitle(id) {
+    this.mySub = undefined; // choosing for the room includes us
     this._commit({ sub: id });
+  }
+
+  /** Load a subtitle file only for us ({id, name, text}; the id must not collide with shared files') and show it. */
+  addMySubtitleFile(entry) {
+    this.myFiles.set(entry.id, { id: entry.id, name: entry.name });
+    this.player.addExternalSubtitle(entry.id, entry.name, entry.text, 'private');
+    this.setMySubtitle(entry.id);
+  }
+
+  _dropMyFiles() {
+    for (const id of this.myFiles.keys()) this.player.removeExternalSubtitle(id);
+    this.myFiles.clear();
+  }
+
+  /** Change the subtitle only here (null: off). undefined, or the room's own choice, follows the room again. */
+  setMySubtitle(id) {
+    this.mySub = id === undefined || id === this.state.sub ? undefined : id;
+    this._apply(false);
+    this._emit('state');
   }
 
   _addSubText(entry) {
@@ -292,7 +332,8 @@ export class MovieSync extends EventTarget {
       await p.setAudioTrack(s.audio);
       this.expectMediaChange(1000);
     }
-    const subId = s.sub && p.subtitles.has(s.sub) ? s.sub : null;
+    const want = this.subtitle;
+    const subId = want && p.subtitles.has(want) ? want : null;
     if (p.subtitleId !== subId) p.setSubtitle(subId);
 
     const target = this.expectedPosition();
@@ -418,6 +459,7 @@ export class MovieSync extends EventTarget {
         const s = cleanState(msg.state);
         if (!s || !newer(s, this.state)) return;
         const prev = this.state;
+        const resetMine = this._resetMySub(prev, s);
         this.state = s;
         if (!sameMovie(prev.movie, this.state.movie)) this.useAnyway = false;
         this._syncSubtitles();
@@ -425,7 +467,7 @@ export class MovieSync extends EventTarget {
         for (const f of this.state.subFiles) {
           if (!this.subTexts.has(f.id)) peer.send({ type: 'sub-request', id: f.id });
         }
-        this._emit('remote-change', { peer, prev, state: this.state });
+        this._emit('remote-change', { peer, prev, state: this.state, resetMine });
         this._apply(true);
         this._emit('state');
         this._sendStatus();

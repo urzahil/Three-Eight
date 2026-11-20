@@ -45,7 +45,9 @@ ffmpeg -i movie.mkv -map 0 -c copy -map 0:a:0 -c:a:1 aac -b:a:1 384k movie-aac.m
 - Embedded text subtitles supported by the remuxer include SRT, ASS/SSA, WebVTT and MP4 timed text. A participant with the file can load an embedded subtitle and share its text with the room.
 - For Google Drive movies, matching subtitle files alongside the film may be detected and loaded automatically. Additional matching files can be selected from the subtitle menu.
 - Image-based Blu-ray/DVD subtitles (PGS/VobSub) are not supported. Use a text subtitle such as SRT instead.
-- Subtitle selection is synchronized. Subtitle delay can be adjusted locally in Settings.
+- Subtitle selection is synchronized: loading a subtitle file or choosing a track turns it on for everyone.
+- Under **Just for me** in the CC menu, anyone can turn subtitles off, pick another track, or load a subtitle file only for themselves (it is not sent to anyone else). That choice lasts until someone picks a different subtitle for the room or starts another movie; **Same as everyone** goes back to the room's choice. A file loaded just for you stays in the menu until the movie changes.
+- Subtitle delay and size can be adjusted locally in Settings.
 
 ## Picture-in-picture
 

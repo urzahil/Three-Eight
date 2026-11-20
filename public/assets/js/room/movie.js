@@ -5,6 +5,17 @@ import { audioContext } from '../media.js';
 import { sameMovie } from '../sync.js';
 import { $, store, toast, setIcon, fmtTime, fmtSize, randomId, hashText, pipState } from './util.js';
 
+/** Subtitle file bytes as text: UTF-8, or Windows-1252 / Latin-1 (most older files) when it isn't UTF-8. */
+function decodeSubtitle(bytes) {
+  const text = new TextDecoder().decode(bytes);
+  if (!text.includes('\uFFFD')) return text;
+  try {
+    return new TextDecoder('windows-1252').decode(bytes);
+  } catch {
+    return text;
+  }
+}
+
 export class Movie {
   _initMovie() {
     const p = this.player;
@@ -34,6 +45,16 @@ export class Movie {
       if (!f) return;
       if (f.size > 5 * 1024 * 1024) return toast('Subtitle file is too large.', 'warn');
       await this._shareSubtitle(f.name, new Uint8Array(await f.arrayBuffer()));
+    });
+    $('my-sub-file').addEventListener('change', async (e) => {
+      const f = e.target.files[0];
+      e.target.value = '';
+      if (!f) return;
+      if (f.size > 5 * 1024 * 1024) return toast('Subtitle file is too large.', 'warn');
+      const text = decodeSubtitle(new Uint8Array(await f.arrayBuffer()));
+      // 'p' ids never match a shared file's 'x' id, so the room sharing the same file later can't remove ours.
+      this.sync.addMySubtitleFile({ id: 'p' + (await hashText(text)), name: f.name, text });
+      toast(`Subtitles “${f.name}” loaded just for you.`);
     });
 
     // Controls
@@ -116,15 +137,7 @@ export class Movie {
 
   /** Decode subtitle bytes and share them with the room (from a local file or Google Drive). */
   async _shareSubtitle(name, bytes, message) {
-    let text = new TextDecoder().decode(bytes);
-    if (text.includes('�')) {
-      // Not UTF-8: most older subtitle files are Windows-1252 / Latin-1.
-      try {
-        text = new TextDecoder('windows-1252').decode(bytes);
-      } catch {
-        /* keep */
-      }
-    }
+    const text = decodeSubtitle(bytes);
     const id = 'x' + (await hashText(text));
     this.sync.addSubtitleFile({ id, name, text });
     toast(message || `Subtitles “${name}” shared with everyone.`);
@@ -174,9 +187,9 @@ export class Movie {
     return p.installCues(id, cues);
   }
 
-  /** The room's selected subtitle is an embedded track we lack, and someone has it: get it from them. */
+  /** The subtitle we show (the room's or our own) is an embedded track we lack, and someone has it: get it from them. */
   _wantCues() {
-    const id = this.sync.state.sub;
+    const id = this.sync.subtitle;
     const p = this.player;
     if (!id || !/^e\d+$/.test(id) || !p.file?.remote || !p.needsCues(id) || !this.swarm.hasCueHolder(id)) return;
     const failed = this._cueFail.get(id);
@@ -442,7 +455,7 @@ export class Movie {
     });
   }
 
-  _announce({ peer, prev, state }) {
+  _announce({ peer, prev, state, resetMine }) {
     const who = this.profileOf(peer.id).name;
     const by = state.by === peer.id ? who : this.profileOf(state.by).name;
     if (!sameMovie(prev.movie, state.movie)) {
@@ -458,7 +471,8 @@ export class Movie {
     }
     if (prev.sub !== state.sub) {
       const t = state.sub ? this.player.subtitles.get(state.sub) : null;
-      toast(state.sub ? `${by} turned on subtitles${t ? ': ' + t.label : ''}` : `${by} turned subtitles off`);
+      const mine = resetMine ? '. Your own subtitle choice was reset.' : '';
+      toast((state.sub ? `${by} turned on subtitles${t ? ': ' + t.label : ''}` : `${by} turned subtitles off`) + mine);
     }
   }
 
