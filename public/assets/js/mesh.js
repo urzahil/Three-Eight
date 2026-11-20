@@ -239,6 +239,10 @@ class Peer {
     this.pendingCandidates = [];
     this.open = false;
     this.closed = false; // set by close()
+    // Names this RTCPeerConnection in every signal we send, so the other side can tell a rebuilt connection of
+    // ours from the one it knows (and drop candidates meant for an old one). `remoteConn` is theirs, once known.
+    this.connId = Math.random().toString(36).slice(2, 14);
+    this.remoteConn = null;
 
     const pc = new RTCPeerConnection({ iceServers: mesh.iceServers, bundlePolicy: 'max-bundle' });
     this.pc = pc;
@@ -329,7 +333,7 @@ class Peer {
         this.makingOffer = true;
         await pc.setLocalDescription();
         if (pc.localDescription?.type === 'offer') this.offerSentAt = Date.now();
-        mesh.signaling.signal(id, { description: pc.localDescription });
+        mesh.signaling.signal(id, { description: pc.localDescription, conn: this.connId });
       } catch (err) {
         console.warn('negotiation failed', err);
       } finally {
@@ -337,7 +341,7 @@ class Peer {
       }
     };
     pc.onicecandidate = ({ candidate }) => {
-      if (candidate) mesh.signaling.signal(id, { candidate });
+      if (candidate) mesh.signaling.signal(id, { candidate, conn: this.connId });
     };
     // Watchdog: if the connection doesn't come up, restart ICE (fresh
     // candidates). Covers rare negotiation races and network changes.
@@ -346,10 +350,16 @@ class Peer {
       this._watchdog = setTimeout(() => {
         if (pc.connectionState === 'connected' || pc.connectionState === 'closed') return;
         if (++this._attempts > 4) return;
-        try {
-          pc.restartIce();
-        } catch {
-          /* ignore */
+        if (pc.signalingState === 'have-local-offer') {
+          // Our offer (first or ICE restart) got no answer: lost on the way, e.g. while a socket reconnected. restartIce() does nothing
+          // until the negotiation is over, so send the same offer again: answering it twice is harmless.
+          if (mesh.signaling.joined && pc.localDescription) mesh.signaling.signal(id, { description: pc.localDescription, conn: this.connId });
+        } else {
+          try {
+            pc.restartIce();
+          } catch {
+            /* ignore */
+          }
         }
         watchdog();
       }, 8000 + this._attempts * 4000);
@@ -401,6 +411,7 @@ class Peer {
   }
 
   handleSignal(data) {
+    if (data.description && data.conn) this.remoteConn = data.conn;
     // Process signaling messages strictly in order.
     this._queue = (this._queue || Promise.resolve()).then(() => this._handleSignal(data));
     return this._queue;
@@ -422,7 +433,7 @@ class Peer {
         for (const c of this.pendingCandidates.splice(0)) await pc.addIceCandidate(c).catch(() => {});
         if (d.type === 'offer') {
           await pc.setLocalDescription();
-          this.mesh.signaling.signal(this.id, { description: pc.localDescription });
+          this.mesh.signaling.signal(this.id, { description: pc.localDescription, conn: this.connId });
         }
       } else if (data.candidate) {
         if (!pc.remoteDescription) {
@@ -580,14 +591,23 @@ export class Mesh extends EventTarget {
     });
     signaling.addEventListener('peer-left', (e) => this.removePeer(e.detail.id));
     signaling.addEventListener('signal', (e) => {
-      const { from, data } = e.detail;
+      const { from } = e.detail;
+      let { data } = e.detail;
       if (!data || typeof data !== 'object') return;
       if (data.description?.type === 'offer' && !this._takeOffer(from)) return;
+      // Which RTCPeerConnection of theirs this belongs to (older clients send none).
+      const conn = typeof data.conn === 'string' && data.conn && data.conn.length <= 32 ? data.conn : null;
+      if (data.conn !== undefined && conn !== data.conn) data = { ...data, conn: undefined };
       let peer = this.peers.get(from);
       if (!peer) peer = this.addPeer(from, this.names.get(from) || '');
-      // A new offer for a link that cannot take it: the other side rebuilt its connection, and only a fresh
-      // RTCPeerConnection of ours can get the negotiated channels open again.
-      else if (data.description?.type === 'offer' && this._needsFreshPeer(peer)) peer = this._rebuildLimited(from);
+      else if (data.description?.type === 'offer' && (this._isNewRemoteConn(peer, conn) || this._needsFreshPeer(peer))) {
+        // An offer from a rebuilt connection of theirs (a different conn id: our link may still look open while
+        // theirs is gone, and its description could never be applied to ours), or one our link cannot take:
+        // only a fresh RTCPeerConnection of ours can get the negotiated channels open again.
+        peer = this._rebuildLimited(from);
+      } else if (data.candidate && conn && peer.remoteConn && conn !== peer.remoteConn) {
+        return; // a candidate for a connection of theirs that this link does not (or no longer) negotiate with
+      }
       if (peer) peer.handleSignal(data);
     });
     // Our own connection to the server was lost and is back. The server may have told the others that we
@@ -624,6 +644,11 @@ export class Mesh extends EventTarget {
     }
     seen.times.push(now);
     return true;
+  }
+
+  /** Does this offer come from another RTCPeerConnection of theirs than the one our link negotiated with? */
+  _isNewRemoteConn(peer, conn) {
+    return !!conn && !!peer.remoteConn && conn !== peer.remoteConn;
   }
 
   /**

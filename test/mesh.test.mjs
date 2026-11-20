@@ -357,3 +357,59 @@ test('offers: a peer gets at most MAX_OFFERS_PER_PEER answered per window, other
     console.warn = realWarn;
   }
 });
+
+// ---- signaling: which connection of theirs a signal belongs to ---------------------------------------------
+
+function signalMesh() {
+  globalThis.MediaStream ??= class MediaStream {};
+  const signaling = new EventTarget();
+  const mesh = new Mesh(signaling, 'me-me-me-me', []);
+  const log = [];
+  const fakePeer = (id, remoteConn) => ({
+    id, remoteConn, open: true, polite: false, dc: { readyState: 'open' }, pc: { signalingState: 'stable', remoteDescription: {} },
+    handleSignal(data) { log.push({ peer: this, data }); },
+  });
+  mesh._rebuildLimited = (id) => {
+    log.push({ rebuilt: id });
+    const p = fakePeer(id, null);
+    mesh.peers.set(id, p);
+    return p;
+  };
+  const signal = (from, data) => signaling.dispatchEvent(Object.assign(new Event('signal'), { detail: { from, data } }));
+  return { mesh, log, fakePeer, signal };
+}
+
+test('an offer from a rebuilt connection of theirs gets a fresh link, though ours still looks open', () => {
+  const { mesh, log, fakePeer, signal } = signalMesh();
+  const old = fakePeer('peer-bbbbbbbb', 'connA1');
+  mesh.peers.set(old.id, old);
+  const offer = { type: 'offer', sdp: 'v=0' };
+  signal(old.id, { description: offer, conn: 'connA1' }); // a renegotiation of the same connection
+  assert.equal(log.at(-1).peer, old);
+  signal(old.id, { description: offer, conn: 'connA2' }); // they rebuilt (network change, reload)
+  assert.deepEqual(log.at(-2), { rebuilt: old.id });
+  assert.notEqual(log.at(-1).peer, old);
+  assert.equal(log.at(-1).data.conn, 'connA2');
+});
+
+test('an older client sends no conn id: offers are judged as before', () => {
+  const { mesh, log, fakePeer, signal } = signalMesh();
+  const p = fakePeer('peer-bbbbbbbb', 'connA1');
+  mesh.peers.set(p.id, p);
+  signal(p.id, { description: { type: 'offer', sdp: 'v=0' } });
+  assert.equal(log.length, 1);
+  assert.equal(log[0].peer, p, 'no rebuild: the link is open and the offer carries no id');
+});
+
+test('ICE candidates meant for another connection of theirs are dropped; others are delivered', () => {
+  const { mesh, log, fakePeer, signal } = signalMesh();
+  const p = fakePeer('peer-bbbbbbbb', 'connA2');
+  mesh.peers.set(p.id, p);
+  signal(p.id, { candidate: { candidate: 'old' }, conn: 'connA1' });
+  assert.equal(log.length, 0);
+  signal(p.id, { candidate: { candidate: 'new' }, conn: 'connA2' });
+  signal(p.id, { candidate: { candidate: 'legacy' } });
+  assert.deepEqual(log.map((l) => l.data.candidate.candidate), ['new', 'legacy']);
+  signal(p.id, { candidate: { candidate: 'odd' }, conn: { not: 'a string' } }); // not a valid id: treated as none
+  assert.equal(log.at(-1).data.conn, undefined);
+});
