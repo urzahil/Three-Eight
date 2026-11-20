@@ -137,6 +137,17 @@ The Compose configuration assumes the app is only reachable through the local re
 
 Behind a proxy without `TRUST_PROXY`, every visitor appears to come from the proxy's address, so per-address limits apply to all of them together: the password attempt limits, the limit on looking up rooms that don't exist (30 in 10 minutes, so room names can't be found by trying many), and the limit of 64 open connections per address (twice `MAX_ROOM_SIZE` if that is higher). The server logs a warning when it refuses a connection for that reason.
 
+### Rate limits
+
+Per-address limits count an IPv4 address on its own. An IPv6 address is counted under its /64, its /56 and its /48. A whole /56 gets twice one address's allowance, and a whole /48 four times. One subscriber usually controls a /56 or a /48, so switching between the /64s inside it does not give fresh attempts. The limits are:
+
+- **Admin password:** 10 wrong attempts per address in 15 minutes. After 100 failed logins from all addresses together within 15 minutes, an address that fails once gets no further attempts until its window ends, and the server logs a warning. An attacker with many addresses then gets one guess per address instead of ten, but cannot lock you out: logging in with the right password from an address that has not failed still works.
+- **Room passwords:** 20 wrong attempts per address in 10 minutes. The server checks at most 2 room passwords at a time, with up to 32 more waiting. Beyond that, a join is asked to retry, so a crowd of guesses cannot slow down the rest of the server.
+- **Rooms that don't exist:** 30 lookups per address in 10 minutes.
+- **Connections:** 64 open WebSocket connections per address, or twice `MAX_ROOM_SIZE` if that is higher.
+
+Use a long random password for the admin page and for rooms. These limits slow down guessing, but they cannot make a short password safe.
+
 If exposing port `4567` directly without a reverse proxy, edit `docker-compose.yml`: set `TRUST_PROXY: "false"` and change the `ports` mapping to publish on the interface you intend (for example `"4567:4567"`). Setting `TRUST_PROXY` in `.env` has no effect with Compose. HTTPS is still recommended and required for camera/microphone on non-localhost origins.
 
 ## Do I need TURN?

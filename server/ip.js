@@ -22,19 +22,37 @@ function ipv6Groups(ip) {
   return groups.length === 8 && groups.every((g) => Number.isInteger(g) && g >= 0 && g <= 0xffff) ? groups : null;
 }
 
+// The prefixes an IPv6 client is counted under, narrowest first. One subscriber controls a whole /64, and usually a
+// /56 or a /48 (a free tunnel broker hands out /48s): counting /64s alone would give one person 256 or 65,536 fresh
+// allowances.
+const IPV6_PREFIXES = [64, 56, 48];
+
+/** "2001:db8:12::/48": the first `bits` bits of the eight groups `g`, as text. */
+function prefixText(g, bits) {
+  const whole = bits >> 4;
+  const kept = g.slice(0, whole);
+  if (bits & 15) kept.push(g[whole] & (0xffff << (16 - (bits & 15))) & 0xffff);
+  return kept.map((x) => x.toString(16)).join(':') + `::/${bits}`;
+}
+
 /**
- * The limiter key for a client address: IPv4 as is, IPv4-mapped IPv6 (::ffff:1.2.3.4) as that IPv4 address, any
- * other IPv6 address as its /64 prefix (one subscriber controls a whole /64, so rotating inside it must not help).
- * Anything that is not an IP address is used unchanged.
+ * Every key a client address is counted under, narrowest first: IPv4 as is, IPv4-mapped IPv6 (::ffff:1.2.3.4) as that
+ * IPv4 address, any other IPv6 address as its /64, /56 and /48 prefixes. Anything that is not an IP address is one key,
+ * unchanged.
  */
-function limiterKey(ip) {
-  let text = String(ip || '').trim().toLowerCase().replace(/^\[|\]$/g, '').replace(/%.*$/, '');
-  if (net.isIPv4(text)) return text;
-  if (!net.isIPv6(text)) return String(ip || '');
+function limiterKeys(ip) {
+  const text = String(ip || '').trim().toLowerCase().replace(/^\[|\]$/g, '').replace(/%.*$/, '');
+  if (net.isIPv4(text)) return [text];
+  if (!net.isIPv6(text)) return [String(ip || '')];
   const g = ipv6Groups(text);
-  if (!g) return String(ip || '');
-  if (g.slice(0, 5).every((x) => x === 0) && g[5] === 0xffff) return `${g[6] >> 8}.${g[6] & 255}.${g[7] >> 8}.${g[7] & 255}`;
-  return g.slice(0, 4).map((x) => x.toString(16)).join(':') + '::/64';
+  if (!g) return [String(ip || '')];
+  if (g.slice(0, 5).every((x) => x === 0) && g[5] === 0xffff) return [`${g[6] >> 8}.${g[6] & 255}.${g[7] >> 8}.${g[7] & 255}`];
+  return IPV6_PREFIXES.map((bits) => prefixText(g, bits));
+}
+
+/** The narrowest limiter key for a client address (see limiterKeys): the address itself, or its IPv6 /64. */
+function limiterKey(ip) {
+  return limiterKeys(ip)[0];
 }
 
 /**
@@ -52,4 +70,4 @@ function forwardedAddress(value) {
   return net.isIP(text) ? text : '';
 }
 
-module.exports = { limiterKey, forwardedAddress };
+module.exports = { limiterKey, limiterKeys, forwardedAddress };

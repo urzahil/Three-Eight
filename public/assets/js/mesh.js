@@ -34,6 +34,13 @@ const MIN_REBUILD_MS = 1000;
 const REBUILD_DECAY_MS = 5 * 60 * 1000;
 // A local offer that is still unanswered after this long is considered lost (a normal answer takes a round trip).
 const OFFER_STALE_MS = 3000;
+// Offers from one peer that we take per OFFER_WINDOW_MS; more are ignored. A peer offers when the link is set up or
+// rebuilt, when it first shares its screen, and when ICE restarts: a few times a minute, up to about 10 on a link that
+// keeps failing (MAX_REBUILDS rebuilds, a few watchdog restarts). Each answer (and the candidates after it) counts
+// against our signaling budget on the server, so a peer that kept offering could otherwise make us send more than the
+// budget allows, and have our signals to everyone dropped. At 20 a minute, the others of a full room of 12 cannot.
+export const MAX_OFFERS_PER_PEER = 20;
+export const OFFER_WINDOW_MS = 60 * 1000;
 
 // Upload budget per outgoing video stream, by number of remote peers:
 // in a mesh every participant uploads one copy per peer.
@@ -556,6 +563,7 @@ export class Mesh extends EventTarget {
     signaling.addEventListener('signal', (e) => {
       const { from, data } = e.detail;
       if (!data || typeof data !== 'object') return;
+      if (data.description?.type === 'offer' && !this._takeOffer(from)) return;
       let peer = this.peers.get(from);
       if (!peer) peer = this.addPeer(from, this.names.get(from) || '');
       // A new offer for a link that cannot take it: the other side rebuilt its connection, and only a fresh
@@ -579,6 +587,24 @@ export class Mesh extends EventTarget {
     });
     this._attempts = new Map(); // peerId -> rebuilds since its data channel was last open
     this._lastRebuild = new Map(); // peerId -> time of the last rebuild
+    this._offers = new Map(); // peerId -> { times: when we took its offers within OFFER_WINDOW_MS, warned: when we last said we ignore it }
+  }
+
+  /** May we take (and so answer) another offer from this peer? Counts it when we may. Kept across rebuilds of the link. */
+  _takeOffer(id) {
+    const now = Date.now();
+    const seen = this._offers.get(id) || { times: [], warned: 0 };
+    seen.times = seen.times.filter((t) => now - t < OFFER_WINDOW_MS);
+    this._offers.set(id, seen);
+    if (seen.times.length >= MAX_OFFERS_PER_PEER) {
+      if (now - seen.warned >= OFFER_WINDOW_MS) {
+        seen.warned = now;
+        console.warn(`ignoring offers from ${id}: more than ${MAX_OFFERS_PER_PEER} in a minute`);
+      }
+      return false;
+    }
+    seen.times.push(now);
+    return true;
   }
 
   /**
@@ -669,6 +695,7 @@ export class Mesh extends EventTarget {
     this.names.delete(id);
     this._attempts.delete(id);
     this._lastRebuild.delete(id);
+    this._offers.delete(id);
     const peer = this.peers.get(id);
     if (!peer) return;
     peer.close();

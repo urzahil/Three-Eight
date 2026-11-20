@@ -35,6 +35,13 @@ const TREE_DEPTH = 32;
 const TREE_POSITIVE_MS = 60_000; // how long "this file is inside the room's folder" is believed
 const TREE_NEGATIVE_MS = 5 * 60_000; // ... and "it is not"
 const MAX_QUEUE = 64; // media requests waiting for an upstream slot
+// Metadata calls (listings, file details, the folder-tree walk) from all rooms together: at most META_RATE a second,
+// in bursts of up to META_BURST; META_QUEUE more may wait, and beyond that a request is told "busy". A member asking for
+// made-up IDs costs an uncached call each, and the API quota is the service account's: every room shares it. Google's
+// default per-minute quota is far above this rate.
+const META_RATE = 10;
+const META_BURST = 100;
+const META_QUEUE = 200;
 const MAX_LIST_ITEMS = 5000; // items of one folder listing
 const MAX_LIST_PAGES = 20; // pages of 1000 files read for one listing
 
@@ -167,6 +174,53 @@ function parseRange(header, size) {
   return { start, end: Math.min(end, size - 1) };
 }
 
+/** A token bucket: take() resolves when one more request may go out (`rate` a second, bursts of `burst`), oldest caller first. */
+class RateGate {
+  constructor(rate, burst, maxQueue) {
+    this.rate = rate;
+    this.burst = burst;
+    this.maxQueue = maxQueue;
+    this.tokens = burst;
+    this.at = Date.now();
+    this.queue = []; // resolve functions, oldest first
+    this.timer = null;
+  }
+
+  _refill() {
+    const now = Date.now();
+    this.tokens = Math.min(this.burst, this.tokens + ((now - this.at) / 1000) * this.rate);
+    this.at = now;
+  }
+
+  /** Rejects with a "busy" DriveError, at once, when maxQueue callers are waiting already. */
+  take() {
+    this._refill();
+    if (!this.queue.length && this.tokens >= 1) {
+      this.tokens--;
+      return Promise.resolve();
+    }
+    if (this.queue.length >= this.maxQueue) return Promise.reject(new DriveError('Google Drive is busy, try again shortly.', 503));
+    return new Promise((resolve) => {
+      this.queue.push(resolve);
+      this._schedule();
+    });
+  }
+
+  _schedule() {
+    if (this.timer) return;
+    const wait = Math.max(1, Math.ceil(((1 - this.tokens) / this.rate) * 1000));
+    this.timer = setTimeout(() => {
+      this.timer = null;
+      this._refill();
+      while (this.queue.length && this.tokens >= 1) {
+        this.tokens--;
+        this.queue.shift()();
+      }
+      if (this.queue.length) this._schedule();
+    }, wait);
+  }
+}
+
 const sleep = (ms, signal) => new Promise((resolve, reject) => {
   if (signal?.aborted) return reject(new DriveError('Cancelled', 499, { aborted: true }));
   const t = setTimeout(resolve, ms);
@@ -184,8 +238,9 @@ class GoogleDrive {
    * @param {number} [o.maxQueue]  media requests allowed to wait for a free upstream slot; more are refused as "busy"
    * @param {number} [o.maxListItems]  items of one folder listing kept (the rest is cut off and reported as truncated)
    * @param {number} [o.maxListPages]  pages of 1000 files read for one listing
+   * @param {number} [o.metaRate]  metadata calls a second, across all clients (bursts of o.metaBurst, o.metaQueue waiting)
    */
-  constructor({ account, apiBase = 'https://www.googleapis.com', cacheBytes = 256 * MiB, maxUpstream = 4, maxQueue = MAX_QUEUE, maxListItems = MAX_LIST_ITEMS, maxListPages = MAX_LIST_PAGES, retryBackoffMs = 400, networkRetryMs = 1000 }) {
+  constructor({ account, apiBase = 'https://www.googleapis.com', cacheBytes = 256 * MiB, maxUpstream = 4, maxQueue = MAX_QUEUE, maxListItems = MAX_LIST_ITEMS, maxListPages = MAX_LIST_PAGES, retryBackoffMs = 400, networkRetryMs = 1000, metaRate = META_RATE, metaBurst = META_BURST, metaQueue = META_QUEUE }) {
     this.account = account;
     this.apiBase = apiBase.replace(/\/+$/, '');
     this.cacheBytes = cacheBytes;
@@ -195,6 +250,7 @@ class GoogleDrive {
     this.maxListPages = maxListPages;
     this.retryBackoffMs = retryBackoffMs;
     this.networkRetryMs = networkRetryMs;
+    this._meta = new RateGate(metaRate, metaBurst, metaQueue);
 
     this._tok = null; // { value, exp }
     this._refreshing = null;
@@ -341,6 +397,7 @@ class GoogleDrive {
 
   async _json(pathAndQuery) {
     return this._retrying(async () => {
+      await this._meta.take(); // every attempt counts: a retry is a call too
       const res = await this._request(`${this.apiBase}/drive/v3/${pathAndQuery}`);
       if (!res.ok) throw await this._errorFrom(res);
       try {

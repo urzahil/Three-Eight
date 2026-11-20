@@ -202,3 +202,30 @@ test('a long stream lets go of the runs it has read past (their blocks are not p
   assert(Buffer.concat(parts).equals(data));
   assert.strictEqual(drive.active, 0);
 });
+
+test('metadata calls share one rate for all callers; past the waiting room they are refused as "busy" at once', async () => {
+  const drive = makeDrive({ metaRate: 20, metaBurst: 3, metaQueue: 2 }); // one call every 50 ms after a burst of 3
+  google.addFolder(id(900), 'Meta folder');
+  for (let i = 0; i < 8; i++) google.addFile(id(901 + i), `meta${i}.mp4`, id(900), Buffer.from('x'), 'video/mp4');
+  const t0 = Date.now();
+  const out = await Promise.all([...Array(8).keys()].map((i) => drive.fileMeta(id(901 + i)).then(
+    () => ({ at: Date.now() - t0 }),
+    (err) => ({ err, at: Date.now() - t0 }),
+  )));
+  const served = out.filter((o) => !o.err).map((o) => o.at).sort((a, b) => a - b);
+  const busy = out.filter((o) => o.err);
+  assert.strictEqual(served.length, 5, 'three at once, two after waiting');
+  assert.strictEqual(busy.length, 3);
+  for (const b of busy) {
+    assert(b.err instanceof DriveError);
+    assert.strictEqual(b.err.status, 503);
+    assert.match(b.err.message, /busy/);
+    assert(b.at < 40, 'refused without waiting');
+  }
+  assert(served[3] >= 40, `the first waiting call went out after a token was refilled (${served[3]} ms)`);
+  assert(served[4] >= 90, `and the second one 50 ms later (${served[4]} ms)`);
+  // The bucket refills: after a pause there is room for a burst again.
+  await sleep(200);
+  google.addFile(id(910), 'later.mp4', id(900), Buffer.from('x'), 'video/mp4');
+  assert.strictEqual((await drive.fileMeta(id(910))).name, 'later.mp4');
+});

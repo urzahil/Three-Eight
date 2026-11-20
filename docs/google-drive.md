@@ -51,7 +51,9 @@ Each room is associated with its own Drive folder. The service account may have 
 ## Limits and troubleshooting
 
 - Folder listings support up to 5,000 items; large folders display a notice.
-- A room can have at most 3 × `MAX_ROOM_SIZE` Drive streams open at once, and at most 64 requests wait for a free connection to Google before the server answers "busy, try again shortly".
+- A room can have at most 3 × `MAX_ROOM_SIZE` Drive streams open at once, and one member at most 8. At most 64 requests wait for a free connection to Google before the server answers "busy, try again shortly".
+- The server makes at most 10 metadata calls to Google per second (listings, file details, folder checks) for all rooms together, with bursts of up to 100. This keeps one member from using up the service account's API quota, which every room shares.
+- Requests for files that are not in the room's folder are limited to 60 per address in 10 minutes. Past that, the address gets "too many requests" for every Drive request until the window ends. The app only asks for files a listing showed, so people using it normally don't reach the limit.
 - Folder listings are cached for 45 seconds in the browser and 60 seconds on the server, and folder membership checks for 60 seconds. Use the reload button (↻) next to **From Google Drive** to refresh a listing.
 - Browsers without Media Source Extensions (such as old iOS versions) play Drive movies straight from the server and do not take part in peer sharing, which costs the server a full copy for that viewer.
 - Google may enforce download quotas on some files. If a quota error appears, use a local copy until it clears.
