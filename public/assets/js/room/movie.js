@@ -75,6 +75,13 @@ export class Movie {
       this._refreshVolume();
     };
     $('m-full').onclick = () => this.toggleFullscreen();
+    // The time at the right end of the seek bar shows the film's length, or (clicked) the time remaining.
+    this._showRemaining = store.get('movieRemaining', false) === true;
+    $('m-duration').onclick = () => {
+      this._showRemaining = !this._showRemaining;
+      store.set('movieRemaining', this._showRemaining || null);
+      this._renderTime();
+    };
     this._initSeekBar();
     this._initMenus();
 
@@ -426,13 +433,18 @@ export class Movie {
     if ($('stage').hidden || this._dragging) return;
     const d = this.sync.state.movie?.duration || this.player.duration || 0;
     const t = this._pos();
-    $('m-time').textContent = fmtTime(t);
-    $('m-duration').textContent = fmtTime(d);
+    this._showTimes(t, d);
     $('m-progress').style.width = d ? `${Math.min(100, (t / d) * 100)}%` : '0';
     this._refreshPlayButton(); // the room's clock reaches the end without any media event
     const b = this.player.loaded ? this.player.buffered.find(([a, e]) => a <= t + 0.5 && e >= t) : null;
     $('m-buffered').style.left = b && d ? `${(b[0] / d) * 100}%` : '0';
     $('m-buffered').style.width = b && d ? `${((b[1] - b[0]) / d) * 100}%` : '0';
+  }
+
+  /** Writes the elapsed time and, at the right end of the seek bar, the length or the time remaining. */
+  _showTimes(t, d) {
+    $('m-time').textContent = fmtTime(t);
+    $('m-duration').textContent = this._showRemaining ? `\u2212${fmtTime(Math.ceil(Math.max(0, d - t)))}` : fmtTime(d);
   }
 
   _initSeekBar() {
@@ -453,7 +465,7 @@ export class Movie {
       if (this._dragging) {
         const d = this.sync.state.movie?.duration || this.player.duration || 1;
         $('m-progress').style.width = `${(timeAt(e.clientX) / d) * 100}%`;
-        $('m-time').textContent = fmtTime(timeAt(e.clientX));
+        this._showTimes(timeAt(e.clientX), d);
       }
     });
     bar.addEventListener('pointerleave', () => { if (!this._dragging) $('m-hover').hidden = true; });

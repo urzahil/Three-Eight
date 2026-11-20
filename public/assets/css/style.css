@@ -202,6 +202,7 @@ button:focus-visible, .seek:focus-visible { outline: 2px solid var(--accent); ou
 .movie-controls { position: absolute; left: 0; right: 0; bottom: 0; padding: 30px 12px 8px; background: linear-gradient(transparent, var(--controls-scrim)); transition: opacity 200ms; z-index: 3; }
 .seek-row { display: flex; align-items: center; gap: 10px; }
 .time { font-size: 12px; font-variant-numeric: tabular-nums; color: var(--time-text); min-width: 44px; text-align: center; }
+.time-toggle { cursor: pointer; user-select: none; }
 .seek { position: relative; flex: 1; height: 18px; cursor: pointer; touch-action: none; }
 .seek::before, .seek-buffered, .seek-progress { content: ""; position: absolute; left: 0; top: 7px; height: 4px; border-radius: 2px; }
 .seek::before { right: 0; background: var(--seek-track); }
