@@ -126,6 +126,8 @@ export class MovieSync extends EventTarget {
     // Our own subtitle choice, never shared: undefined follows the room, null is off just for us, otherwise a
     // track id. It lasts until the room picks another subtitle or another movie.
     this.mySub = undefined;
+    // Subtitle files we loaded only for ourselves (id -> {id, name}): never sent to peers, dropped with the movie.
+    this.myFiles = new Map();
     this.peerStatus = new Map(); // peerId -> {file, ready, buffering}
     this.localFile = null; // {name, size, duration} of the file we loaded
     this.useAnyway = false; // user accepted a file that doesn't match
@@ -189,6 +191,7 @@ export class MovieSync extends EventTarget {
 
   /** Forget our own subtitle choice when the room moves on (another subtitle or movie). True if there was one. */
   _resetMySub(prev, next) {
+    if (!sameMovie(prev.movie, next.movie)) this._dropMyFiles();
     if (this.mySub === undefined || (prev.sub === next.sub && sameMovie(prev.movie, next.movie))) return false;
     this.mySub = undefined;
     return true;
@@ -268,6 +271,18 @@ export class MovieSync extends EventTarget {
   setSubtitle(id) {
     this.mySub = undefined; // choosing for the room includes us
     this._commit({ sub: id });
+  }
+
+  /** Load a subtitle file only for us ({id, name, text}; the id must not collide with shared files') and show it. */
+  addMySubtitleFile(entry) {
+    this.myFiles.set(entry.id, { id: entry.id, name: entry.name });
+    this.player.addExternalSubtitle(entry.id, entry.name, entry.text, 'private');
+    this.setMySubtitle(entry.id);
+  }
+
+  _dropMyFiles() {
+    for (const id of this.myFiles.keys()) this.player.removeExternalSubtitle(id);
+    this.myFiles.clear();
   }
 
   /** Change the subtitle only here (null: off). undefined, or the room's own choice, follows the room again. */

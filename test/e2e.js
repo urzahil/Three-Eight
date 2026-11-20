@@ -172,6 +172,18 @@ async function waitFor(page, fn, arg, timeout = 15000) {
   b = await state(bob);
   assert(b.subs !== '', 'bob follows the room again');
 
+  // Bob loads a subtitle file just for himself: it is on for him, and Alice never hears of it
+  await bob.setInputFiles('#my-sub-file', path.resolve(__dirname, 'fixtures', 'subs_en.srt'));
+  await sleep(800);
+  const subOf = (page) => page.evaluate(() => ({ id: window.room.player.subtitleId, menu: document.getElementById('m-subs-menu').innerText }));
+  const bobMine = await subOf(bob);
+  const aliceView = await subOf(alice);
+  console.log('bob loaded a file for himself:', bobMine.id, aliceView.id);
+  assert(/^p/.test(bobMine.id) && /Just for me[\s\S]*subs_en[\s\S]*Load a file just for me/.test(bobMine.menu), 'private file on for bob');
+  assert(!/^p/.test(aliceView.id) && !/subs_en/.test(aliceView.menu), 'alice does not get bob\'s private file');
+  await ctl(bob, '#m-subs');
+  await mine(bob, 'Same as everyone').click();
+
   // External subtitle file shared from Bob to Alice
   await bob.setInputFiles('#sub-file', path.resolve(__dirname, 'fixtures', 'subs_it.ass'));
   await sleep(1000);

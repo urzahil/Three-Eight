@@ -357,3 +357,22 @@ test('choosing a subtitle for the room also clears our own choice', (t) => {
   sync.addSubtitleFile({ id: 'x2', name: 'b.srt', text: '' }); // sharing a file turns it on for everyone, us included
   assert.equal(sync.mySub, undefined);
 });
+
+test('a subtitle file loaded just for us is shown here only, kept while the room changes subtitles, dropped with the movie', (t) => {
+  const { sync, player, peer } = loadedSync(t);
+  const sent = [];
+  sync.mesh.broadcast = (m) => sent.push(m);
+  player.addExternalSubtitle = (id, name, text, source) => { player.subs.set(id, { name, text, source }); player.subtitles.set(id, {}); };
+  player.removeExternalSubtitle = (id) => { player.subs.delete(id); player.subtitles.delete(id); };
+  sync.addMySubtitleFile({ id: 'p1', name: 'mine.srt', text: 'x' });
+  assert.equal(player.subs.get('p1').source, 'private');
+  assert.equal(player.subtitleId, 'p1');
+  assert.equal(sent.length, 0, 'nothing sent to the room');
+  assert.equal(sync.state.subFiles.some((f) => f.id === 'p1'), false);
+  sync._onMessage(peer, { type: 'sync-state', state: good({ seq: 4, sub: 'e1' }) });
+  assert.equal(player.subtitleId, 'e1', 'the room\'s new choice replaces ours');
+  assert(player.subs.has('p1'), 'but the file stays available to pick again');
+  sync._onMessage(peer, { type: 'sync-state', state: good({ seq: 5, sub: null, subFiles: [], movie: { name: 'B.mkv', size: 200, duration: 90 } }) });
+  assert.equal(player.subs.has('p1'), false, 'another movie drops it');
+  assert.equal(sync.myFiles.size, 0);
+});
