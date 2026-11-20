@@ -282,7 +282,8 @@ const encodeInFlight = new Map();
 function pickEncoding(req) {
   const accepted = new Map();
   for (const part of String(req.headers['accept-encoding'] || '').split(',')) {
-    const [name, ...params] = part.trim().toLowerCase().split(';');
+    const [raw, ...params] = part.trim().toLowerCase().split(';');
+    const name = raw.trim(); // "br ;q=0" names br
     if (!name) continue;
     const q = params.map((x) => /^\s*q=([\d.]+)\s*$/.exec(x)).find(Boolean);
     accepted.set(name, q ? parseFloat(q[1]) : 1);
@@ -1342,7 +1343,8 @@ function registered(ws) {
 // Only text is a name: any other JSON value (an object whose toString is a number, an array, ...) becomes "Guest".
 function cleanName(name) {
   if (typeof name !== 'string') return 'Guest';
-  return name.replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 40) || 'Guest';
+  // 40 code points, so an emoji is never cut in half.
+  return [...name.replace(/[\u0000-\u001f\u007f]/g, '').trim()].slice(0, 40).join('').trim() || 'Guest';
 }
 
 function leave(ws) {

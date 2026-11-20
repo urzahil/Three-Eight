@@ -30,11 +30,21 @@ export function mseSupports(mime) {
   }
 }
 
-function waitUpdate(sb) {
+// A SourceBuffer operation takes milliseconds; one that has not ended after this is stuck (a browser or MediaSource
+// failure), and waiting longer would leave the feeder hanging for good.
+export const UPDATE_TIMEOUT_MS = 15_000;
+
+/** Resolves on the SourceBuffer's next updateend; rejects on its error event, or with a TimeoutError. */
+export function waitUpdate(sb, ms = UPDATE_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
     const ok = () => { cleanup(); resolve(); };
     const bad = () => { cleanup(); reject(new Error('SourceBuffer error')); };
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(Object.assign(new Error('The SourceBuffer did not finish updating.'), { name: 'TimeoutError' }));
+    }, ms);
     const cleanup = () => {
+      clearTimeout(timer);
       sb.removeEventListener('updateend', ok);
       sb.removeEventListener('error', bad);
     };
@@ -45,7 +55,7 @@ function waitUpdate(sb) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-class Feeder {
+export class Feeder {
   constructor(engine, track) {
     this.engine = engine;
     this.track = track;
@@ -56,10 +66,34 @@ class Feeder {
     this.eos = false;
     this.ahead = AHEAD;
     this.lastEnd = -1; // element time of the end of the last appended fragment
+    this.updateTimeoutMs = UPDATE_TIMEOUT_MS;
+    this._skippedTo = -1; // element time of the merged range end we last continued from (_skipMerged)
   }
 
+  /**
+   * Waits until the SourceBuffer is not updating. An operation that never ends is aborted once; if the buffer
+   * is still busy after that, it is broken and this throws instead of waiting (or looping) forever.
+   */
   async _whenIdle() {
-    while (this.sb.updating) await waitUpdate(this.sb).catch(() => {});
+    let aborted = false;
+    for (let errors = 0; this.sb.updating && !this.engine.destroyed; ) {
+      try {
+        await waitUpdate(this.sb, this.updateTimeoutMs);
+      } catch (err) {
+        if (err.name !== 'TimeoutError') {
+          // An error event normally ends the operation; one that keeps the buffer busy repeatedly is not normal.
+          if (++errors > 3) throw err;
+          continue;
+        }
+        if (aborted) throw err;
+        aborted = true;
+        try {
+          if (this.engine.ms?.readyState === 'open') this.sb.abort();
+        } catch {
+          /* the MediaSource is gone */
+        }
+      }
+    }
   }
 
   async _append(data, gen) {
@@ -68,14 +102,18 @@ class Feeder {
       if (gen !== this.gen || this.engine.destroyed) return false;
       try {
         this.sb.appendBuffer(data);
-        await waitUpdate(this.sb);
+        await waitUpdate(this.sb, this.updateTimeoutMs);
         return true;
       } catch (err) {
         if (err.name !== 'QuotaExceededError' || attempt > 20) throw err;
-        // Buffer full: drop what's behind the playhead and keep less ahead.
+        // Buffer full: drop what's behind the playhead and keep less ahead. Also drop what lies beyond what we
+        // are filling: ranges left far ahead by earlier seeks (seek forward, then back) would otherwise fill the
+        // quota for good, and every retry would free nothing.
         this.ahead = Math.max(10, this.ahead * 0.7);
         const t = this.engine.video.currentTime;
         await this._remove(0, Math.max(0, t - 3));
+        const keep = Math.max(t + this.ahead, this.lastEnd) + 1;
+        if (keep < this.engine.ms.duration) await this._remove(keep, Infinity);
         await sleep(500);
       }
     }
@@ -86,7 +124,7 @@ class Feeder {
     await this._whenIdle();
     try {
       this.sb.remove(start, end);
-      await waitUpdate(this.sb);
+      await waitUpdate(this.sb, this.updateTimeoutMs);
     } catch {
       /* ignore */
     }
@@ -100,13 +138,36 @@ class Feeder {
     return 0;
   }
 
-  /** Is element-time t inside the range we are currently extending? */
+  /**
+   * Is element-time t inside the range we are currently extending? That range may have grown past our last
+   * append by merging with data appended earlier (see _skipMerged): it is still ours if it holds that append.
+   */
   continuousAt(t) {
     const b = this.sb.buffered;
     for (let i = 0; i < b.length; i++) {
-      if (b.start(i) - GAP <= t && b.end(i) >= t) return Math.abs(b.end(i) - this.lastEnd) < 1.5 || this.eos;
+      if (b.start(i) - GAP <= t && b.end(i) >= t) return this.eos || (this.lastEnd >= b.start(i) - GAP && this.lastEnd <= b.end(i) + 1.5);
     }
     return false;
+  }
+
+  /**
+   * The range we are extending reached data appended earlier (after a seek back) and the browser merged them:
+   * the cursor is still at our last append, but everything up to the merged range's end is already there.
+   * Continue from that end, rather than demux (and download) again what is buffered.
+   */
+  _skipMerged() {
+    if (this.lastEnd < 0 || this.eos || !this.cursor) return;
+    const b = this.sb.buffered;
+    for (let i = 0; i < b.length; i++) {
+      if (this.lastEnd < b.start(i) - GAP || this.lastEnd > b.end(i) + GAP) continue;
+      // Once per end: the cursor restarts at the keyframe before it, and the first fragments from there may still
+      // end before it; jumping again would restart at the same keyframe forever.
+      if (b.end(i) > this.lastEnd + 1.5 && Math.abs(b.end(i) - this._skippedTo) > 0.5) {
+        this._skippedTo = b.end(i);
+        this.reposition(b.end(i) - SHIFT);
+      }
+      return;
+    }
   }
 
   reposition(movieTime) {
@@ -145,6 +206,7 @@ class Feeder {
   async run() {
     const engine = this.engine;
     while (!engine.destroyed) {
+      this._skipMerged();
       const gen = this.gen;
       const t = engine.video.currentTime;
       if (!this.cursor || this.eos || this.failed || this.bufferedAhead(t) > this.ahead) {
@@ -253,6 +315,7 @@ export class MseEngine extends EventTarget {
     }
     this.ms.duration = (this.demux.duration || 0) + SHIFT;
     for (const f of this.feeders) await f._append(initSegment(f.track), f.gen);
+    if (this.destroyed) return; // replaced while the init segments were appended: attach nothing to the element
     for (const f of this.feeders) f.reposition(movieTime);
     this.video.addEventListener('seeking', this._onSeeking);
     this.video.currentTime = movieTime + SHIFT;
@@ -277,7 +340,13 @@ export class MseEngine extends EventTarget {
     const f = this.audioFeeder;
     if (!f) return false;
     if (track.mime !== f.mime && !('changeType' in SourceBuffer.prototype)) return false;
-    await f.switchTrack(track, this.video.currentTime - SHIFT);
+    try {
+      await f.switchTrack(track, this.video.currentTime - SHIFT);
+    } catch (err) {
+      // The buffer is stuck or broken: the player rebuilds the whole pipeline instead (false).
+      console.warn('MSE audio switch failed', err);
+      return false;
+    }
     return true;
   }
 

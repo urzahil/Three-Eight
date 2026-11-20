@@ -345,8 +345,15 @@ class Room {
   }
 
   async _wakeLock() {
+    // The visibilitychange listener outlives the room: once left, coming back to the tab must not lock the screen.
+    if (this.left) return;
     try {
-      this.lock = await navigator.wakeLock?.request('screen');
+      const lock = await navigator.wakeLock?.request('screen');
+      if (this.left) {
+        lock?.release(); // left while the request was pending
+        return;
+      }
+      this.lock = lock;
     } catch {
       /* not supported */
     }

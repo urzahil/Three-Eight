@@ -35,6 +35,8 @@ export class Pip {
   closePip() {
     pipState.window?.close();
     this.compactPip?.close();
+    // Native PiP (Safari) belongs to the movie's own <video>: it would otherwise float on after the movie or the room.
+    if (document.pictureInPictureElement === this.player.video) document.exitPictureInPicture().catch(() => {});
   }
 
   /** Canvas-based native PiP: no browser title bar, play/pause only. Must run inside the click handler. */

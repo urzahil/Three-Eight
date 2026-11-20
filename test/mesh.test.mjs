@@ -180,6 +180,64 @@ test('a short message goes out at once', () => {
   assert.deepEqual(dc.sent, ['{"type":"a"}']);
 });
 
+test('a short message waits in the queue while the channel is over the high-water mark', () => {
+  const dc = fakeChannel();
+  const s = new ChunkSender(dc);
+  dc.bufferedAmount = 1024 * 1024 + 1; // stalled: the browser buffer is full
+  assert.equal(s.send('{"type":"a"}'), true);
+  assert.deepEqual(dc.sent, []);
+  assert.equal(s.queue.length, 1);
+  dc.drain(); // bufferedamountlow
+  s.pump();
+  assert.deepEqual(dc.sent, ['{"type":"a"}']);
+  assert.equal(s.queue.length, 0);
+  assert.equal(s.queued, 0);
+  assert.equal(s.send('{"type":"b"}'), true); // recovered: straight out again
+  assert.deepEqual(dc.sent, ['{"type":"a"}', '{"type":"b"}']);
+});
+
+test('short messages on a stalled channel overflow the bounded queue instead of growing the browser buffer', () => {
+  const dc = fakeChannel();
+  const s = new ChunkSender(dc, 1000);
+  let overflows = 0;
+  s.onoverflow = () => overflows++;
+  dc.bufferedAmount = 1024 * 1024 + 1;
+  const msg = '{"type":"state","t":12345}'; // 26 chars
+  let ok = 0;
+  for (let k = 0; k < 100; k++) if (s.send(msg)) ok++;
+  assert.equal(dc.sent.length, 0);
+  assert.ok(overflows >= 1);
+  assert.ok(s.queued <= 1000);
+  assert.ok(ok < 100);
+});
+
+test('a short message whose send throws is reported, not thrown', () => {
+  const dc = fakeChannel();
+  const s = new ChunkSender(dc);
+  dc.send = () => {
+    const err = new Error('send queue full');
+    err.name = 'OperationError';
+    throw err;
+  };
+  assert.equal(s.send('{"type":"a"}'), false);
+  assert.equal(s.queue.length, 0);
+});
+
+test('queued messages are dropped when the channel closes, and nothing is sent after', () => {
+  const dc = fakeChannel();
+  const s = new ChunkSender(dc);
+  dc.bufferedAmount = 1024 * 1024 + 1;
+  s.send('{"type":"a"}');
+  s.send('{"type":"b"}');
+  dc.readyState = 'closed';
+  s.clear(); // what the channel's onclose does
+  dc.drain();
+  s.pump();
+  assert.deepEqual(dc.sent, []);
+  assert.equal(s.queued, 0);
+  assert.equal(s.send('{"type":"c"}'), false);
+});
+
 test('send reports a closed channel', () => {
   const dc = fakeChannel();
   dc.readyState = 'closed';
@@ -298,4 +356,60 @@ test('offers: a peer gets at most MAX_OFFERS_PER_PEER answered per window, other
     Date.now = realNow;
     console.warn = realWarn;
   }
+});
+
+// ---- signaling: which connection of theirs a signal belongs to ---------------------------------------------
+
+function signalMesh() {
+  globalThis.MediaStream ??= class MediaStream {};
+  const signaling = new EventTarget();
+  const mesh = new Mesh(signaling, 'me-me-me-me', []);
+  const log = [];
+  const fakePeer = (id, remoteConn) => ({
+    id, remoteConn, open: true, polite: false, dc: { readyState: 'open' }, pc: { signalingState: 'stable', remoteDescription: {} },
+    handleSignal(data) { log.push({ peer: this, data }); },
+  });
+  mesh._rebuildLimited = (id) => {
+    log.push({ rebuilt: id });
+    const p = fakePeer(id, null);
+    mesh.peers.set(id, p);
+    return p;
+  };
+  const signal = (from, data) => signaling.dispatchEvent(Object.assign(new Event('signal'), { detail: { from, data } }));
+  return { mesh, log, fakePeer, signal };
+}
+
+test('an offer from a rebuilt connection of theirs gets a fresh link, though ours still looks open', () => {
+  const { mesh, log, fakePeer, signal } = signalMesh();
+  const old = fakePeer('peer-bbbbbbbb', 'connA1');
+  mesh.peers.set(old.id, old);
+  const offer = { type: 'offer', sdp: 'v=0' };
+  signal(old.id, { description: offer, conn: 'connA1' }); // a renegotiation of the same connection
+  assert.equal(log.at(-1).peer, old);
+  signal(old.id, { description: offer, conn: 'connA2' }); // they rebuilt (network change, reload)
+  assert.deepEqual(log.at(-2), { rebuilt: old.id });
+  assert.notEqual(log.at(-1).peer, old);
+  assert.equal(log.at(-1).data.conn, 'connA2');
+});
+
+test('an older client sends no conn id: offers are judged as before', () => {
+  const { mesh, log, fakePeer, signal } = signalMesh();
+  const p = fakePeer('peer-bbbbbbbb', 'connA1');
+  mesh.peers.set(p.id, p);
+  signal(p.id, { description: { type: 'offer', sdp: 'v=0' } });
+  assert.equal(log.length, 1);
+  assert.equal(log[0].peer, p, 'no rebuild: the link is open and the offer carries no id');
+});
+
+test('ICE candidates meant for another connection of theirs are dropped; others are delivered', () => {
+  const { mesh, log, fakePeer, signal } = signalMesh();
+  const p = fakePeer('peer-bbbbbbbb', 'connA2');
+  mesh.peers.set(p.id, p);
+  signal(p.id, { candidate: { candidate: 'old' }, conn: 'connA1' });
+  assert.equal(log.length, 0);
+  signal(p.id, { candidate: { candidate: 'new' }, conn: 'connA2' });
+  signal(p.id, { candidate: { candidate: 'legacy' } });
+  assert.deepEqual(log.map((l) => l.data.candidate.candidate), ['new', 'legacy']);
+  signal(p.id, { candidate: { candidate: 'odd' }, conn: { not: 'a string' } }); // not a valid id: treated as none
+  assert.equal(log.at(-1).data.conn, undefined);
 });

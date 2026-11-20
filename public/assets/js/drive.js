@@ -34,6 +34,8 @@ async function serverError(res) {
 }
 
 export const networkError = (cause) => Object.assign(new Error(NETWORK_MESSAGE), { remote: true, cause });
+// A session request that was cancelled: replaced by a newer token's, or the room was left.
+const abortError = () => Object.assign(new Error('The Drive session request was cancelled.'), { name: 'AbortError' });
 
 // ISO 639-2 codes that subtitle files use next to the 2-letter ones.
 const LANG3 = { en: ['eng'], it: ['ita'], fr: ['fre', 'fra'], de: ['ger', 'deu'], es: ['spa'], pt: ['por'], nl: ['dut', 'nld'], ru: ['rus'], ja: ['jpn'], zh: ['chi', 'zho'], ko: ['kor'], pl: ['pol'], sv: ['swe'], tr: ['tur'], cs: ['cze', 'ces'], da: ['dan'], fi: ['fin'], no: ['nor'], hu: ['hun'], el: ['gre', 'ell'], he: ['heb'], ar: ['ara'], uk: ['ukr'], ro: ['rum', 'ron'] };
@@ -89,14 +91,26 @@ export function pickSubtitle(movieName, files, lang = '') {
 }
 
 export class DriveClient {
-  /** @param {{room: string, token: string, folder: string}} o  the room, its Drive token and the root folder's ID */
-  constructor({ room, token, folder }) {
+  /**
+   * @param {{room: string, token: string, folder: string, replaces?: DriveClient|null}} o  the room, its Drive token
+   * and the root folder's ID; `replaces` is the room's previous client (another folder), which is retired: its
+   * pending session request is aborted and ours is sent after it, since both set the same cookie.
+   */
+  constructor({ room, token, folder, replaces = null }) {
     this.room = room;
     this.token = token;
     this.folder = folder;
     this.cache = new Map(); // folder id ('root' for the room's folder) -> { p: Promise of its listing, at: when it was asked }
     this.session = null; // Promise of the cookie session for the current token
+    this._inflight = replaces?._retire() ?? null; // the session request still on the wire, if any
     this._startSession();
+  }
+
+  /** Stops this client from setting the cookie, without clearing it (a newer client takes it over). */
+  _retire() {
+    this.ended = true;
+    this._abort?.abort();
+    return this._inflight;
   }
 
   /**
@@ -108,32 +122,61 @@ export class DriveClient {
     this._startSession();
   }
 
+  /**
+   * Posts the current token for the cookie. Session requests are serialized: a newer one aborts the one still
+   * pending and is sent only once that has settled, so an older response can never set the cookie after a newer
+   * one (nor after endSession()). Whoever awaits a superseded request gets the outcome of the newest instead.
+   */
   _startSession() {
     if (this.ended) return this.session; // left the room: the cookie must stay cleared
     const token = this.token;
+    const prev = this._inflight;
+    this._abort?.abort();
+    const ctrl = new AbortController();
+    this._abort = ctrl;
     const p = (async () => {
+      if (prev) await prev.catch(() => {});
+      if (ctrl.signal.aborted) throw abortError();
       let res;
       try {
-        res = await fetch(`${this.base}/session`, { method: 'POST', headers: { Authorization: `Bearer ${token}` }, cache: 'no-store' });
+        res = await fetch(`${this.base}/session`, { method: 'POST', headers: { Authorization: `Bearer ${token}` }, cache: 'no-store', signal: ctrl.signal });
       } catch (err) {
+        if (ctrl.signal.aborted) throw abortError();
         throw networkError(err);
       }
       if (!res.ok) throw await serverError(res);
     })();
-    p.catch(() => {}); // nobody may be waiting for it; ensureSession() reports it to whoever is
-    this.session = p;
-    p.failed = false;
-    p.catch(() => { p.failed = true; });
-    return p;
+    // The raw request, which the next one waits for; `session` below is what callers see.
+    const inflight = p.finally(() => {
+      if (this._inflight === inflight) this._inflight = null;
+    });
+    inflight.catch(() => {});
+    this._inflight = inflight;
+    const session = p.catch((err) => {
+      // Superseded by a newer token: answer with that one (unless we left, which makes it final).
+      if (err?.name === 'AbortError' && this.session !== session && !this.ended) return this.session;
+      throw err;
+    });
+    session.catch(() => {}); // nobody may be waiting for it; ensureSession() reports it to whoever is
+    session.failed = false;
+    session.catch(() => { session.failed = true; });
+    this.session = session;
+    return session;
   }
 
   /**
    * Clears the cookie (it would otherwise outlive the page, up to the token's lifetime) and stops later calls from
-   * setting it again. `keepalive` lets the request finish while the page is being closed.
+   * setting it again. `keepalive` lets the request finish while the page is being closed. A session request still
+   * pending is aborted, and since its response may already be on the way, the cookie is cleared again once it has
+   * settled.
    */
   endSession() {
+    if (this.ended) return;
     this.ended = true;
-    fetch(`${this.base}/session`, { method: 'DELETE', keepalive: true, cache: 'no-store' }).catch(() => {});
+    this._abort?.abort();
+    const clear = () => fetch(`${this.base}/session`, { method: 'DELETE', keepalive: true, cache: 'no-store' }).catch(() => {});
+    clear();
+    this._inflight?.catch(() => {}).then(clear);
   }
 
   /**

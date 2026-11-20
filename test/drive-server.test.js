@@ -171,6 +171,27 @@ test('the folder-tree memo: "inside" is believed for 60 s, "not inside" for 5 mi
   }
 });
 
+test('the tree walk stops at an ancestor already known to be inside, and skips one known to be outside', async () => {
+  const drive = makeDrive();
+  google.addFolder(id(800), 'Walk root');
+  google.addFolder(id(801), 'Walk a', id(800));
+  google.addFolder(id(802), 'Walk b', id(801));
+  google.addFolder(id(803), 'Walk c', id(802));
+  google.addFile(id(810), 'deep.mp4', id(803), Buffer.from('x'), 'video/mp4');
+  drive.markInTree(id(800), [id(803)]); // as a listing of folder b would
+  const before = google.entries('meta').length;
+  assert.strictEqual(await drive.inTree(id(800), id(810)), true);
+  assert.strictEqual(google.entries('meta').length - before, 1, 'only the file itself was looked up');
+
+  google.addFolder(id(820), 'Outside');
+  google.addFolder(id(821), 'Outside sub', id(820));
+  google.addFile(id(830), 'out.mp4', id(821), Buffer.from('x'), 'video/mp4');
+  assert.strictEqual(await drive.inTree(id(800), id(821)), false);
+  const mid = google.entries('meta').length;
+  assert.strictEqual(await drive.inTree(id(800), id(830)), false);
+  assert.strictEqual(google.entries('meta').length - mid, 1, 'its parent is known to be outside: no walk above it');
+});
+
 test('a long stream lets go of the runs it has read past (their blocks are not pinned in memory)', async () => {
   const drive = makeDrive({ cacheBytes: 4 * MiB });
   google.addFolder(id(60), 'Long stream');
@@ -228,4 +249,13 @@ test('metadata calls share one rate for all callers; past the waiting room they 
   await sleep(200);
   google.addFile(id(910), 'later.mp4', id(900), Buffer.from('x'), 'video/mp4');
   assert.strictEqual((await drive.fileMeta(id(910))).name, 'later.mp4');
+});
+
+test('kindOf: a shortcut is never a video or subtitle, whatever its name', () => {
+  const { kindOf } = require('../server/drive');
+  const SHORTCUT = 'application/vnd.google-apps.shortcut';
+  assert.strictEqual(kindOf({ name: 'movie.mkv', mimeType: SHORTCUT }), null);
+  assert.strictEqual(kindOf({ name: 'movie.srt', mimeType: SHORTCUT }), null);
+  assert.strictEqual(kindOf({ name: 'movie.mkv', mimeType: 'application/octet-stream' }), 'video');
+  assert.strictEqual(kindOf({ name: 'x', mimeType: 'application/vnd.google-apps.folder' }), 'folder');
 });

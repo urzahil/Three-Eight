@@ -109,7 +109,10 @@ export function dOpsFromOpusHead(head, channels) {
     const gain = dv.getInt16(16, true);
     const family = head[18];
     const parts = [u8(0, ch), u16(preSkip), u32(rate), u16(gain & 0xffff), u8(family)];
-    if (family !== 0) parts.push(head.subarray(19, 21 + ch));
+    if (family !== 0) {
+      if (head.length < 21 + ch) return null; // the channel mapping table is cut short
+      parts.push(head.subarray(19, 21 + ch));
+    }
     return { box: box('dOps', ...parts), channels: ch };
   }
   return { box: box('dOps', u8(0, channels || 2), u16(312), u32(48000), u16(0), u8(0)), channels: channels || 2 };
@@ -154,10 +157,11 @@ export function mp4TrackFromMatroska(t, firstFrame) {
   const id = t.codecId;
   if (t.type === 'video') {
     const w = t.width || 1920, h = t.height || 1080;
-    if (id === 'V_MPEG4/ISO/AVC' && cp) {
+    // Too short to hold the profile/level bytes the codec string is made of: treat as unknown, not as garbage.
+    if (id === 'V_MPEG4/ISO/AVC' && cp && cp.length >= 4) {
       return { codecString: avcCodecString(cp), sampleEntry: visualSampleEntry('avc1', w, h, box('avcC', cp)) };
     }
-    if (id === 'V_MPEGH/ISO/HEVC' && cp) {
+    if (id === 'V_MPEGH/ISO/HEVC' && cp && cp.length >= 23) {
       return { codecString: hevcCodecString(cp), sampleEntry: visualSampleEntry('hvc1', w, h, box('hvcC', cp)) };
     }
     if (id === 'V_AV1' && cp && cp.length >= 4) {
@@ -185,6 +189,7 @@ export function mp4TrackFromMatroska(t, firstFrame) {
     }
     if (id === 'A_OPUS') {
       const d = dOpsFromOpusHead(cp, ch);
+      if (!d) return { unsupported: 'Opus with a damaged header' };
       return { codecString: 'opus', sampleEntry: audioSampleEntry('Opus', d.channels, 48000, d.box) };
     }
     if (id === 'A_FLAC') {

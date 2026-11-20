@@ -97,7 +97,7 @@ A successful WebSocket handshake returns `101 Switching Protocols`.
 
 ## Running without Docker
 
-Install Node.js 18 or newer, then from the repository:
+Install Node.js 22 or newer, then from the repository:
 
 ```bash
 npm ci

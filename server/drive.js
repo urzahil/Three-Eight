@@ -22,6 +22,8 @@ const fs = require('fs');
 const MiB = 1024 * 1024;
 const ID_RE = /^[A-Za-z0-9_-]{10,200}$/;
 const FOLDER = 'application/vnd.google-apps.folder';
+// A shortcut points at another file and has no content of its own: we don't resolve them, so they are never listed.
+const SHORTCUT = 'application/vnd.google-apps.shortcut';
 const VIDEO_EXT = new Set(['mkv', 'mp4', 'm4v', 'mov', 'webm', 'avi']);
 const SUB_EXT = new Set(['srt', 'vtt', 'ass', 'ssa']);
 const SCOPE = 'https://www.googleapis.com/auth/drive.readonly';
@@ -51,6 +53,7 @@ const ext = (name) => (String(name).match(/\.([A-Za-z0-9]+)$/)?.[1] || '').toLow
 /** What a Drive entry is for us: 'folder', 'video', 'subtitle', or null (documents, images, shortcuts, ...). */
 function kindOf(f) {
   if (f.mimeType === FOLDER) return 'folder';
+  if (f.mimeType === SHORTCUT) return null; // even one named movie.mkv
   const e = ext(f.name);
   if (String(f.mimeType).startsWith('video/') || VIDEO_EXT.has(e)) return 'video';
   if (SUB_EXT.has(e)) return 'subtitle';
@@ -133,14 +136,24 @@ class Memo {
     if (e && e.exp > Date.now()) return e.p;
     const entry = { p: Promise.resolve().then(fn), exp: Date.now() + this.ttl };
     this.map.set(key, entry);
-    entry.p.then((value) => { if (this.ttlOf) entry.exp = Date.now() + this.ttlOf(value); }, () => { if (this.map.get(key) === entry) this.map.delete(key); });
+    entry.p.then((value) => {
+      entry.settled = true;
+      entry.value = value;
+      if (this.ttlOf) entry.exp = Date.now() + this.ttlOf(value);
+    }, () => { if (this.map.get(key) === entry) this.map.delete(key); });
     this._prune();
     return entry.p;
   }
 
   put(key, value) {
-    this.map.set(key, { p: Promise.resolve(value), exp: Date.now() + (this.ttlOf ? this.ttlOf(value) : this.ttl) });
+    this.map.set(key, { p: Promise.resolve(value), exp: Date.now() + (this.ttlOf ? this.ttlOf(value) : this.ttl), settled: true, value });
     this._prune();
+  }
+
+  /** The answer for `key` if one is known and still fresh, without waiting or asking; else undefined. */
+  peek(key) {
+    const e = this.map.get(key);
+    return e && e.settled && e.exp > Date.now() ? e.value : undefined;
   }
 
   delete(key) {
@@ -525,7 +538,10 @@ class GoogleDrive {
           throw err;
         }
         for (const p of ps) {
-          if (p === root) {
+          // Ancestors already known (listed folders are marked by markInTree) end the walk without asking Drive.
+          const known = p === root ? true : this._tree.peek(`${root}/${p}`);
+          if (known === false) continue; // outside the tree: no way up to the root through it
+          if (known === true) {
             for (let n = node; n !== undefined; n = via.get(n)) this._tree.put(`${root}/${n}`, true);
             return true;
           }

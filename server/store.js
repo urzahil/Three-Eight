@@ -25,7 +25,7 @@ async function hashPassword(password) {
 async function verifyPassword(password, stored) {
   if (typeof password !== 'string' || typeof stored !== 'string' || !stored) return false;
   const [scheme, saltB64, keyB64] = stored.split('$');
-  if (scheme !== 'scrypt') return false;
+  if (scheme !== 'scrypt' || !saltB64 || !keyB64) return false; // damaged by hand-editing: not a match, not a crash
   const expected = Buffer.from(keyB64, 'base64');
   const key = await scrypt(password, Buffer.from(saltB64, 'base64'));
   return key.length === expected.length && crypto.timingSafeEqual(key, expected);
@@ -72,6 +72,44 @@ class RoomError extends Error {
   }
 }
 
+const HASH_RE = /^scrypt\$[A-Za-z0-9+/]+={0,2}\$[A-Za-z0-9+/]+={0,2}$/;
+// Stands in for a password hash that is damaged in rooms.json: no password matches it, so the room stays closed
+// (an unreadable hash must never turn into "no password") until an admin sets a new one.
+const BROKEN_HASH = 'invalid';
+
+/**
+ * One room record from rooms.json, checked and normalised, or null if it cannot be used (reported on stderr).
+ * The file may have been edited by hand or partly damaged: nothing in it is trusted to have the right shape.
+ */
+function loadRoom(key, room) {
+  if (!room || typeof room !== 'object' || Array.isArray(room)) {
+    console.error(`rooms.json: the entry "${key}" is not a room record; it is ignored.`);
+    return null;
+  }
+  const name = typeof room.name === 'string' && room.name ? room.name : key;
+  if (!RoomStore.validName(name)) {
+    console.error(`rooms.json: "${name}" is not a valid room name; the room is ignored.`);
+    return null;
+  }
+  // Every version of the store writes a string here ('' for an open room): anything else is damage.
+  let passwordHash = room.passwordHash;
+  if (passwordHash !== '' && (typeof passwordHash !== 'string' || !HASH_RE.test(passwordHash))) {
+    console.error(`rooms.json: the password of room "${name}" is damaged. Nobody can join it until an admin sets a new password.`);
+    passwordHash = BROKEN_HASH;
+  }
+  const r = {
+    name,
+    passwordHash,
+    createdAt: Number.isFinite(room.createdAt) ? room.createdAt : 0,
+    updatedAt: Number.isFinite(room.updatedAt) ? room.updatedAt : 0,
+  };
+  if (room.drive != null) {
+    if (typeof room.drive === 'object' && DRIVE_ID_RE.test(String(room.drive.folderId))) r.drive = { folderId: room.drive.folderId };
+    else console.error(`rooms.json: the Google Drive folder of room "${name}" is not valid; it is removed.`);
+  }
+  return r;
+}
+
 class RoomStore {
   constructor(dataDir) {
     this.file = path.join(dataDir, 'rooms.json');
@@ -92,7 +130,16 @@ class RoomStore {
         parsed = JSON.parse(text);
       } catch { /* handled below */ }
       if (parsed && typeof parsed.rooms === 'object' && parsed.rooms !== null && !Array.isArray(parsed.rooms)) {
-        for (const [key, room] of Object.entries(parsed.rooms)) if (room && typeof room === 'object') this.rooms[key] = room;
+        for (const [key, room] of Object.entries(parsed.rooms)) {
+          const r = loadRoom(key, room);
+          if (!r) continue;
+          const k = RoomStore.key(r.name);
+          if (this.rooms[k]) {
+            console.error(`${this.file}: room "${r.name}" appears twice; the first one is kept.`);
+            continue;
+          }
+          this.rooms[k] = r;
+        }
       } else {
         // Keep the unreadable file for the operator instead of overwriting it with the next save.
         const aside = `${this.file}.corrupt-${Date.now()}`;
@@ -187,7 +234,8 @@ class RoomStore {
   async check(name, password) {
     const r = this.get(name);
     if (!r) return false;
-    if (!r.passwordHash) return true;
+    if (r.passwordHash === '') return true; // only a deliberately empty password opens the room
+
     return verifyPassword(typeof password === 'string' ? password : '', r.passwordHash);
   }
 }

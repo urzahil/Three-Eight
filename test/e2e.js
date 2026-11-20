@@ -135,6 +135,26 @@ async function waitFor(page, fn, arg, timeout = 15000) {
   assert(a.paused && b.paused, 'both should be paused');
   assert(Math.abs(a.time - b.time) < 0.15, 'paused at same position');
 
+  // Space on a focused toolbar button presses that button: it must not start the movie for everyone.
+  await bob.focus('#t-chat');
+  for (let i = 0; i < 2; i++) { // twice, so the chat panel ends up as it was; checked after each press
+    await bob.keyboard.press(' ');
+    await sleep(1000);
+    a = await state(alice);
+    assert(a.paused, 'Space on a focused button must not toggle the room\'s playback');
+  }
+  // Letter shortcuts work with Caps Lock on ("K" without Shift).
+  await bob.evaluate(() => document.activeElement.blur());
+  await bob.keyboard.press('K');
+  await sleep(1200);
+  a = await state(alice);
+  assert(!a.paused, '"K" toggles playback like "k"');
+  await bob.keyboard.press('k');
+  await sleep(800);
+  a = await state(alice); b = await state(bob);
+  assert(a.paused && b.paused, 'paused again');
+  console.log('keyboard: Space on a button and Caps Lock shortcuts ok');
+
   // Bob seeks to 19.5s via keyboard-free API (seek bar click)
   await ctl(bob, '#m-time');
   const box = await bob.locator('#m-seek').boundingBox();
@@ -199,6 +219,18 @@ async function waitFor(page, fn, arg, timeout = 15000) {
   await carol.fill('#lobby-password', 'secret');
   await carol.click('#lobby-join');
   await waitFor(carol, () => !document.getElementById('stage').hidden);
+  // Another film under the room movie's file name: once its content is known to differ, Carol is asked (she
+  // cancels) instead of quietly watching it alone.
+  const fs = require('fs');
+  const os = require('os');
+  const odd = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'three-eight-e2e-')), path.basename(MOVIE));
+  fs.copyFileSync(path.resolve(__dirname, 'fixtures', 'single.mp4'), odd);
+  await carol.setInputFiles('#movie-file', odd);
+  await waitFor(carol, () => document.getElementById('mismatch-dialog').open, null, 20000);
+  console.log('mismatch asked after load:', await carol.evaluate(() => document.getElementById('mismatch-text').textContent));
+  await carol.click('#mismatch-dialog button[value="cancel"]');
+  await waitFor(carol, () => !window.room.player.file && !window.room.sync.localFile);
+  fs.rmSync(path.dirname(odd), { recursive: true, force: true });
   await carol.setInputFiles('#movie-file', MOVIE);
   await sleep(3000);
   a = await state(alice);

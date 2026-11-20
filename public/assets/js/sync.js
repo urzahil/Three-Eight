@@ -122,6 +122,7 @@ export class MovieSync extends EventTarget {
     this.selfId = selfId;
     this.state = emptyState();
     this.subTexts = new Map(); // external subtitle id -> {id, name, text}, only for files the room shares now
+    this.subAsked = new Map(); // shared subtitle id we lack -> ids of the peers already asked for it
     this.subEarly = new Map(); // files that arrived before the state that lists them (the sharer sends the file first)
     // Our own subtitle choice, never shared: undefined follows the room, null is off just for us, otherwise a
     // track id. It lasts until the room picks another subtitle or another movie.
@@ -240,10 +241,22 @@ export class MovieSync extends EventTarget {
     this._commit({ movie: null, paused: true, pos: 0, sub: null, subFiles: [] });
   }
 
+  /**
+   * Is the film over? By the room's clock, or because our own copy ended: its last frame can come well before the
+   * duration the container states (an MKV's Info may claim more), so the playhead may stop short of the end.
+   */
+  atEnd() {
+    if (!this.state.movie) return false;
+    if (this.fileMatches && this.player.loaded && this.player.video?.ended) return true;
+    const d = this.state.movie.duration || this.player.duration;
+    if (!d) return false;
+    if (this.fileMatches && this.player.loaded && this.player.time >= d - 0.5) return true;
+    return this.expectedPosition() >= d - 0.5;
+  }
+
   play() {
-    const d = this.state.movie?.duration || this.player.duration;
-    let pos = this.fileMatches ? this.player.time : this.expectedPosition();
-    if (d && pos >= d - 0.5) pos = 0;
+    // Play at the end starts over (from the start, not from where our copy happened to stop).
+    const pos = this.atEnd() ? 0 : this.fileMatches ? this.player.time : this.expectedPosition();
     this._commit({ paused: false, pos, at: this.now() });
   }
 
@@ -253,9 +266,7 @@ export class MovieSync extends EventTarget {
   }
 
   toggle() {
-    const d = this.state.movie?.duration;
-    const ended = d && this.expectedPosition() >= d - 0.5;
-    if (this.state.paused || ended) this.play();
+    if (this.state.paused || this.atEnd()) this.play();
     else this.pause();
   }
 
@@ -297,6 +308,18 @@ export class MovieSync extends EventTarget {
     this.player.addExternalSubtitle(entry.id, entry.name, entry.text);
   }
 
+  /** Ask `peer` for the shared subtitle files we still lack: each file once per peer, so another member can answer. */
+  _requestSubFiles(peer) {
+    for (const f of this.state.subFiles) {
+      if (this.subTexts.has(f.id)) continue;
+      let asked = this.subAsked.get(f.id);
+      if (!asked) this.subAsked.set(f.id, (asked = new Set()));
+      if (asked.has(peer.id)) continue;
+      asked.add(peer.id);
+      peer.send({ type: 'sub-request', id: f.id });
+    }
+  }
+
   /** Keep the external subtitles in step with the shared state: add early arrivals, drop files no longer shared. */
   _syncSubtitles() {
     const shared = new Set(this.state.subFiles.map((f) => f.id));
@@ -306,6 +329,7 @@ export class MovieSync extends EventTarget {
       this.subEarly.delete(id);
       if (!this.subTexts.has(id)) this._addSubText(early);
     }
+    for (const id of [...this.subAsked.keys()]) if (!shared.has(id) || this.subTexts.has(id)) this.subAsked.delete(id);
     for (const id of [...this.subTexts.keys()]) {
       if (shared.has(id)) continue;
       this.subTexts.delete(id);
@@ -457,16 +481,19 @@ export class MovieSync extends EventTarget {
     switch (msg.type) {
       case 'sync-state': {
         const s = cleanState(msg.state);
-        if (!s || !newer(s, this.state)) return;
+        if (!s) return;
+        if (!newer(s, this.state)) {
+          // The same state from another member (each sends theirs when a link opens): the first sender may not
+          // have had the subtitle files yet, so ask this one too.
+          if (s.seq === this.state.seq && s.by === this.state.by) this._requestSubFiles(peer);
+          return;
+        }
         const prev = this.state;
         const resetMine = this._resetMySub(prev, s);
         this.state = s;
         if (!sameMovie(prev.movie, this.state.movie)) this.useAnyway = false;
         this._syncSubtitles();
-        // Fetch any shared subtitle file we don't have yet.
-        for (const f of this.state.subFiles) {
-          if (!this.subTexts.has(f.id)) peer.send({ type: 'sub-request', id: f.id });
-        }
+        this._requestSubFiles(peer);
         this._emit('remote-change', { peer, prev, state: this.state, resetMine });
         this._apply(true);
         this._emit('state');
