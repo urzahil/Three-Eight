@@ -386,7 +386,10 @@ export class Movie {
   }
 
   _refreshPlayButton() {
-    const playing = !this.sync.state.paused;
+    // At the end the room's state still says "playing", but there is nothing left to pause: offer Play (again).
+    const playing = !this.sync.state.paused && !this.sync.atEnd();
+    if (playing === this._shownPlaying) return; // called by the time ticker too
+    this._shownPlaying = playing;
     setIcon($('m-play'), playing ? 'pause' : 'play');
   }
 
@@ -403,6 +406,7 @@ export class Movie {
     $('m-time').textContent = fmtTime(t);
     $('m-duration').textContent = fmtTime(d);
     $('m-progress').style.width = d ? `${Math.min(100, (t / d) * 100)}%` : '0';
+    this._refreshPlayButton(); // the room's clock reaches the end without any media event
     const b = this.player.loaded ? this.player.buffered.find(([a, e]) => a <= t + 0.5 && e >= t) : null;
     $('m-buffered').style.left = b && d ? `${(b[0] / d) * 100}%` : '0';
     $('m-buffered').style.width = b && d ? `${((b[1] - b[0]) / d) * 100}%` : '0';

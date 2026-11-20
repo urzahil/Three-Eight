@@ -256,6 +256,22 @@ test('a shared subtitle file that arrives before the state listing it is kept, a
   assert.equal(sent.filter((m) => m.type === 'sub-request').length, 0);
 });
 
+test('a missing subtitle file is asked of every member that sends the same state, once each', (t) => {
+  const { sync, player } = subSync(t);
+  const sent = { a: [], b: [] };
+  const a = { id: 'peer-aaaaaaaa', send: (m) => sent.a.push(m) };
+  const b = { id: 'peer-bbbbbbbb', send: (m) => sent.b.push(m) };
+  sync._onMessage(a, { type: 'sync-state', state: good() }); // lists x1; a has not received the file itself yet
+  sync._onMessage(a, { type: 'sync-state', state: good() }); // a repeat from the same peer asks nothing new
+  assert.deepEqual(sent.a.filter((m) => m.type === 'sub-request').map((m) => m.id), ['x1']);
+  sync._onMessage(b, { type: 'sync-state', state: good() }); // the same state from the sharer
+  assert.deepEqual(sent.b.filter((m) => m.type === 'sub-request').map((m) => m.id), ['x1']);
+  sync._onMessage(b, { type: 'sub-file', id: 'x1', name: 'a.srt', text: '1\n00:00:01,000 --> 00:00:02,000\nHi\n' });
+  assert.deepEqual([...player.subs.keys()], ['x1']);
+  const c = { id: 'peer-cccccccc', send: (m) => assert.fail(`nothing to ask once we have it: ${m.type}`) };
+  sync._onMessage(c, { type: 'sync-state', state: good() });
+});
+
 test('subtitle files nobody shares are bounded, and a new movie drops the old one\'s files', (t) => {
   const { sync, player, peer } = subSync(t);
   for (let i = 0; i < 100; i++) sync._onMessage(peer, { type: 'sub-file', id: 'junk' + i, name: 'j.srt', text: 'x' });
@@ -375,4 +391,26 @@ test('a subtitle file loaded just for us is shown here only, kept while the room
   sync._onMessage(peer, { type: 'sync-state', state: good({ seq: 5, sub: null, subFiles: [], movie: { name: 'B.mkv', size: 200, duration: 90 } }) });
   assert.equal(player.subs.has('p1'), false, 'another movie drops it');
   assert.equal(sync.myFiles.size, 0);
+});
+
+test('end of the film: our copy ended short of the stated duration, so Play starts over from 0', (t) => {
+  const { sync, player } = loadedSync(t); // movie of 60 s
+  player.time = 59.2; // the last frame came 0.8 s before the duration the container claims
+  player.video.ended = true;
+  assert.equal(sync.atEnd(), true);
+  sync.toggle();
+  assert.equal(sync.state.paused, false);
+  assert.equal(sync.state.pos, 0, 'starts over, rather than "playing" from where the copy stopped');
+});
+
+test('atEnd: not before the end, and by the room clock without a copy of our own', (t) => {
+  const { sync, player } = loadedSync(t);
+  player.time = 30;
+  player.video.ended = false;
+  assert.equal(sync.atEnd(), false);
+  sync.toggle(); // pauses: the film is still playing
+  assert.equal(sync.state.paused, true);
+  sync.localFile = null;
+  sync.state = { ...sync.state, paused: true, pos: 59.8 };
+  assert.equal(sync.atEnd(), true);
 });
