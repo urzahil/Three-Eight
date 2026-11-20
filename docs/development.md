@@ -62,6 +62,8 @@ The browser suite requires ffmpeg and Playwright's Chromium. Each browser script
 
 `npm test` runs the unit tests, including `test/swarm.test.mjs` for the movie-sharing protocol.
 
+The app version appears in two places: `version` in `package.json` and the `#app-version` text in the Settings dialog (`public/index.html`). Bump both together; `test/version.test.js` fails if they differ.
+
 Some checks can also be run directly:
 
 ```bash
