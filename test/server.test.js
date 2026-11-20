@@ -10,7 +10,7 @@ const path = require('node:path');
 const WebSocket = require('ws');
 const http = require('node:http');
 const net = require('node:net');
-const { RoomStore, parseDriveFolder } = require('../server/store');
+const { RoomStore, parseDriveFolder, hashPassword, verifyPassword } = require('../server/store');
 const { limiterKey, limiterKeys } = require('../server/ip');
 const { startFakeGoogle } = require('./fake-google');
 
@@ -942,6 +942,53 @@ test('RoomStore: an unparseable rooms.json is moved aside, not overwritten', asy
   }
 });
 
+test('RoomStore: damaged room records are checked one by one, and a broken password never opens a room', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'three-eight-store-'));
+  const origError = console.error;
+  const logged = [];
+  try {
+    const good = await hashPassword('pw');
+    const rooms = {
+      ok: { name: 'Ok', passwordHash: good, createdAt: 1, updatedAt: 2 },
+      open: { name: 'Open', passwordHash: '', createdAt: 1, updatedAt: 2 },
+      nohash: { name: 'NoHash', passwordHash: null },
+      cut: { name: 'Cut', passwordHash: 'scrypt$' },
+      num: { name: 'Num', passwordHash: 42 },
+      arr: [1, 2],
+      badname: { name: 'bad name!', passwordHash: '' },
+      MixedKey: { passwordHash: '' }, // no name: the key is the name, and lookups are case-insensitive
+      dup: { name: 'OK', passwordHash: '' }, // a second "ok" must not replace the first
+      drive: { name: 'Drv', passwordHash: '', drive: { folderId: 'not valid' } },
+    };
+    fs.writeFileSync(path.join(dir, 'rooms.json'), JSON.stringify({ version: 1, rooms }));
+    console.error = (...a) => logged.push(a.join(' '));
+    const store = new RoomStore(dir);
+    console.error = origError;
+    assert.deepStrictEqual(store.list().map((r) => r.name).sort(), ['Cut', 'Drv', 'MixedKey', 'NoHash', 'Num', 'Ok', 'Open'].sort());
+    assert.strictEqual(await store.check('ok', 'pw'), true);
+    assert.strictEqual(await store.check('OK', 'wrong'), false);
+    assert.strictEqual(await store.check('open', ''), true);
+    for (const name of ['NoHash', 'Cut', 'Num']) {
+      assert.strictEqual(await store.check(name, ''), false, `${name} stays closed`);
+      assert.strictEqual(store.list().find((r) => r.name === name).hasPassword, true);
+    }
+    assert.ok(store.get('mixedkey'));
+    assert.strictEqual(store.get('drv').drive, undefined);
+    assert.ok(logged.some((l) => /password of room "Cut" is damaged/.test(l)));
+    assert.ok(logged.some((l) => /appears twice/.test(l)));
+    assert.ok(logged.some((l) => /"arr" is not a room record/.test(l)));
+    await store.setPassword('Cut', 'new'); // an admin can repair it
+    assert.strictEqual(await store.check('Cut', 'new'), true);
+  } finally {
+    console.error = origError;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('verifyPassword: a damaged hash is a mismatch, not an exception', async () => {
+  for (const h of ['scrypt$', 'scrypt$abc', 'scrypt$$', 'plain', '$$$']) assert.strictEqual(await verifyPassword('x', h), false, h);
+});
+
 test('RoomStore: an unreadable rooms.json stops the server instead of risking an overwrite', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'three-eight-store-'));
   try {
@@ -1287,6 +1334,8 @@ test('static files: ETag/Last-Modified, 304, compression, HEAD', async () => {
   assert.strictEqual(br.headers['content-encoding'], 'br');
   assert(zlib.brotliDecompressSync(br.body).equals(original));
   assert.strictEqual((await rawGet(p, { 'Accept-Encoding': 'br;q=0, gzip' })).headers['content-encoding'], 'gzip');
+  assert.strictEqual((await rawGet(p, { 'Accept-Encoding': 'br ;q=0, gzip' })).headers['content-encoding'], 'gzip', 'a space before the parameters');
+  assert.strictEqual((await rawGet(p, { 'Accept-Encoding': 'gzip, br ; q=1' })).headers['content-encoding'], 'br');
   assert.strictEqual((await rawGet(p, { 'Accept-Encoding': 'gzip', 'If-None-Match': gz.headers.etag })).status, 304);
   assert.strictEqual((await rawGet(p, { 'Accept-Encoding': 'gzip', 'If-None-Match': br.headers.etag })).status, 200);
   assert.strictEqual((await rawGet(p)).headers['content-encoding'], undefined, 'no Accept-Encoding, no compression');
@@ -1772,6 +1821,13 @@ test('hostile JSON in WebSocket messages never takes the server down', async () 
   b.sendJson({ type: 'time', c: 3 });
   await b.next();
   assert.deepStrictEqual((await rooms()).find((r) => r.name === 'hostile').online, ['A', 'Bob']);
+  // 40 characters at most, counted in code points: an emoji on the edge is kept whole, not cut in half.
+  b.sendJson({ type: 'rename', name: 'x'.repeat(39) + '😀😀' });
+  b.sendJson({ type: 'time', c: 4 });
+  await b.next();
+  const long = (await rooms()).find((r) => r.name === 'hostile').online[1];
+  assert.strictEqual(long, 'x'.repeat(39) + '😀');
+  assert.ok(long.isWellFormed(), 'no lone surrogate');
 
   // type, signal.to, and every join field with odd values.
   for (const v of WEIRD) {

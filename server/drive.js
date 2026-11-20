@@ -136,14 +136,24 @@ class Memo {
     if (e && e.exp > Date.now()) return e.p;
     const entry = { p: Promise.resolve().then(fn), exp: Date.now() + this.ttl };
     this.map.set(key, entry);
-    entry.p.then((value) => { if (this.ttlOf) entry.exp = Date.now() + this.ttlOf(value); }, () => { if (this.map.get(key) === entry) this.map.delete(key); });
+    entry.p.then((value) => {
+      entry.settled = true;
+      entry.value = value;
+      if (this.ttlOf) entry.exp = Date.now() + this.ttlOf(value);
+    }, () => { if (this.map.get(key) === entry) this.map.delete(key); });
     this._prune();
     return entry.p;
   }
 
   put(key, value) {
-    this.map.set(key, { p: Promise.resolve(value), exp: Date.now() + (this.ttlOf ? this.ttlOf(value) : this.ttl) });
+    this.map.set(key, { p: Promise.resolve(value), exp: Date.now() + (this.ttlOf ? this.ttlOf(value) : this.ttl), settled: true, value });
     this._prune();
+  }
+
+  /** The answer for `key` if one is known and still fresh, without waiting or asking; else undefined. */
+  peek(key) {
+    const e = this.map.get(key);
+    return e && e.settled && e.exp > Date.now() ? e.value : undefined;
   }
 
   delete(key) {
@@ -528,7 +538,10 @@ class GoogleDrive {
           throw err;
         }
         for (const p of ps) {
-          if (p === root) {
+          // Ancestors already known (listed folders are marked by markInTree) end the walk without asking Drive.
+          const known = p === root ? true : this._tree.peek(`${root}/${p}`);
+          if (known === false) continue; // outside the tree: no way up to the root through it
+          if (known === true) {
             for (let n = node; n !== undefined; n = via.get(n)) this._tree.put(`${root}/${n}`, true);
             return true;
           }
