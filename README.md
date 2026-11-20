@@ -27,7 +27,7 @@ Clone the repository and create your environment file:
 cp .env.example .env
 ```
 
-Edit `.env` and set a strong administrator password:
+Edit `.env` and set a strong administrator password (at least 9 characters; the server refuses to start with the example value):
 
 ```dotenv
 ADMIN_PASSWORD=replace-with-a-long-random-password
@@ -77,7 +77,7 @@ If you use another reverse proxy, configure it to forward WebSocket upgrades and
 4. Share the room link and password with your friends. A room named `movienight` is available at `https://your-domain.example/movienight`.
 5. Participants enter a display name and the room password, choose their camera and microphone, and join. The name, and optionally the password, are remembered on that device. A camera or microphone switched off in the lobby is not requested from the browser until it is turned on.
 
-The admin page shows who is online in each room and lets you create and delete rooms, change room passwords (optionally disconnecting everyone currently in the room), and attach a Google Drive folder to a room (optional).
+The admin page shows who is online in each room and lets you remove someone from a room, create and delete rooms, change room passwords (optionally disconnecting everyone currently in the room), and attach a Google Drive folder to a room (optional).
 
 ## Watch a movie
 
@@ -117,7 +117,7 @@ To enable Drive movies:
 3. Keep the key file private on your server. Do not commit it to Git.
 4. Configure `GOOGLE_SERVICE_ACCOUNT` to the key file's path. With Docker Compose, uncomment the read-only key mount in `docker-compose.yml` and set the variable in `.env` to the mounted path.
 5. Share the Drive folder with the service account email as **Viewer**.
-6. In `/admin`, attach that folder to the room.
+6. In `/admin`, attach that folder to the room. Give the room a password: in a room without one, anyone who knows its name can stream the whole folder (the admin page warns about this).
 
 See [Google Drive integration](docs/google-drive.md) for the full Docker mount example and security notes.
 
@@ -127,11 +127,11 @@ See [Google Drive integration](docs/google-drive.md) for the full Docker mount e
 |---|---|---|
 | `PORT` | `4567` | HTTP port |
 | `HOST` | `0.0.0.0` | Address the server listens on |
-| `ADMIN_PASSWORD` | Random if unset | Admin login password; set this explicitly |
+| `ADMIN_PASSWORD` | Random if unset | Admin login password, at least 9 characters; set this explicitly |
 | `DATA_DIR` | `./data` (Docker: `/data`) | Room storage location |
 | `TRUST_PROXY` | `false` (Compose: `true`) | Trust proxy headers; use only behind a trusted proxy |
 | `ALLOWED_ORIGINS` | — | Additional allowed WebSocket origins |
-| `MAX_ROOM_SIZE` | `12` | Room capacity (1–100); large rooms use more bandwidth |
+| `MAX_ROOM_SIZE` | `12` | Room capacity (1–50); large rooms use more bandwidth |
 | `STUN_URLS` | Built-in STUN servers | STUN server list |
 | `TURN_URLS` | — | Optional TURN server URLs for difficult network connections |
 | `TURN_SECRET` | — | TURN shared secret for coturn's secret-based authentication |

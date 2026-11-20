@@ -1,12 +1,12 @@
 // End-to-end test: admin creates a room, two participants join with fake
 // camera/mic, chat, and watch a movie in sync.
-// Usage: node test/e2e.js   (expects the server on BASE, default http://localhost:4567, ADMIN_PASSWORD=test)
+// Usage: node test/e2e.js   (expects the server on BASE, default http://localhost:4567, ADMIN_PASSWORD=test-admin-password)
 const { chromium } = require('playwright');
 const path = require('path');
 const assert = require('assert');
 
 const BASE = process.env.BASE || 'http://localhost:4567';
-const ADMIN = process.env.ADMIN_PASSWORD || 'test';
+const ADMIN = process.env.ADMIN_PASSWORD || 'test-admin-password';
 const MOVIE = path.resolve(__dirname, 'fixtures', process.env.MOVIE || 'multi.mkv');
 const ROOM = 'e2e-' + Date.now().toString(36);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));

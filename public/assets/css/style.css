@@ -82,6 +82,7 @@ h2 { font-size: 20px; }
 .muted { color: var(--muted); }
 .small { font-size: 13px; }
 .error { color: var(--danger-text); margin: 0; }
+.warning { color: var(--warn-text); margin: 0; }
 .spacer { flex: 1; }
 
 /* ---- Forms & buttons ---- */

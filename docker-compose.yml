@@ -89,6 +89,12 @@ services:
   #     - --denied-peer-ip=fe80::-febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff
   #     - --user-quota=12                      # simultaneous relays per login
   #     - --total-quota=100
+  #     # Bandwidth, in BYTES per second (each direction counted separately). A session is one relayed link between
+  #     # two friends (camera, screen and movie pieces): 2000000 = 16 Mbit/s, more than a 1080p film needs.
+  #     # bps-capacity is the total for all sessions: set it a little below what this machine's connection carries
+  #     # (12500000 = 100 Mbit/s), so leaked credentials cannot saturate it.
+  #     - --max-bps=2000000
+  #     - --bps-capacity=12500000
 
 volumes:
   three-eight-data:

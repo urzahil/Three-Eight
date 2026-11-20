@@ -33,8 +33,9 @@ Do not commit the key. Keep it outside public folders and backups that are share
 
 1. In Google Drive, share each room's folder with the service account email address (ending in `iam.gserviceaccount.com`) as **Viewer**. The folder does not need to be public.
 2. Open Three-Eight's `/admin` page and sign in.
-3. Click **Drive…** beside the room and paste the folder URL. The dialog displays the service account email for sharing.
-4. Save. Three-Eight checks that the account can access the folder and reports the result.
+3. Give the room a password (recommended). In a room without one, anyone who knows or guesses the room's name can join and stream the whole folder through your server. The admin page warns when a room with a folder has no password.
+4. Click **Drive…** beside the room and paste the folder URL. The dialog displays the service account email for sharing.
+5. Save. Three-Eight checks that the account can access the folder and reports the result.
 
 Each room is associated with its own Drive folder. The service account may have access to other folders, but Three-Eight serves only the folder attached to the room and its subfolders.
 
@@ -42,7 +43,8 @@ Each room is associated with its own Drive folder. The service account may have 
 
 - The server reads the folder and streams requested movie ranges to participants.
 - Browser clients request Drive data from Three-Eight; they do not call Google Drive themselves.
-- Room-scoped tokens are sent in authorization headers. For native video playback, the browser exchanges the token for a restricted cookie because a video element cannot add authorization headers.
+- Each member gets its own token for the room's folder, sent in authorization headers. For native video playback, the browser exchanges the token for a restricted cookie because a video element cannot add authorization headers.
+- A token is valid for one hour and renewed while the member stays in the room, so someone who leaves loses access within the hour. Removing someone in `/admin` ends their access at once, including downloads in progress; changing the room password ends everyone's (members still in the room get a new token).
 - Movies are not persisted on the server's disk. Stream data may be cached in memory for performance.
 - The integration uses a short-lived in-memory cache controlled by `DRIVE_CACHE_MB` (default 256 MB; values below 32 MB are raised to the minimum).
 

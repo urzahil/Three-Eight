@@ -1,8 +1,8 @@
 const $ = (id) => document.getElementById(id);
 
-function toast(text, ms = 3000) {
+function toast(text, ms = 3000, kind = '') {
   const el = document.createElement('div');
-  el.className = 'toast';
+  el.className = kind ? `toast ${kind}` : 'toast';
   el.textContent = text;
   $('toasts').appendChild(el);
   setTimeout(() => el.remove(), ms);
@@ -56,9 +56,31 @@ async function refresh() {
     const tdDrive = document.createElement('td');
     tdDrive.textContent = r.drive ? (driveNames.get(r.name + '|' + r.drive.folderId) || 'linked') : '—';
     if (!r.drive) tdDrive.className = 'muted';
+    else if (!r.hasPassword) {
+      // Anyone who knows the room's name can join, and so stream the folder.
+      tdDrive.textContent += ' · no password';
+      tdDrive.title = 'This room has no password: anyone with its link can stream this folder.';
+      tdDrive.className = 'warning';
+    }
     const tdOnline = document.createElement('td');
-    tdOnline.textContent = r.online.length ? r.online.join(', ') : '—';
-    if (!r.online.length) tdOnline.className = 'muted';
+    const members = r.members || [];
+    if (!members.length) {
+      tdOnline.textContent = '—';
+      tdOnline.className = 'muted';
+    }
+    for (const m of members) {
+      const chip = document.createElement('span');
+      chip.className = 'member';
+      const remove = document.createElement('button');
+      remove.type = 'button';
+      remove.className = 'member-remove';
+      remove.textContent = '×';
+      remove.title = `Remove ${m.name} from the room`;
+      remove.setAttribute('aria-label', remove.title);
+      remove.onclick = () => removeMember(r, m);
+      chip.append(m.name, remove);
+      tdOnline.append(chip);
+    }
     const tdAct = document.createElement('td');
     const copy = button('Copy link', async () => {
       try {
@@ -68,8 +90,8 @@ async function refresh() {
         prompt('Room link', roomUrl(r.name));
       }
     });
-    const pw = button('Password…', () => changePassword(r.name));
-    const drv = button('Drive…', () => changeDrive(r.name, r.drive));
+    const pw = button('Password…', () => changePassword(r.name, !!r.drive));
+    const drv = button('Drive…', () => changeDrive(r.name, r.drive, r.hasPassword));
     const del = button('Delete', async () => {
       if (!confirm(`Delete room “${r.name}”? Anyone inside will be disconnected.`)) return;
       try {
@@ -88,6 +110,21 @@ async function refresh() {
   $('empty').hidden = data.rooms.length > 0;
 }
 
+/** Disconnect one person from a room and end their Drive access. It does not keep them out: the password (or, for an open room, the link) still works. */
+async function removeMember(room, m) {
+  const after = room.hasPassword
+    ? 'Their access to the room\'s Google Drive folder ends now too. They can join again with the room password: to keep them out, change it.'
+    : 'Their access to the room\'s Google Drive folder ends now too. This room has no password, so they can join again with its link: give the room a password to keep them out.';
+  if (!confirm(`Remove “${m.name}” from “${room.name}”?\n\n${after}`)) return;
+  try {
+    await api('DELETE', `/rooms/${encodeURIComponent(room.name)}/members/${encodeURIComponent(m.id)}`, {});
+    toast(`${m.name} was removed from the room`);
+  } catch (err) {
+    toast(err.message);
+  }
+  refresh();
+}
+
 function button(label, onClick) {
   const b = document.createElement('button');
   b.className = 'btn';
@@ -97,10 +134,11 @@ function button(label, onClick) {
   return b;
 }
 
-function changePassword(name) {
+function changePassword(name, hasDrive) {
   const d = $('pw-dialog');
   $('pw-room').textContent = name;
   $('pw-new').value = '';
+  $('pw-drive').hidden = !hasDrive; // a warning: without a password, anyone with the link can stream the folder
   $('pw-kick').checked = false;
   d.returnValue = 'cancel';
   d.showModal();
@@ -108,7 +146,8 @@ function changePassword(name) {
     if (d.returnValue !== 'save') return;
     try {
       await api('PUT', '/rooms/' + encodeURIComponent(name), { password: $('pw-new').value, kick: $('pw-kick').checked });
-      toast('Password updated');
+      if (hasDrive && !$('pw-new').value) toast(`Password removed. Anyone with the link to “${name}” can now stream its Google Drive folder.`, 10000, 'warn');
+      else toast('Password updated');
     } catch (err) {
       toast(err.message);
     }
@@ -116,8 +155,9 @@ function changePassword(name) {
   }, { once: true });
 }
 
-function changeDrive(name, current) {
+function changeDrive(name, current, hasPassword) {
   const d = $('drive-dialog');
+  $('drive-nopw').hidden = hasPassword;
   $('drive-room').textContent = name;
   $('drive-link').value = current ? driveLink(current) : '';
   $('drive-share').hidden = !serviceAccount;
@@ -144,6 +184,7 @@ function changeDrive(name, current) {
       driveNames.set(name + '|' + drive.folderId, check.name);
       toast(`Folder “${check.name}” linked: ${check.items} items${check.truncated ? ' (very large: only the first part is listed)' : ''}`);
     }
+    if (drive && !hasPassword) toast(`“${name}” has no password: anyone with its link can stream this folder.`, 10000, 'warn');
     refresh();
   }, { once: true });
 }

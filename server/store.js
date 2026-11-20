@@ -63,8 +63,14 @@ function parseDriveFolder(input) {
   return { folderId };
 }
 
-// Errors the admin can act on (bad name, no such room): safe to show. Anything else is an internal failure.
-class RoomError extends Error {}
+// Errors the admin can act on (bad name, no such room): safe to show, with the HTTP status to answer with. Anything else
+// is an internal failure.
+class RoomError extends Error {
+  constructor(message, status = 400) {
+    super(message);
+    this.status = status;
+  }
+}
 
 class RoomStore {
   constructor(dataDir) {
@@ -149,11 +155,11 @@ class RoomStore {
   }
 
   async setPassword(name, password) {
-    if (!this.get(name)) throw new RoomError('No such room.');
+    if (!this.get(name)) throw new RoomError('No such room.', 404);
     if (typeof password !== 'string') throw new RoomError('The password must be text.');
     const passwordHash = password ? await hashPassword(password) : '';
     // The room may have been deleted while hashing.
-    if (!this.get(name)) throw new RoomError('No such room.');
+    if (!this.get(name)) throw new RoomError('No such room.', 404);
     const next = this._draft();
     const r = next[RoomStore.key(name)];
     r.passwordHash = passwordHash;
@@ -162,7 +168,7 @@ class RoomStore {
   }
 
   setDrive(name, drive) {
-    if (!this.get(name)) throw new RoomError('No such room.');
+    if (!this.get(name)) throw new RoomError('No such room.', 404);
     const next = this._draft();
     const r = next[RoomStore.key(name)];
     if (drive) r.drive = { folderId: drive.folderId };
@@ -172,7 +178,7 @@ class RoomStore {
   }
 
   delete(name) {
-    if (!this.get(name)) throw new RoomError('No such room.');
+    if (!this.get(name)) throw new RoomError('No such room.', 404);
     const next = this._draft();
     delete next[RoomStore.key(name)];
     this._commit(next);

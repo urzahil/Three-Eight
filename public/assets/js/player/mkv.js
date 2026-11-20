@@ -27,6 +27,14 @@ const ID = {
 const TOP_LEVEL = new Set([ID.SeekHead, ID.Info, ID.Tracks, ID.Cluster, ID.Cues, ID.Chapters, ID.Tags, ID.Attachments]);
 const UNKNOWN = -1;
 const td = new TextDecoder();
+// Sizes come from the file, which may be damaged, or crafted by whoever shares it (a friend, the Drive folder). An
+// element is read into memory whole, so a garbage size would make us read the rest of the file: anything above this is
+// treated as corruption. Real blocks are a few MB at most (a 4K keyframe).
+const MAX_ELEMENT = 64 * 1024 * 1024;
+// A Timecode is an unsigned integer of at most 8 bytes.
+const MAX_UINT_SIZE = 8;
+// One decompressed (zlib) subtitle block: text, never anywhere near this.
+const MAX_INFLATED = 4 * 1024 * 1024;
 
 // ---- EBML primitives --------------------------------------------------------
 function vintLength(first) {
@@ -186,7 +194,7 @@ export class MkvDemuxer {
     const h = readHeader(hb, 0);
     if (!h) return null;
     const size = h.size === UNKNOWN ? 0 : h.size;
-    const data = size > 64 * 1024 * 1024 ? null : await this.src.read(pos + h.headerLen, size);
+    const data = size > MAX_ELEMENT ? null : await this.src.read(pos + h.headerLen, size);
     return { id: h.id, data, size, headerLen: h.headerLen };
   }
 
@@ -398,6 +406,12 @@ export class MkvDemuxer {
         if (pos < 0) return;
         continue;
       }
+      if ((h.id === ID.Timecode && h.size > MAX_UINT_SIZE) || ((h.id === ID.SimpleBlock || h.id === ID.BlockGroup) && h.size > MAX_ELEMENT)) {
+        // A size no real file has: the data is damaged here. Go on from the next cluster rather than read it all in.
+        pos = await this._resync(src, pos + 1);
+        if (pos < 0) return;
+        continue;
+      }
       if (h.id === ID.Timecode) {
         await src.ensure(dataStart, h.size);
         clusterTc = readUint(src.view(dataStart, h.size), 0, h.size);
@@ -521,6 +535,7 @@ export class MkvDemuxer {
         if (t.compression.algo === 3) data = concatBytes(t.compression.settings, data);
         else if (t.compression.algo === 0) data = await inflate(data);
         else return;
+        if (!data) return; // a damaged block: skip it, keep the others
       }
       const start = blk.pts / this.timescale;
       const dur = blk.duration != null ? blk.duration / this.timescale : 4;
@@ -559,7 +574,7 @@ export class MkvDemuxer {
         const bpos = dataStart + c.relPos;
         await src.ensure(bpos, 16);
         const bh = readHeader(src.view(bpos, 16), 0);
-        if (!bh || (bh.id !== ID.BlockGroup && bh.id !== ID.SimpleBlock) || bh.size === UNKNOWN) continue;
+        if (!bh || (bh.id !== ID.BlockGroup && bh.id !== ID.SimpleBlock) || bh.size === UNKNOWN || bh.size > MAX_ELEMENT) continue;
         await src.ensure(bpos + bh.headerLen, bh.size);
         const data = src.view(bpos + bh.headerLen, bh.size);
         let blk = null, duration = null;
@@ -607,10 +622,32 @@ function concatBytes(a, b) {
   return out;
 }
 
-async function inflate(data) {
-  const ds = new DecompressionStream('deflate');
-  const out = new Response(new Blob([data]).stream().pipeThrough(ds));
-  return new Uint8Array(await out.arrayBuffer());
+/** zlib-decompress one block; null when it is corrupt or would grow past `max` bytes (a decompression bomb). */
+export async function inflate(data, max = MAX_INFLATED) {
+  const reader = new Blob([data]).stream().pipeThrough(new DecompressionStream('deflate')).getReader();
+  const parts = [];
+  let n = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      n += value.length;
+      if (n > max) {
+        reader.cancel().catch(() => {});
+        return null;
+      }
+      parts.push(value);
+    }
+  } catch {
+    return null; // not valid zlib data
+  }
+  const out = new Uint8Array(n);
+  let o = 0;
+  for (const p of parts) {
+    out.set(p, o);
+    o += p.length;
+  }
+  return out;
 }
 
 // ---- Cursor: reads samples of a single track sequentially ------------------

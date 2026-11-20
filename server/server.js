@@ -25,14 +25,16 @@ const { WebSocketServer } = require('ws');
 const { RoomStore, RoomError, parseDriveFolder } = require('./store');
 const { limiterKey, forwardedAddress } = require('./ip');
 const { GoogleDrive, DriveError, ID_RE: DRIVE_ID_RE, FOLDER, kindOf, loadServiceAccount, parseRange, MiB } = require('./drive');
-const { ConfigError, intSetting, trustedHops, driveCacheMb } = require('./config');
+const { ConfigError, intSetting, trustedHops, driveCacheMb, adminPassword } = require('./config');
 
 // Settings that are set but unusable stop the server (see config.js) rather than silently change its behaviour.
-let PORT, MAX_ROOM_SIZE, TRUSTED_HOPS, DRIVE_CACHE_SETTING_MB;
+let PORT, MAX_ROOM_SIZE, TRUSTED_HOPS, DRIVE_CACHE_SETTING_MB, ADMIN_PASSWORD;
 try {
+  ADMIN_PASSWORD = adminPassword(process.env);
   PORT = intSetting(process.env, 'PORT', 4567, 1, 65535);
-  // Each person sends video to everyone else, so the mesh gets heavy well before this upper bound.
-  MAX_ROOM_SIZE = intSetting(process.env, 'MAX_ROOM_SIZE', 12, 1, 100);
+  // Each person sends video to everyone else, so the mesh gets heavy well before this upper bound. The bound also keeps
+  // the relay limits below sound (see RELAY_FAIR_BYTES).
+  MAX_ROOM_SIZE = intSetting(process.env, 'MAX_ROOM_SIZE', 12, 1, 50);
   // Number of trusted reverse proxies in front of the server (0 = none, use the socket's address).
   // TRUST_PROXY=true/1/yes means one hop; a larger number (e.g. 2 for CDN + proxy) means that many.
   TRUSTED_HOPS = trustedHops(process.env);
@@ -59,8 +61,8 @@ for (const entry of (process.env.ALLOWED_ORIGINS || '').split(',').map((o) => o.
 }
 const DRIVE_DEBUG = process.env.DRIVE_DEBUG === '1';
 // Test knobs, honoured only together with DRIVE_DEBUG=1: how old a member's Drive token may get before a new one is
-// pushed, and how often the housekeeping tick (which does that) runs. Production uses 10 h and 30 s.
-const TOKEN_REFRESH_MS = (DRIVE_DEBUG && parseInt(process.env.DRIVE_TOKEN_REFRESH_MS, 10)) || 10 * 3600 * 1000;
+// pushed, and how often the housekeeping tick (which does that) runs. Production uses 45 min (a token lives 1 h) and 30 s.
+const TOKEN_REFRESH_MS = (DRIVE_DEBUG && parseInt(process.env.DRIVE_TOKEN_REFRESH_MS, 10)) || 45 * 60 * 1000;
 const HEARTBEAT_MS = (DRIVE_DEBUG && parseInt(process.env.HEARTBEAT_MS, 10)) || 30000;
 const MAX_MESSAGE_BYTES = 64 * 1024;
 const MAX_WS_BUFFERED = 4 * 1024 * 1024; // bytes queued for one client before it counts as gone
@@ -70,7 +72,6 @@ const MSG_BURST = 1000;
 const MSG_REFILL_PER_SEC = 100;
 const ADMIN_SESSION_MS = 12 * 3600 * 1000;
 
-let ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
 if (!ADMIN_PASSWORD) {
   ADMIN_PASSWORD = crypto.randomBytes(12).toString('base64url');
   console.warn(`ADMIN_PASSWORD is not set. Generated a temporary admin password for this run: ${ADMIN_PASSWORD}`);
@@ -121,14 +122,21 @@ const GOOGLE_API_BASE = 'https://www.googleapis.com';
 }
 
 // ---- Room tokens for the Drive endpoints -----------------------------------------
-// A token proves that its holder joined a room (it is only sent over the member's WebSocket, after the
-// password check: in the welcome message, and again before it expires or when the room's access changes). Format: base64url(JSON {r: room key, e: expiry ms, v: room version}) + '.' +
-// base64url(HMAC-SHA256 of the first part). The secret is random per process, so tokens do not
-// survive a restart (clients get a fresh one when they reconnect, and every TOKEN_REFRESH_MS while connected). The version is a hash of the
-// room's creation time, password hash and Drive folder: changing the password or the folder
-// invalidates every token issued before.
+// A token proves that its holder joined a room as a given member: each member gets its own, only over its WebSocket,
+// after the password check (in the welcome message, and again before it expires or when the room's access changes).
+// Format: base64url(JSON {r: room key, m: member id, i: issued ms, e: expiry ms, v: room version}) + '.' +
+// base64url(HMAC-SHA256 of the first part). The secret is random per process, so tokens do not survive a restart
+// (clients get a fresh one when they reconnect, and every TOKEN_REFRESH_MS while connected). The version is a hash of
+// the room's creation time, password hash and Drive folder: changing the password or the folder invalidates every
+// token issued before. Removing one member (admin page) invalidates the tokens issued to that member before the
+// removal (see revokeMember); if it joins again, its new token works.
 const TOKEN_SECRET = crypto.randomBytes(32);
-const TOKEN_TTL_MS = 12 * 3600 * 1000;
+// Short-lived, so that someone who left the room loses access soon; members get a new one every TOKEN_REFRESH_MS.
+const TOKEN_TTL_MS = 3600 * 1000;
+/** room key + '\0' + member id -> when the admin removed that member. Kept for TOKEN_TTL_MS (older tokens have expired). */
+const revokedMembers = new Map();
+
+const revocationKey = (roomKey, id) => `${roomKey}\0${id}`;
 
 function roomVersion(r) {
   return crypto.createHash('sha256').update(`${r.createdAt}\0${r.passwordHash || ''}\0${r.drive?.folderId || ''}`).digest('base64url').slice(0, 16);
@@ -138,12 +146,19 @@ function tokenSignature(body) {
   return crypto.createHmac('sha256', TOKEN_SECRET).update(body).digest('base64url');
 }
 
-function issueToken(r) {
-  const body = Buffer.from(JSON.stringify({ r: RoomStore.key(r.name), e: Date.now() + TOKEN_TTL_MS, v: roomVersion(r) })).toString('base64url');
+function issueToken(r, memberId) {
+  const now = Date.now();
+  const body = Buffer.from(JSON.stringify({ r: RoomStore.key(r.name), m: memberId, i: now, e: now + TOKEN_TTL_MS, v: roomVersion(r) })).toString('base64url');
   return `${body}.${tokenSignature(body)}`;
 }
 
-/** The room a valid token belongs to and the time it expires, or null. */
+/** Was this token issued to a member before the admin removed it? */
+function revoked(claim) {
+  const at = revokedMembers.get(revocationKey(claim.r, claim.m));
+  return at !== undefined && claim.i <= at;
+}
+
+/** A valid token's room, expiry and claims ({ room, exp, claim }), or null. */
 function checkToken(token) {
   if (typeof token !== 'string' || token.length > 600) return null;
   const dot = token.indexOf('.');
@@ -158,32 +173,45 @@ function checkToken(token) {
   } catch {
     return null;
   }
-  if (!claim || typeof claim.r !== 'string' || typeof claim.e !== 'number' || claim.e < Date.now()) return null;
+  if (!claim || typeof claim.r !== 'string' || typeof claim.m !== 'string' || typeof claim.i !== 'number'
+    || typeof claim.e !== 'number' || claim.e < Date.now() || revoked(claim)) return null;
   const room = store.get(claim.r);
   if (!room || !room.drive || claim.v !== roomVersion(room)) return null;
-  return { room, exp: claim.e };
+  return { room, exp: claim.e, claim };
 }
 
-/** The room a valid token belongs to, or null. */
-function verifyToken(token) {
-  return checkToken(token)?.room ?? null;
+/** Does a token checkToken() accepted still hold (room unchanged, member not removed)? For after an await. */
+function stillValid(checked) {
+  const now = store.get(checked.room.name);
+  return !!now && roomVersion(now) === roomVersion(checked.room) && !revoked(checked.claim);
 }
 
 // ---- ICE (STUN/TURN) configuration ---------------------------------------
 // STUN lets browsers discover their public address so they can connect
 // directly. TURN is only needed when two peers cannot reach each other
 // (symmetric NAT, strict firewalls); it relays media, so it is opt-in.
-function iceServers() {
-  const servers = [];
+// TURN credentials let their holder relay traffic through the operator's TURN server: they are only handed to room
+// members, after the password check (in the welcome message, and again before they expire). The public /api/config
+// lists STUN only.
+const TURN_URLS = (process.env.TURN_URLS || '').split(',').map((s) => s.trim()).filter(Boolean);
+const TURN_TTL_S = 12 * 3600;
+// Members get fresh TURN credentials when theirs are this old (they expire after TURN_TTL_S). DRIVE_DEBUG=1 lets tests shorten it.
+const ICE_REFRESH_MS = (DRIVE_DEBUG && parseInt(process.env.ICE_REFRESH_MS, 10)) || 10 * 3600 * 1000;
+
+function stunServers() {
   const stun = (process.env.STUN_URLS ?? 'stun:stun.l.google.com:19302,stun:stun.cloudflare.com:3478')
     .split(',').map((s) => s.trim()).filter(Boolean);
-  if (stun.length) servers.push({ urls: stun });
+  return stun.length ? [{ urls: stun }] : [];
+}
 
-  const turn = (process.env.TURN_URLS || '').split(',').map((s) => s.trim()).filter(Boolean);
+/** STUN and, when configured, TURN with credentials. For room members only. */
+function iceServers() {
+  const servers = stunServers();
+  const turn = TURN_URLS;
   if (turn.length) {
     if (process.env.TURN_SECRET) {
       // coturn "use-auth-secret" ephemeral credentials (valid 12 h).
-      const expiry = Math.floor(Date.now() / 1000) + 12 * 3600;
+      const expiry = Math.floor(Date.now() / 1000) + TURN_TTL_S;
       const username = `${expiry}:three-eight`;
       const credential = crypto.createHmac('sha1', process.env.TURN_SECRET).update(username).digest('base64');
       servers.push({ urls: turn, username, credential });
@@ -425,20 +453,30 @@ function clientError(message) {
   return Object.assign(new Error(message), { clientError: true });
 }
 
+// After a body turned out too large, this much more of it is read (and thrown away) so the 413 reaches the client:
+// closing a socket with unread data resets the connection, and the client may then never see the answer.
+const DRAIN_AFTER_LIMIT = 1024 * 1024;
+
 function readJson(req, limit = 16 * 1024) {
   return new Promise((resolve, reject) => {
     let size = 0;
+    let tooLarge = false;
     const chunks = [];
     req.on('data', (c) => {
       size += c.length;
       if (size > limit) {
-        reject(clientError('Body too large'));
-        req.destroy();
+        if (!tooLarge) {
+          tooLarge = true;
+          chunks.length = 0;
+          reject(Object.assign(clientError('Body too large'), { status: 413 }));
+        }
+        if (size > limit + DRAIN_AFTER_LIMIT) req.destroy(); // not worth reading any further
         return;
       }
       chunks.push(c);
     });
     req.on('end', () => {
+      if (tooLarge) return;
       try {
         const body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString('utf8')) : {};
         // Handlers read fields from the body: null, numbers, strings and arrays are not a request they can work with.
@@ -524,6 +562,11 @@ class FailLimiter {
 }
 const adminLimiter = new FailLimiter(10, 15 * 60 * 1000);
 const roomLimiter = new FailLimiter(20, 10 * 60 * 1000);
+// Lookups of rooms that do not exist (the lobby's GET /api/rooms/:room, or a join): room names are often guessable, and
+// a room without a password is open to whoever finds it, so finding names by trying many must be slow. While a client
+// is over the limit every lookup is refused, existing rooms included: the answer must not tell the two apart.
+const lookupLimiter = new FailLimiter(30, 10 * 60 * 1000);
+const LOOKUP_LIMITED = 'Too many rooms that do not exist were tried. Try again in a few minutes.';
 
 // ---- Admin sessions -----------------------------------------------------------
 const adminSessions = new Map(); // token -> expiry
@@ -555,36 +598,45 @@ function roomMembers(name) {
 }
 
 // What room members need to browse the room's Google Drive folder: a token for our endpoints and the
-// folder's ID. null when the room has no folder or the server has no service account.
-function driveInfo(r) {
+// folder's ID. null when the room has no folder or the server has no service account. In a room without a password
+// that is anyone who knows the room's name: the admin page warns about it.
+function driveInfo(r, memberId) {
   if (!r || !r.drive || !driveApi) return null;
-  return { token: issueToken(r), folder: r.drive.folderId };
+  return { token: issueToken(r, memberId), folder: r.drive.folderId };
 }
 
 function pushDrive(name) {
   const members = roomMembers(name);
   if (!members) return;
-  const info = driveInfo(store.get(name));
-  for (const m of members.values()) {
-    send(m.ws, { type: 'drive', drive: info });
+  const room = store.get(name);
+  for (const [id, m] of members) {
+    send(m.ws, { type: 'drive', drive: driveInfo(room, id) });
     m.driveAt = Date.now();
   }
 }
 
-/** Hand a fresh token to the members whose last one is older than TOKEN_REFRESH_MS (a token lives 12 h). */
+/** Hand a fresh token to the members whose last one is older than TOKEN_REFRESH_MS (a token lives TOKEN_TTL_MS). */
 function refreshDriveTokens() {
   if (!driveApi) return;
   const now = Date.now();
   for (const [key, members] of live) {
-    let info; // one token per room and tick
-    for (const m of members.values()) {
+    let room; // looked up once per room and tick
+    for (const [id, m] of members) {
       if (now - m.driveAt < TOKEN_REFRESH_MS) continue;
-      info ??= driveInfo(store.get(key));
+      room ??= store.get(key) || null;
+      const info = driveInfo(room, id);
       if (!info) break; // no folder (any more): nothing to refresh
       send(m.ws, { type: 'drive', drive: info });
       m.driveAt = now;
     }
   }
+}
+
+/** The admin removed a member: the tokens issued to it until now stop working, and its open Drive file responses are cut. */
+function revokeMember(roomKey, id) {
+  revokedMembers.set(revocationKey(roomKey, id), Date.now());
+  const set = driveStreams.get(roomKey);
+  if (set) for (const entry of [...set]) if (entry.member === id) entry.abort();
 }
 
 function kickRoom(name, code, message) {
@@ -599,10 +651,11 @@ function kickRoom(name, code, message) {
 }
 
 // ---- Google Drive endpoints --------------------------------------------------------
-// Open Drive file responses per room (roomKey -> Set of { version, abort }). A token is checked once, before a
+// Open Drive file responses per room (roomKey -> Set of { version, member, abort }). A token is checked once, before a
 // response starts; when the room's access changes (deleted, password, folder) the responses still streaming under the
-// old version are cut, so a client that asked for a whole film in one request cannot keep downloading it.
-/** @type {Map<string, Set<{version: string, abort: () => void}>>} */
+// old version are cut, and so are a member's when the admin removes it, so a client that asked for a whole film in
+// one request cannot keep downloading it.
+/** @type {Map<string, Set<{version: string, member: string, abort: () => void}>>} */
 const driveStreams = new Map();
 
 // At most this many file responses are open per room at once (a viewer has a few in flight; members x 3 is generous).
@@ -610,19 +663,19 @@ const driveStreams = new Map();
 const MAX_DRIVE_STREAMS_PER_ROOM = 3 * MAX_ROOM_SIZE;
 
 /**
- * Register a streaming response of `room` (the room object its token was verified against). Returns the function that
- * unregisters it, null when the room is gone or changed since the token was checked (nothing is registered then), or
- * 'busy' when the room already has too many open file responses.
+ * Register a streaming response under a token checkToken() accepted. Returns the function that unregisters it, null
+ * when the token no longer holds (room gone or changed, member removed: nothing is registered then), or 'busy' when
+ * the room already has too many open file responses.
  */
-function trackDriveStream(room, abort) {
-  const now = store.get(room.name);
+function trackDriveStream(checked, abort) {
+  if (!stillValid(checked)) return null;
+  const { room } = checked;
   const version = roomVersion(room);
-  if (!now || roomVersion(now) !== version) return null;
   const key = RoomStore.key(room.name);
   let set = driveStreams.get(key);
   if ((set?.size || 0) >= MAX_DRIVE_STREAMS_PER_ROOM) return 'busy';
   if (!set) driveStreams.set(key, (set = new Set()));
-  const entry = { version, abort };
+  const entry = { version, member: checked.claim.m, abort };
   set.add(entry);
   return () => {
     set.delete(entry);
@@ -699,7 +752,7 @@ function driveCookie(req, roomKey) {
 
 // POST   /api/rooms/:room/drive/session   Authorization: Bearer <room token>  ->  204 + the room's token cookie
 // DELETE /api/rooms/:room/drive/session   (no authentication)                 ->  204 + the cookie cleared
-// The cookie outlives the page (up to the token's 12 h), so a member who leaves clears it: on a shared computer the next
+// The cookie outlives the page (up to the token's hour), so a member who leaves clears it: on a shared computer the next
 // user must not inherit it. Clearing needs no token (it only removes the caller's own cookie), works for rooms that no
 // longer exist and does not depend on Drive being set up.
 function handleDriveSession(req, res, parts) {
@@ -737,7 +790,8 @@ async function handleDrive(req, res, url, parts) {
   if (!driveApi) return sendJson(res, 503, { error: 'Google Drive is not set up on this server.' }, DRIVE_HEADERS);
 
   const bearer = /^Bearer\s+(\S+)$/i.exec(String(req.headers.authorization || ''));
-  const room = verifyToken(bearer ? bearer[1] : driveCookie(req, RoomStore.key(parts[2])));
+  const checked = checkToken(bearer ? bearer[1] : driveCookie(req, RoomStore.key(parts[2])));
+  const room = checked?.room;
   if (!room || RoomStore.key(parts[2]) !== RoomStore.key(room.name)) {
     return sendJson(res, 401, { error: 'Your Drive session is missing or has expired. Rejoin the room.' }, DRIVE_HEADERS);
   }
@@ -749,24 +803,25 @@ async function handleDrive(req, res, url, parts) {
   try {
     // Only the room's folder and what is below it: the service account may be able to read much more.
     if (!(await driveApi.inTree(root, id))) return sendJson(res, 404, { error: 'Not found in this room\'s folder.' }, DRIVE_HEADERS);
-    // The room may have changed (password, folder, deleted) while Drive was asked: the token only counts for the room it was issued for.
+    // The room may have changed (password, folder, deleted), or its member been removed, while Drive was asked: the
+    // token only counts for the room and member it was issued to.
     if (res.destroyed) return; // the client went away while Drive was asked: nothing to do
-    const now = store.get(room.name);
-    if (!now || roomVersion(now) !== roomVersion(room)) return sendJson(res, 401, { error: 'Your Drive session is missing or has expired. Rejoin the room.' }, DRIVE_HEADERS);
+    if (!stillValid(checked)) return sendJson(res, 401, { error: 'Your Drive session is missing or has expired. Rejoin the room.' }, DRIVE_HEADERS);
     if (!isFiles) {
       const [info, { items, truncated }] = await Promise.all([driveApi.folderInfo(id), driveApi.listing(id)]);
+      if (!stillValid(checked)) return sendJson(res, 401, { error: 'Your Drive session is missing or has expired. Rejoin the room.' }, DRIVE_HEADERS);
       if (info.mimeType !== FOLDER) return sendJson(res, 404, { error: 'That is not a folder.' }, DRIVE_HEADERS);
       driveApi.markInTree(root, items.map((f) => f.id));
       // `truncated`: the folder is larger than the server lists (the rest is not shown).
       return sendJson(res, 200, { id, name: info.name, items, ...(truncated && { truncated: true }) }, DRIVE_HEADERS);
     }
-    await serveFile(req, res, id, room);
+    await serveFile(req, res, id, checked);
   } catch (err) {
     driveFail(res, err);
   }
 }
 
-async function serveFile(req, res, id, room) {
+async function serveFile(req, res, id, checked) {
   const meta = await driveApi.fileMeta(id);
   const kind = kindOf(meta);
   if (meta.trashed || (kind !== 'video' && kind !== 'subtitle') || !Number.isSafeInteger(meta.size) || meta.size < 0) {
@@ -799,7 +854,7 @@ async function serveFile(req, res, id, room) {
   // Stop upstream work when the client goes away.
   const ctrl = new AbortController();
   // Registered once streaming is about to start; fileMeta above was awaited, so the room may have changed since handleDrive checked the token.
-  const untrack = trackDriveStream(room, () => {
+  const untrack = trackDriveStream(checked, () => {
     ctrl.abort();
     res.destroy(); // the client sees the connection cut, not a clean end
   });
@@ -836,13 +891,19 @@ async function handleApi(req, res, url) {
 
   // Public: does a room exist / need a password?
   if (parts[1] === 'rooms' && parts.length === 3 && req.method === 'GET') {
+    const ip = limiterKey(clientIp(req));
+    if (lookupLimiter.blocked(ip)) return sendJson(res, 429, { error: LOOKUP_LIMITED }, { 'Retry-After': '600' });
     const r = store.get(parts[2]);
-    if (!r) return sendJson(res, 404, { error: 'Room not found' });
+    if (!r) {
+      lookupLimiter.fail(ip);
+      return sendJson(res, 404, { error: 'Room not found' });
+    }
     return sendJson(res, 200, { name: r.name, passwordRequired: !!r.passwordHash });
   }
 
-  if (parts[1] === 'config' && req.method === 'GET') {
-    return sendJson(res, 200, { iceServers: iceServers(), maxRoomSize: MAX_ROOM_SIZE });
+  if (parts[1] === 'config' && parts.length === 2 && req.method === 'GET') {
+    // STUN only: TURN credentials go to room members over the WebSocket (see iceServers()).
+    return sendJson(res, 200, { iceServers: stunServers(), maxRoomSize: MAX_ROOM_SIZE });
   }
 
   // Tests only (needs DRIVE_DEBUG=1): how many Drive file responses the server still tracks.
@@ -860,7 +921,10 @@ async function handleApi(req, res, url) {
     return sendJson(res, 415, { error: 'Expected application/json' });
   }
 
-  if (parts[2] === 'login' && req.method === 'POST') {
+  // Every admin route matches its exact path: /api/admin/rooms/x/anything must not act on room x.
+  const action = parts.length === 3 ? parts[2] : '';
+
+  if (action === 'login' && req.method === 'POST') {
     const ip = limiterKey(clientIp(req));
     if (adminLimiter.blocked(ip)) return sendJson(res, 429, { error: 'Too many attempts. Try again later.' });
     const body = await readJson(req);
@@ -879,7 +943,7 @@ async function handleApi(req, res, url) {
     return sendJson(res, 200, { ok: true }, { 'Set-Cookie': cookie });
   }
 
-  if (parts[2] === 'logout' && req.method === 'POST') {
+  if (action === 'logout' && req.method === 'POST') {
     req.resume(); // the body is not needed
     adminSessions.delete(parseCookies(req).te_admin);
     return sendJson(res, 200, { ok: true }, {
@@ -889,18 +953,19 @@ async function handleApi(req, res, url) {
 
   if (!adminAuthed(req)) return sendJson(res, 401, { error: 'Not logged in' });
 
-  if (parts[2] === 'session' && req.method === 'GET') return sendJson(res, 200, { ok: true });
+  if (action === 'session' && req.method === 'GET') return sendJson(res, 200, { ok: true });
 
   if (parts[2] === 'rooms') {
     const name = parts[3];
-    if (!name && req.method === 'GET') {
+    if (parts.length === 3 && req.method === 'GET') {
       const rooms = store.list().map((r) => {
         const m = roomMembers(r.name);
-        return { ...r, online: m ? [...m.values()].map((x) => x.name) : [] };
+        // online: the names (as before); members: who is in the room, with the ids the admin can remove them by.
+        return { ...r, online: m ? [...m.values()].map((x) => x.name) : [], members: m ? [...m].map(([id, x]) => ({ id, name: x.name })) : [] };
       });
       return sendJson(res, 200, { rooms, serviceAccount: driveApi ? driveApi.account.email : '' });
     }
-    if (!name && req.method === 'POST') {
+    if (parts.length === 3 && req.method === 'POST') {
       const body = await readJson(req);
       const password = body.password == null ? '' : body.password;
       if (typeof password !== 'string') return sendJson(res, 400, { error: 'The password must be text.' });
@@ -912,7 +977,7 @@ async function handleApi(req, res, url) {
       }
       return sendJson(res, 201, { ok: true });
     }
-    if (name && parts[4] === 'drive' && parts.length === 5 && req.method === 'PUT') {
+    if (parts.length === 5 && parts[4] === 'drive' && req.method === 'PUT') {
       const body = await readJson(req);
       let drive;
       try {
@@ -924,7 +989,7 @@ async function handleApi(req, res, url) {
         store.setDrive(name, drive);
       } catch (err) {
         if (!(err instanceof RoomError)) throw err;
-        return sendJson(res, 404, { error: err.message });
+        return sendJson(res, err.status, { error: err.message });
       }
       pushDrive(name); // the fresh token is on its way before the old responses are cut
       dropDriveStreams(name);
@@ -932,7 +997,7 @@ async function handleApi(req, res, url) {
       if (drive && driveApi) out.check = await checkFolder(drive.folderId);
       return sendJson(res, 200, out);
     }
-    if (name && parts.length === 4 && req.method === 'PUT') {
+    if (parts.length === 4 && req.method === 'PUT') {
       const body = await readJson(req);
       const password = body.password == null ? '' : body.password;
       if (typeof password !== 'string') return sendJson(res, 400, { error: 'The password must be text.' });
@@ -940,19 +1005,31 @@ async function handleApi(req, res, url) {
         await store.setPassword(name, password);
       } catch (err) {
         if (!(err instanceof RoomError)) throw err;
-        return sendJson(res, 400, { error: err.message });
+        return sendJson(res, err.status, { error: err.message });
       }
       if (body.kick === true) kickRoom(name, 'kicked', 'The room password was changed. Please rejoin.');
       else pushDrive(name); // everyone's old Drive token just stopped working: hand out the new one
       dropDriveStreams(name);
       return sendJson(res, 200, { ok: true });
     }
-    if (name && req.method === 'DELETE') {
+    if (parts.length === 6 && parts[4] === 'members' && req.method === 'DELETE') {
+      req.resume(); // the body is not needed
+      // Remove one person from the room now. They can join again with the password: to keep them out, change it.
+      const entry = roomMembers(name)?.get(parts[5]);
+      if (!entry) return sendJson(res, 404, { error: 'That person is not in the room (any more).' });
+      const { ws } = entry;
+      revokeMember(RoomStore.key(name), parts[5]); // its Drive token and downloads stop working first
+      send(ws, { type: 'error', code: 'kicked', message: 'The administrator removed you from the room.' });
+      leave(ws); // the others get peer-left now, not when the socket has closed
+      ws.close(4001, 'kicked');
+      return sendJson(res, 200, { ok: true });
+    }
+    if (parts.length === 4 && req.method === 'DELETE') {
       try {
         store.delete(name);
       } catch (err) {
         if (!(err instanceof RoomError)) throw err;
-        return sendJson(res, 404, { error: err.message });
+        return sendJson(res, err.status, { error: err.message });
       }
       kickRoom(name, 'room-deleted', 'This room has been deleted.');
       dropDriveStreams(name);
@@ -985,7 +1062,8 @@ function route(req, res) {
   if (url.pathname.startsWith('/api/')) {
     handleApi(req, res, url).catch((err) => {
       if (res.headersSent) return res.destroy();
-      if (err && err.clientError) return sendJson(res, 400, { error: err.message || 'Bad request' });
+      // A body that is too large: the connection closes after the answer (readJson drains a bounded part of the rest).
+      if (err && err.clientError) return sendJson(res, err.status || 400, { error: err.message || 'Bad request' }, err.status === 413 ? { Connection: 'close' } : {});
       // Internal failure: log it here, but do not tell the client (messages can contain file paths).
       console.error('request failed:', req.method, url.pathname, err);
       sendJson(res, 500, { error: 'Something went wrong on the server.' });
@@ -1061,6 +1139,77 @@ const server = process.env.TLS_CERT && process.env.TLS_KEY
 
 // ---- Signaling -------------------------------------------------------------
 const ID_RE = /^[A-Za-z0-9_-]{8,64}$/;
+// A participant id is not secret: every member sees everyone's. What lets a join take over the live entry of an id (a
+// reconnect, or the same tab after a reload) is the secret the client generated with it, which only that tab knows.
+const SECRET_RE = /^[A-Za-z0-9_-]{16,128}$/;
+
+function secretHash(secret) {
+  return secret ? crypto.createHash('sha256').update(secret).digest() : null;
+}
+
+/** May a join with this secret take over a live entry? Only with the secret that entry was created with. */
+function sameSecret(a, b) {
+  return !!a && !!b && crypto.timingSafeEqual(a, b);
+}
+
+// A socket that has not joined a room within this time (after connecting, or after leaving one) is closed: an open
+// socket costs memory, and only members need one. DRIVE_DEBUG=1 lets tests shorten it.
+const JOIN_DEADLINE_MS = (DRIVE_DEBUG && parseInt(process.env.JOIN_DEADLINE_MS, 10)) || 30 * 1000;
+// Open sockets per client address (limiter key, so an IPv6 /64 counts once). Everybody on one network (a household,
+// a party on one Wi-Fi) shares an address, hence the generous floor.
+const MAX_SOCKETS_PER_CLIENT = Math.max(64, 2 * MAX_ROOM_SIZE);
+/** @type {Map<string, number>} limiter key -> open sockets */
+const socketsPerClient = new Map();
+let lastSocketCapLog = 0;
+
+// Relayed signals: one is at most MAX_SIGNAL_BYTES (a Chromium offer is about 6 KB, 10 KB while sharing a screen), and
+// each socket has a byte budget for what it makes the server send to others (a token bucket: a burst, then a steady
+// rate). Without it, a member with a fast uplink could fill another member's send buffer until that member counts as
+// stalled and is dropped. A newcomer sends about 9 KB per member (an offer and its candidates), and so does starting a
+// screen share: the burst covers that for a full room of MAX_ROOM_SIZE.
+const MAX_SIGNAL_BYTES = 32 * 1024;
+const SIGNAL_BYTES_BURST = Math.max(512 * 1024, MAX_ROOM_SIZE * 16 * 1024);
+const SIGNAL_BYTES_PER_SEC = 64 * 1024;
+
+// Several members together can still send one member more than its link carries, each within its own budget. So the
+// relayed bytes are also counted per receiver and sender (in windows of RELAY_WINDOW_MS); once a receiver's send buffer
+// is past RELAY_BACKLOG, every member that sent it more than RELAY_FAIR_BYTES in the window is cut off, rather than the
+// receiver being dropped as stalled for what others sent it. An honest member sends one peer an offer and its
+// candidates (about 9 KB), a few times at most in a window. A receiver that really stopped reading is still dropped:
+// by the heartbeat, or by the MAX_WS_BUFFERED guard in send(). With at most 49 others in a room (MAX_ROOM_SIZE <= 50),
+// colluding members can add at most 49 x 48 KB past RELAY_BACKLOG in a window: about 3.4 MB in all, under the 4 MB at
+// which send() drops a receiver.
+const RELAY_WINDOW_MS = 10 * 1000;
+const RELAY_BACKLOG = 1024 * 1024;
+const RELAY_FAIR_BYTES = 48 * 1024;
+
+/**
+ * Count a relay of `bytes` from socket `from` to socket `to`. When `to` is behind, cut off whoever sent it more than a
+ * fair share in this window. False when `from` is cut off (then the signal is not delivered).
+ */
+function relayAllowed(from, to, bytes, now) {
+  let inbound = to.inbound;
+  if (!inbound || now - inbound.since > RELAY_WINDOW_MS) inbound = to.inbound = { since: now, bytes: new Map() };
+  inbound.bytes.set(from, (inbound.bytes.get(from) || 0) + bytes);
+  if (to.bufferedAmount <= RELAY_BACKLOG) return true;
+  for (const [sender, n] of inbound.bytes) {
+    if (n <= RELAY_FAIR_BYTES) continue;
+    inbound.bytes.delete(sender);
+    sender.cutOff?.();
+  }
+  return !from.limited;
+}
+
+function armJoinDeadline(ws) {
+  clearTimeout(ws.joinDeadline);
+  ws.joinDeadline = setTimeout(() => {
+    if (registered(ws)) return;
+    if (ws.joining) return armJoinDeadline(ws); // a join is being evaluated: give it its answer first
+    ws.close(4002, 'join-timeout');
+    setTimeout(() => ws.terminate(), 2000).unref();
+  }, JOIN_DEADLINE_MS);
+  ws.joinDeadline.unref();
+}
 
 function send(ws, msg) {
   if (ws.readyState !== ws.OPEN) return;
@@ -1088,6 +1237,7 @@ function leave(ws) {
   const { room, id } = ws;
   if (!room) return;
   ws.room = null;
+  armJoinDeadline(ws); // a socket without a room may stay open only briefly (cleared when it closes)
   const members = live.get(room);
   if (!members) return;
   const entry = members.get(id);
@@ -1100,15 +1250,23 @@ function leave(ws) {
 
 async function handleJoin(ws, msg) {
   // Every field comes from the client's JSON: only text is usable (ID_RE.test would also accept an array of one string).
-  if (typeof msg.room !== 'string' || typeof msg.id !== 'string' || (msg.password != null && typeof msg.password !== 'string')) {
+  if (typeof msg.room !== 'string' || typeof msg.id !== 'string' || (msg.password != null && typeof msg.password !== 'string')
+    || (msg.secret != null && (typeof msg.secret !== 'string' || !SECRET_RE.test(msg.secret)))) {
     send(ws, { type: 'error', code: 'bad-request', message: 'Invalid join request' });
     return;
   }
   const roomName = msg.room;
   const id = msg.id;
   const password = msg.password == null ? '' : msg.password;
+  // Without a secret (a client from before secrets existed) a join can use a free id, but never take over a live one.
+  const secret = secretHash(msg.secret);
+  if (lookupLimiter.blocked(ws.ip)) {
+    send(ws, { type: 'error', code: 'rate-limited', message: LOOKUP_LIMITED });
+    return;
+  }
   const r = store.get(roomName);
   if (!r) {
+    lookupLimiter.fail(ws.ip);
     send(ws, { type: 'error', code: 'no-room', message: 'This room does not exist.' });
     return;
   }
@@ -1152,6 +1310,12 @@ async function handleJoin(ws, msg) {
   leave(ws);
   let members = live.get(key);
   const existing = members?.get(id);
+  if (existing && !sameSecret(existing.secret, secret)) {
+    // Someone else's id (every member can see it): taking it over would disconnect that person and let the newcomer
+    // sign as them.
+    send(ws, { type: 'error', code: 'id-taken', message: 'Someone in this room is already connected with your connection id. Reload the page to join again.' });
+    return;
+  }
   if (!existing && (members ? members.size : 0) >= MAX_ROOM_SIZE) {
     send(ws, { type: 'error', code: 'room-full', message: `Room is full (max ${MAX_ROOM_SIZE}).` });
     return;
@@ -1168,14 +1332,16 @@ async function handleJoin(ws, msg) {
     } catch { /* already gone */ }
   }
   const peers = [...members.entries()].filter(([pid]) => pid !== id).map(([pid, m]) => ({ id: pid, name: m.name }));
-  const member = { ws, name, driveAt: 0 }; // driveAt: when this socket last got a Drive token
+  // driveAt / iceAt: when this socket last got a Drive token / TURN credentials. secret: hash of the id's secret.
+  const member = { ws, name, driveAt: 0, iceAt: Date.now(), secret };
   members.set(id, member);
   ws.room = key;
   ws.id = id;
+  clearTimeout(ws.joinDeadline);
   try {
     // resumed: this join took over the live entry of the same participant (a reconnect).
-    const welcome = { type: 'welcome', id, room: room.name, peers, resumed: !!existing };
-    const drive = driveInfo(room);
+    const welcome = { type: 'welcome', id, room: room.name, peers, resumed: !!existing, iceServers: iceServers() };
+    const drive = driveInfo(room, id);
     if (drive) {
       welcome.drive = drive;
       member.driveAt = Date.now();
@@ -1234,31 +1400,57 @@ function originAllowed(req) {
   return false;
 }
 
+/** Is this client below its socket limit? Says so in the log (at most once a minute) when it is not. */
+function socketAllowed(key) {
+  const open = socketsPerClient.get(key) || 0;
+  if (open < MAX_SOCKETS_PER_CLIENT) return true;
+  const now = Date.now();
+  if (now - lastSocketCapLog > 60 * 1000) {
+    lastSocketCapLog = now;
+    console.warn(`Refused a WebSocket: ${open} are already open from one client address (${key}). If every visitor shows `
+      + 'the same address, the server runs behind a proxy without TRUST_PROXY.');
+  }
+  return false;
+}
+
 const wss = new WebSocketServer({
   server,
   path: '/ws',
   maxPayload: MAX_MESSAGE_BYTES,
-  verifyClient: ({ req }, done) => (originAllowed(req) ? done(true) : done(false, 403, 'Forbidden origin')),
+  verifyClient: ({ req }, done) => {
+    if (!originAllowed(req)) return done(false, 403, 'Forbidden origin');
+    if (!socketAllowed(limiterKey(clientIp(req)))) return done(false, 429, 'Too many connections');
+    return done(true);
+  },
 });
 
 wss.on('connection', (ws, req) => {
   ws.isAlive = true;
   ws.ip = limiterKey(clientIp(req));
+  socketsPerClient.set(ws.ip, (socketsPerClient.get(ws.ip) || 0) + 1);
+  armJoinDeadline(ws);
   ws.on('pong', () => { ws.isAlive = true; });
   let tokens = MSG_BURST;
   let refilled = Date.now();
-  let limited = false;
+  let signalBytes = SIGNAL_BYTES_BURST;
+  let signalRefilled = refilled;
+  ws.limited = false;
+  // Also called by relayAllowed() for a member that floods another one.
+  ws.cutOff = () => {
+    if (ws.limited) return;
+    ws.limited = true;
+    ws.close(1008, 'rate-limited');
+    // A flooding peer will not finish the close handshake: drop the connection shortly after the close frame went out.
+    setTimeout(() => ws.terminate(), 200).unref();
+  };
 
   ws.on('message', (raw, isBinary) => {
-    if (limited) return; // already cut off: ignore whatever is still in flight
+    if (ws.limited) return; // already cut off: ignore whatever is still in flight
     const now = Date.now();
     tokens = Math.min(MSG_BURST, tokens + ((now - refilled) / 1000) * MSG_REFILL_PER_SEC);
     refilled = now;
     if (--tokens < 0) {
-      limited = true;
-      ws.close(1008, 'rate-limited');
-      // A flooding peer will not finish the close handshake: drop the connection shortly after the close frame went out.
-      setTimeout(() => ws.terminate(), 200).unref();
+      ws.cutOff();
       return;
     }
     if (isBinary) return;
@@ -1296,8 +1488,19 @@ wss.on('connection', (ws, req) => {
         case 'signal': {
           // Relay WebRTC signaling to one peer in the same room, but only from a socket that really is a member.
           if (!registered(ws) || typeof msg.to !== 'string') return;
+          if (raw.length > MAX_SIGNAL_BYTES) {
+            logBadMessage(ws, 'signal', new Error(`signal of ${raw.length} bytes is over the ${MAX_SIGNAL_BYTES}-byte limit`));
+            return;
+          }
+          signalBytes = Math.min(SIGNAL_BYTES_BURST, signalBytes + ((now - signalRefilled) / 1000) * SIGNAL_BYTES_PER_SEC);
+          signalRefilled = now;
+          signalBytes -= raw.length;
+          if (signalBytes < 0) {
+            ws.cutOff();
+            return;
+          }
           const target = live.get(ws.room)?.get(msg.to);
-          if (target) send(target.ws, { type: 'signal', from: ws.id, data: msg.data });
+          if (target && relayAllowed(ws, target.ws, raw.length, now)) send(target.ws, { type: 'signal', from: ws.id, data: msg.data });
           break;
         }
 
@@ -1320,9 +1523,30 @@ wss.on('connection', (ws, req) => {
     }
   });
 
-  ws.on('close', () => leave(ws));
+  ws.on('close', () => {
+    leave(ws);
+    clearTimeout(ws.joinDeadline);
+    const open = (socketsPerClient.get(ws.ip) || 1) - 1;
+    if (open > 0) socketsPerClient.set(ws.ip, open);
+    else socketsPerClient.delete(ws.ip);
+  });
   ws.on('error', () => leave(ws));
 });
+
+/** Fresh TURN credentials for the members whose last ones are older than ICE_REFRESH_MS (they are valid 12 h). */
+function refreshIce() {
+  if (!TURN_URLS.length || !process.env.TURN_SECRET) return; // nothing that expires: STUN, or static TURN credentials
+  const now = Date.now();
+  let servers; // one set per tick
+  for (const members of live.values()) {
+    for (const m of members.values()) {
+      if (now - m.iceAt < ICE_REFRESH_MS) continue;
+      servers ??= iceServers();
+      send(m.ws, { type: 'ice', iceServers: servers });
+      m.iceAt = now;
+    }
+  }
+}
 
 // Drop dead connections so rooms don't keep ghosts; expire old state.
 const heartbeat = setInterval(() => {
@@ -1336,9 +1560,12 @@ const heartbeat = setInterval(() => {
   }
   adminLimiter.sweep();
   roomLimiter.sweep();
+  lookupLimiter.sweep();
   const now = Date.now();
   for (const [t, exp] of adminSessions) if (exp < now) adminSessions.delete(t);
+  for (const [k, at] of revokedMembers) if (now - at > TOKEN_TTL_MS) revokedMembers.delete(k); // older tokens have expired
   refreshDriveTokens();
+  refreshIce();
 }, HEARTBEAT_MS);
 wss.on('close', () => clearInterval(heartbeat));
 

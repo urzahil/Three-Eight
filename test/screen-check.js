@@ -2,13 +2,13 @@
 // during the share, sees it too; only one person can share at a time; a movie and a share exclude each other;
 // stopping (from the room or from the browser's own "Stop sharing") clears it for everyone.
 // Chromium's fake capture devices stand in for the screen and the camera.
-// Usage: node test/screen-check.js   (expects the server on BASE, default http://localhost:4567, ADMIN_PASSWORD=test)
+// Usage: node test/screen-check.js   (expects the server on BASE, default http://localhost:4567, ADMIN_PASSWORD=test-admin-password)
 const { chromium } = require('playwright');
 const path = require('path');
 const assert = require('assert');
 
 const BASE = process.env.BASE || 'http://localhost:4567';
-const ADMIN = process.env.ADMIN_PASSWORD || 'test';
+const ADMIN = process.env.ADMIN_PASSWORD || 'test-admin-password';
 const MOVIE = path.resolve(__dirname, 'fixtures', 'multi.mkv');
 const ROOM = 'screen-' + Date.now().toString(36);
 const waitFor = (page, fn, arg, timeout = 20000) => page.waitForFunction(fn, arg, { timeout, polling: 200 });

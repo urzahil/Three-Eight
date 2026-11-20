@@ -85,6 +85,13 @@ export function randomId() {
   return [...a].map((b) => b.toString(36).padStart(2, '0')).join('').slice(0, 20);
 }
 
+/** 32 characters of base64url (192 random bits): a secret, unlike randomId() which is shown to others. */
+export function randomSecret() {
+  const a = new Uint8Array(24);
+  crypto.getRandomValues(a);
+  return btoa(String.fromCharCode(...a)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
 export async function hashText(text) {
   try {
     const d = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));

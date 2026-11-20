@@ -47,7 +47,7 @@ async function spawnServer(env) {
   const port = await freePort();
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'three-eight-x-'));
   const child = spawn(process.execPath, [path.join(__dirname, '..', 'server', 'server.js')], {
-    env: { ...process.env, PORT: String(port), HOST: '127.0.0.1', ADMIN_PASSWORD: 'admin-pw', DATA_DIR: dir, GOOGLE_SERVICE_ACCOUNT: '', ...env },
+    env: { ...process.env, PORT: String(port), HOST: '127.0.0.1', ADMIN_PASSWORD: 'admin-pw-for-tests', DATA_DIR: dir, GOOGLE_SERVICE_ACCOUNT: '', ...env },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   const out = { log: '' };
@@ -68,7 +68,7 @@ before(async () => {
   BASE = `http://127.0.0.1:${PORT}`;
   proc = spawn(process.execPath, [path.join(__dirname, '..', 'server', 'server.js')], {
     env: {
-      ...process.env, PORT: String(PORT), HOST: '127.0.0.1', ADMIN_PASSWORD: 'admin-pw', DATA_DIR: dataDir,
+      ...process.env, PORT: String(PORT), HOST: '127.0.0.1', ADMIN_PASSWORD: 'admin-pw-for-tests', DATA_DIR: dataDir,
       GOOGLE_SERVICE_ACCOUNT: google.writeAccount(keyDir), GOOGLE_API_BASE: google.url, DRIVE_DEBUG: '1',
     },
     stdio: 'ignore',
@@ -106,7 +106,7 @@ function wsClient() {
 test('admin endpoints require login', async () => {
   assert.strictEqual((await json('GET', '/api/admin/rooms')).status, 401);
   assert.strictEqual((await json('POST', '/api/admin/login', { password: 'nope' })).status, 401);
-  const res = await json('POST', '/api/admin/login', { password: 'admin-pw' });
+  const res = await json('POST', '/api/admin/login', { password: 'admin-pw-for-tests' });
   assert.strictEqual(res.status, 200);
   cookie = res.headers.get('set-cookie').split(';')[0];
   assert.match(res.headers.get('set-cookie'), /HttpOnly/);
@@ -252,9 +252,12 @@ const api = (p, token, extra = {}) => fetch(BASE + p, { headers: token ? { Autho
 const files = (room, id) => `/api/rooms/${room}/drive/files/${id}`;
 const mediaCalls = (id) => google.entries('media', id);
 
+/** The secret a test client sends with this id: the same id always comes with the same secret, like one browser tab. */
+const secretOf = (id) => `${id}-test-secret`;
+
 async function join(room, password, id, name = 'Tester') {
   const ws = await wsClient();
-  ws.sendJson({ type: 'join', room, id, name, password });
+  ws.sendJson({ type: 'join', room, id, name, password, secret: secretOf(id) });
   const welcome = await ws.next();
   return { ws, welcome };
 }
@@ -309,9 +312,11 @@ test('drive: the welcome message carries { token, folder } after the password ch
   const [body, sig] = tokA.split('.');
   assert(/^[A-Za-z0-9_-]+$/.test(body) && /^[A-Za-z0-9_-]{43}$/.test(sig), 'base64url(payload).base64url(HMAC-SHA256)');
   const claims = JSON.parse(Buffer.from(body, 'base64url'));
-  assert.deepStrictEqual(Object.keys(claims).sort(), ['e', 'r', 'v']);
+  assert.deepStrictEqual(Object.keys(claims).sort(), ['e', 'i', 'm', 'r', 'v']);
   assert.strictEqual(claims.r, 'drive-a');
-  assert(Math.abs(claims.e - (Date.now() + 12 * 3600 * 1000)) < 60000, 'expires in 12 hours');
+  assert.strictEqual(claims.m, 'eeeeeeee2', 'issued to this member');
+  assert(Math.abs(claims.e - (Date.now() + 3600 * 1000)) < 60000, 'expires in 1 hour');
+  assert(Math.abs(claims.i - Date.now()) < 60000);
 
   const b = await join('drive-b', 'pb', 'eeeeeeee3', 'Bob');
   tokB = b.welcome.drive.token;
@@ -371,7 +376,7 @@ test('drive: POST .../drive/session sets a per-room, HttpOnly, SameSite=Strict c
   assert.match(set, /; SameSite=Strict/);
   assert.doesNotMatch(set, /Secure/, 'plain http');
   const maxAge = Number(/Max-Age=(\d+)/.exec(set)[1]);
-  assert(maxAge > 11.9 * 3600 && maxAge <= 12 * 3600, `Max-Age ${maxAge}`);
+  assert(maxAge > 0.9 * 3600 && maxAge <= 3600, `Max-Age ${maxAge}`); // the token lives 1 h
   assert.strictEqual(res.headers.get('cache-control'), 'private, no-store');
   // The room's name in another case: the same room, the same cookie.
   assert.strictEqual(cookiePair(await api('/api/rooms/Drive-A/drive/session', tokA, { method: 'POST' })), cookiePair(res));
@@ -774,7 +779,7 @@ test('drive: clients that disconnect right after sending a file request leave no
 
 test('drive: without a service account there is no drive field and no endpoint', async () => {
   const s = await spawnServer({});
-  const login = await fetch(s.base + '/api/admin/login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password: 'admin-pw' }) });
+  const login = await fetch(s.base + '/api/admin/login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password: 'admin-pw-for-tests' }) });
   const ck = login.headers.get('set-cookie').split(';')[0];
   const call = (method, p, body) => fetch(s.base + p, { method, headers: { 'content-type': 'application/json', cookie: ck }, body: body ? JSON.stringify(body) : undefined });
   assert.strictEqual((await call('POST', '/api/admin/rooms', { name: 'nodrive', password: '' })).status, 201);
@@ -943,7 +948,7 @@ test('RoomStore: an unreadable rooms.json stops the server instead of risking an
     fs.mkdirSync(path.join(dir, 'rooms.json')); // reading it fails with EISDIR (like EACCES: not ENOENT)
     assert.throws(() => new RoomStore(dir), /Cannot read .*rooms\.json/);
     const child = spawn(process.execPath, [path.join(__dirname, '..', 'server', 'server.js')], {
-      env: { ...process.env, PORT: String(await freePort()), HOST: '127.0.0.1', ADMIN_PASSWORD: 'x', DATA_DIR: dir, GOOGLE_SERVICE_ACCOUNT: '' },
+      env: { ...process.env, PORT: String(await freePort()), HOST: '127.0.0.1', ADMIN_PASSWORD: 'admin-pw-for-tests', DATA_DIR: dir, GOOGLE_SERVICE_ACCOUNT: '' },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let log = '';
@@ -1067,12 +1072,12 @@ function wsAt(base, headers = {}, opts = {}) {
 }
 
 async function adminCookie(base) {
-  const login = await fetch(base + '/api/admin/login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password: 'admin-pw' }) });
+  const login = await fetch(base + '/api/admin/login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password: 'admin-pw-for-tests' }) });
   return login.headers.get('set-cookie').split(';')[0];
 }
 
 test('room password limit: a burst of wrong passwords cannot get past it, and open rooms cost nothing', async () => {
-  const s = await spawnServer({ TRUST_PROXY: '1', MAX_ROOM_SIZE: '100' });
+  const s = await spawnServer({ TRUST_PROXY: '1', MAX_ROOM_SIZE: '50' });
   const ck = await adminCookie(s.base);
   const post = (body) => fetch(s.base + '/api/admin/rooms', { method: 'POST', headers: { 'content-type': 'application/json', cookie: ck }, body: JSON.stringify(body) });
   assert.strictEqual((await post({ name: 'locked', password: 'right' })).status, 201);
@@ -1136,27 +1141,80 @@ test('TRUST_PROXY counts X-Forwarded-For from the right (number of trusted hops)
   off.stop();
 });
 
-// ---- welcome.resumed ----------------------------------------------------------------------------------------------
+// ---- welcome.resumed, and who may take over an id -----------------------------------------------------------------
 test('welcome says whether the join resumed the previous connection', async () => {
   assert.strictEqual((await json('POST', '/api/admin/rooms', { name: 'resume-room', password: '' })).status, 201);
+  const secret = secretOf('resumer001');
   const a = await wsClient();
-  a.sendJson({ type: 'join', room: 'resume-room', id: 'resumer001', name: 'A' });
+  a.sendJson({ type: 'join', room: 'resume-room', id: 'resumer001', name: 'A', secret });
   const first = await a.next();
   assert.strictEqual(first.resumed, false);
   const b = await wsClient();
-  b.sendJson({ type: 'join', room: 'resume-room', id: 'resumer001', name: 'A' });
+  b.sendJson({ type: 'join', room: 'resume-room', id: 'resumer001', name: 'A', secret });
   const second = await b.next();
   assert.strictEqual(second.resumed, true, 'took over the live entry of the same id');
   const other = await wsClient();
-  other.sendJson({ type: 'join', room: 'resume-room', id: 'resumer002', name: 'B' });
+  other.sendJson({ type: 'join', room: 'resume-room', id: 'resumer002', name: 'B', secret: secretOf('resumer002') });
   assert.strictEqual((await other.next()).resumed, false);
   // After a clean leave there is nothing to resume.
   b.sendJson({ type: 'leave' });
   await other.next(); // peer-left
   const c = await wsClient();
-  c.sendJson({ type: 'join', room: 'resume-room', id: 'resumer001', name: 'A' });
+  c.sendJson({ type: 'join', room: 'resume-room', id: 'resumer001', name: 'A', secret });
   assert.strictEqual((await c.next()).resumed, false);
   for (const ws of [a, b, c, other]) ws.close();
+});
+
+test('an id seen in the room cannot be taken over without its secret: no eviction, no leave in its name', { timeout: 30000 }, async () => {
+  assert.strictEqual((await json('POST', '/api/admin/rooms', { name: 'hijack-room', password: 'hp' })).status, 201);
+  const online = async () => (await (await json('GET', '/api/admin/rooms')).json()).rooms.find((r) => r.name === 'hijack-room').online.sort();
+  const victim = await wsClient();
+  victim.sendJson({ type: 'join', room: 'hijack-room', id: 'victim0001', name: 'Alice', password: 'hp', secret: secretOf('victim0001') });
+  assert.strictEqual((await victim.next()).type, 'welcome');
+  const victimClosed = new Promise((r) => victim.once('close', (code) => r(code)));
+  const mallory = await wsClient();
+  mallory.sendJson({ type: 'join', room: 'hijack-room', id: 'mallory001', name: 'Mallory', password: 'hp', secret: secretOf('mallory001') });
+  const mw = await mallory.next();
+  assert.deepStrictEqual(mw.peers, [{ id: 'victim0001', name: 'Alice' }], 'every member sees the others\' ids');
+  await victim.next(); // peer-joined
+
+  // Mallory joins under Alice's id: with another secret, with none, and with a malformed one.
+  const attempts = [
+    [secretOf('mallory001'), 'id-taken'],
+    [undefined, 'id-taken'],
+    ['short', 'bad-request'],
+    [['x'.repeat(20)], 'bad-request'],
+    ['has spaces in it, 1234', 'bad-request'],
+  ];
+  for (const [secret, code] of attempts) {
+    const ws = await wsClient();
+    ws.sendJson({ type: 'join', room: 'hijack-room', id: 'victim0001', name: 'Mallory', password: 'hp', secret });
+    assert.strictEqual((await ws.next()).code, code, JSON.stringify(secret));
+    // Not a member: its leave (in Alice's name, if it had worked) and its signals go nowhere.
+    ws.sendJson({ type: 'leave' });
+    ws.sendJson({ type: 'signal', to: 'mallory001', data: { evil: 1 } });
+    ws.close();
+  }
+  assert.deepStrictEqual(await online(), ['Alice', 'Mallory']);
+  victim.sendJson({ type: 'time', c: 7 });
+  assert.strictEqual((await victim.next()).c, 7, 'Alice is still connected and got nothing in between');
+  mallory.sendJson({ type: 'time', c: 8 });
+  assert.strictEqual((await mallory.next()).c, 8, 'and Mallory got no peer-left for her');
+
+  // Alice's own tab (same secret) can take its id back, e.g. after a network blip: the old socket is replaced (4000).
+  const again = await wsClient();
+  again.sendJson({ type: 'join', room: 'hijack-room', id: 'victim0001', name: 'Alice', password: 'hp', secret: secretOf('victim0001') });
+  assert.strictEqual((await again.next()).resumed, true);
+  assert.strictEqual(await victimClosed, 4000);
+  // A free id needs no secret (a client from before secrets existed).
+  const legacy = await wsClient();
+  legacy.sendJson({ type: 'join', room: 'hijack-room', id: 'legacy0001', name: 'Old', password: 'hp' });
+  assert.strictEqual((await legacy.next()).type, 'welcome');
+  // ...but such an entry cannot be taken over at all, not even without a secret.
+  const legacy2 = await wsClient();
+  legacy2.sendJson({ type: 'join', room: 'hijack-room', id: 'legacy0001', name: 'Old', password: 'hp' });
+  assert.strictEqual((await legacy2.next()).code, 'id-taken');
+  for (const ws of [again, mallory, legacy, legacy2]) ws.close();
 });
 
 // ---- Headers, caching, compression ---------------------------------------------------------------------------------
@@ -1304,8 +1362,10 @@ test('bad input is a 400, internal failures are a generic 500 that is logged but
   const bad = await call('/api/admin/rooms', { method: 'POST', body: '{nope' });
   assert.strictEqual(bad.status, 400);
   assert.deepStrictEqual(await bad.json(), { error: 'Invalid JSON' });
-  const big = await call('/api/admin/rooms', { method: 'POST', body: JSON.stringify({ name: 'x'.repeat(40000) }) }).then((r) => r.status, () => 400);
-  assert.strictEqual(big, 400);
+  // Too large: answered with 413 (the client gets to read it), not a connection reset.
+  const big = await call('/api/admin/rooms', { method: 'POST', body: JSON.stringify({ name: 'x'.repeat(40000) }) });
+  assert.strictEqual(big.status, 413);
+  assert.deepStrictEqual(await big.json(), { error: 'Body too large' });
   // A malformed cookie (maybe from another app on the domain) is ignored: not logged in, but no error either.
   const cookieRes = await fetch(s.base + '/api/admin/rooms', { headers: { cookie: 'te_admin=%E0%A4%A' } });
   assert.strictEqual(cookieRes.status, 401);
@@ -1482,7 +1542,7 @@ async function failedStart(env) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'three-eight-cfg-'));
   try {
     const child = spawn(process.execPath, [path.join(__dirname, '..', 'server', 'server.js')], {
-      env: { ...process.env, PORT: String(await freePort()), HOST: '127.0.0.1', ADMIN_PASSWORD: 'admin-pw', DATA_DIR: dir, GOOGLE_SERVICE_ACCOUNT: '', ...env },
+      env: { ...process.env, PORT: String(await freePort()), HOST: '127.0.0.1', ADMIN_PASSWORD: 'admin-pw-for-tests', DATA_DIR: dir, GOOGLE_SERVICE_ACCOUNT: '', ...env },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let log = '';
@@ -1522,6 +1582,7 @@ test('config: an unusable setting stops the server with a message naming it', as
   for (const [env, re] of [
     [{ MAX_ROOM_SIZE: 'invalid' }, /MAX_ROOM_SIZE=invalid is not a whole number/],
     [{ MAX_ROOM_SIZE: '0' }, /MAX_ROOM_SIZE=0 is out of range/],
+    [{ MAX_ROOM_SIZE: '51' }, /MAX_ROOM_SIZE=51 is out of range \(expected 1 to 50\)/],
     [{ PORT: '70000' }, /PORT=70000 is out of range/],
     [{ TRUST_PROXY: 'on' }, /TRUST_PROXY=on is not valid/],
     [{ DRIVE_CACHE_MB: 'lots' }, /DRIVE_CACHE_MB=lots is not a number/],
@@ -1763,7 +1824,7 @@ test('drive: a member connected for a long time gets a fresh token pushed; the c
     GOOGLE_SERVICE_ACCOUNT: google.writeAccount(keyDir), GOOGLE_API_BASE: google.url, DRIVE_DEBUG: '1',
     DRIVE_TOKEN_REFRESH_MS: '600', HEARTBEAT_MS: '150', TRUST_PROXY: 'true',
   });
-  const login = await fetch(s.base + '/api/admin/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password: 'admin-pw' }) });
+  const login = await fetch(s.base + '/api/admin/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password: 'admin-pw-for-tests' }) });
   const admin = { 'Content-Type': 'application/json', cookie: login.headers.get('set-cookie').split(';')[0] };
   assert.strictEqual((await fetch(s.base + '/api/admin/rooms', { method: 'POST', headers: admin, body: JSON.stringify({ name: 'refresh', password: 'pw' }) })).status, 201);
   assert.strictEqual((await fetch(s.base + '/api/admin/rooms/refresh/drive', { method: 'PUT', headers: admin, body: JSON.stringify({ link: FOLDER }) })).status, 200);
@@ -1819,7 +1880,7 @@ test('drive: `truncated` reaches the folders endpoint, and a room has a cap on o
     GOOGLE_SERVICE_ACCOUNT: google.writeAccount(keyDir), GOOGLE_API_BASE: google.url, DRIVE_DEBUG: '1',
     DRIVE_MAX_LIST_ITEMS: '3', MAX_ROOM_SIZE: '1', // at most 3 streams per room
   });
-  const login = await fetch(s.base + '/api/admin/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password: 'admin-pw' }) });
+  const login = await fetch(s.base + '/api/admin/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password: 'admin-pw-for-tests' }) });
   const admin = { 'Content-Type': 'application/json', cookie: login.headers.get('set-cookie').split(';')[0] };
   assert.strictEqual((await fetch(s.base + '/api/admin/rooms', { method: 'POST', headers: admin, body: JSON.stringify({ name: 'limits' }) })).status, 201);
   const put = await fetch(s.base + '/api/admin/rooms/limits/drive', { method: 'PUT', headers: admin, body: JSON.stringify({ link: F }) });
@@ -1881,7 +1942,7 @@ test('container health check: exits 0 while the server answers, 1 when it is dow
 test('admin logout behind a TLS proxy clears a Secure cookie and ends the session (X-Forwarded-Proto in any case)', async () => {
   const s = await spawnServer({ TRUST_PROXY: 'true' });
   const tls = { 'content-type': 'application/json', 'X-Forwarded-Proto': 'HTTPS' };
-  const login = await fetch(s.base + '/api/admin/login', { method: 'POST', headers: tls, body: JSON.stringify({ password: 'admin-pw' }) });
+  const login = await fetch(s.base + '/api/admin/login', { method: 'POST', headers: tls, body: JSON.stringify({ password: 'admin-pw-for-tests' }) });
   assert.match(login.headers.get('set-cookie'), /; Secure/);
   const ck = login.headers.get('set-cookie').split(';')[0];
   assert.strictEqual((await fetch(s.base + '/api/admin/rooms', { headers: { cookie: ck } })).status, 200);
@@ -1892,25 +1953,389 @@ test('admin logout behind a TLS proxy clears a Secure cookie and ends the sessio
   s.stop();
 });
 
-test('a member that stops reading is dropped once too much is queued for it, not kept until the heartbeat', async () => {
-  const s = await spawnServer({});
+/** What `read()` resolves to once it deep-equals `want`, or its last value after `ms` (a client sees its socket close a
+ * moment before the server has processed it, so lists of members lag behind by a few milliseconds). */
+async function settled(read, want, ms = 5000) {
+  const deadline = Date.now() + ms;
+  for (;;) {
+    const got = await read();
+    if (JSON.stringify(got) === JSON.stringify(want) || Date.now() > deadline) return got;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+}
+
+/** The next message `pred` accepts (others are skipped); { type: 'timeout' } after `ms`. */
+async function nextMatching(ws, pred, ms = 15000) {
+  const deadline = Date.now() + ms;
+  for (;;) {
+    const left = deadline - Date.now();
+    if (left <= 0) return { type: 'timeout' };
+    const m = await Promise.race([ws.next(), new Promise((r) => setTimeout(() => r(null), left))]);
+    if (!m) return { type: 'timeout' };
+    if (pred(m)) return m;
+  }
+}
+
+test('several members flooding one (each within its own budget): the flooders are cut off, the receiver stays', { timeout: 60000 }, async () => {
+  const s = await spawnServer({ MAX_ROOM_SIZE: '50' }); // the receiver, an honest member and 48 flooders: a full room
   const ck = await adminCookie(s.base);
   await fetch(s.base + '/api/admin/rooms', { method: 'POST', headers: { 'content-type': 'application/json', cookie: ck }, body: JSON.stringify({ name: 'stall-room' }) });
+  const online = async () => (await (await fetch(s.base + '/api/admin/rooms', { headers: { cookie: ck } })).json()).rooms[0].online;
+  const joinAs = async (id) => {
+    const ws = await wsAt(s.base);
+    ws.sendJson({ type: 'join', room: 'stall-room', id, name: id });
+    assert.strictEqual((await nextMatching(ws, (m) => m.type === 'welcome')).type, 'welcome');
+    return ws;
+  };
+  const a = await joinAs('stallpeerA1');
+  const honest = await joinAs('honestpeer1');
+  const senders = [];
+  for (let i = 0; i < 48; i++) senders.push(await joinAs(`stallsend${String(i).padStart(2, '0')}`));
+  const closes = senders.map((b) => new Promise((r) => b.once('close', (code) => r(code))));
+  honest.sendJson({ type: 'signal', to: 'stallpeerA1', data: { sdp: 'an honest offer' } });
+  // A's link is slow (here: it stops reading); together the senders queue far more than it takes.
+  a._socket.pause();
+  const big = 'x'.repeat(30 * 1024);
+  for (const b of senders) for (let i = 0; i < 16; i++) b.sendJson({ type: 'signal', to: 'stallpeerA1', data: { sdp: big } });
+  const codes = await Promise.race([Promise.all(closes), new Promise((r) => setTimeout(() => r(null), 20000))]);
+  assert(codes, 'every flooder was cut off');
+  assert(codes.every((c) => c === 1008), JSON.stringify(codes));
+  const stayed = ['honestpeer1', 'stallpeerA1'];
+  assert.deepStrictEqual(await settled(async () => (await online()).sort(), stayed), stayed, 'the receiver and the honest member are still in the room');
+  honest.sendJson({ type: 'signal', to: 'stallpeerA1', data: { sdp: 'another honest offer' } });
+  honest.sendJson({ type: 'time', c: 1 });
+  assert.strictEqual((await nextMatching(honest, (m) => m.type === 'time')).c, 1, 'the honest member is still connected');
+  a.terminate();
+  honest.close();
+  s.stop();
+});
+
+test('a member that stops reading is dropped by the heartbeat, and the others are told', { timeout: 30000 }, async () => {
+  const s = await spawnServer({ DRIVE_DEBUG: '1', HEARTBEAT_MS: '200' });
+  const ck = await adminCookie(s.base);
+  await fetch(s.base + '/api/admin/rooms', { method: 'POST', headers: { 'content-type': 'application/json', cookie: ck }, body: JSON.stringify({ name: 'stuck-room' }) });
   const a = await wsAt(s.base);
-  const b = await wsAt(s.base);
-  a.sendJson({ type: 'join', room: 'stall-room', id: 'stallpeerA1', name: 'A' });
+  a.sendJson({ type: 'join', room: 'stuck-room', id: 'stuckpeerA1', name: 'A' });
   assert.strictEqual((await a.next()).type, 'welcome');
-  b.sendJson({ type: 'join', room: 'stall-room', id: 'stallpeerB1', name: 'B' });
+  const b = await wsAt(s.base);
+  b.sendJson({ type: 'join', room: 'stuck-room', id: 'stuckpeerB1', name: 'B' });
   assert.strictEqual((await b.next()).type, 'welcome');
-  assert.strictEqual((await a.next()).type, 'peer-joined');
-  a._socket.pause(); // A's connection stalls: it reads nothing more
-  const big = 'x'.repeat(60 * 1024);
-  for (let i = 0; i < 900; i++) b.sendJson({ type: 'signal', to: 'stallpeerA1', data: { sdp: big } });
-  const left = await Promise.race([b.next(), new Promise((r) => setTimeout(() => r({ type: 'timeout' }), 15000))]);
-  assert.deepStrictEqual({ type: left.type, id: left.id }, { type: 'peer-left', id: 'stallpeerA1' });
-  b.sendJson({ type: 'time', c: 1 });
-  assert.strictEqual((await b.next()).c, 1, 'the sender is still connected');
+  a._socket.pause(); // A's connection stalls: no more pongs either
+  const left = await nextMatching(b, (m) => m.type === 'peer-left', 10000);
+  assert.deepStrictEqual({ type: left.type, id: left.id }, { type: 'peer-left', id: 'stuckpeerA1' });
   a.terminate();
   b.close();
+  s.stop();
+});
+
+test('the signal budget grows with MAX_ROOM_SIZE: a newcomer in a big room can send an offer to everyone', { timeout: 30000 }, async () => {
+  // About 15 KB (an offer with a shared screen, and its candidates) to each of the 49 others in a full room of 50, all at
+  // once. Signals to someone who is not in the room still count against the sender's budget, so the members do not
+  // have to exist here.
+  const burst = async (maxRoomSize) => {
+    const s = await spawnServer({ MAX_ROOM_SIZE: maxRoomSize });
+    const ck = await adminCookie(s.base);
+    await fetch(s.base + '/api/admin/rooms', { method: 'POST', headers: { 'content-type': 'application/json', cookie: ck }, body: JSON.stringify({ name: 'big-room' }) });
+    const ws = await wsAt(s.base);
+    ws.sendJson({ type: 'join', room: 'big-room', id: 'newcomer01', name: 'N' });
+    assert.strictEqual((await ws.next()).type, 'welcome');
+    const closed = new Promise((r) => ws.once('close', (code) => r(code)));
+    const offer = 'o'.repeat(15 * 1024);
+    for (let i = 0; i < 49; i++) ws.sendJson({ type: 'signal', to: `member${String(i).padStart(4, '0')}`, data: { sdp: offer } });
+    ws.sendJson({ type: 'time', c: 1 });
+    const answer = await Promise.race([nextMatching(ws, (m) => m.type === 'time', 5000), closed.then((code) => ({ type: 'closed', code }))]);
+    ws.terminate();
+    s.stop();
+    return answer;
+  };
+  assert.strictEqual((await burst('50')).type, 'time', 'MAX_ROOM_SIZE=50: still connected');
+  assert.deepStrictEqual(await burst('12'), { type: 'closed', code: 1008 }, 'MAX_ROOM_SIZE=12: that much is a flood');
+});
+
+test('signals: one member cannot flood another off the server; oversized signals are not relayed', { timeout: 30000 }, async () => {
+  const s = await spawnServer({});
+  const ck = await adminCookie(s.base);
+  await fetch(s.base + '/api/admin/rooms', { method: 'POST', headers: { 'content-type': 'application/json', cookie: ck }, body: JSON.stringify({ name: 'flood-room' }) });
+  const online = async () => (await (await fetch(s.base + '/api/admin/rooms', { headers: { cookie: ck } })).json()).rooms[0].online.sort();
+  const victim = await wsAt(s.base);
+  victim.sendJson({ type: 'join', room: 'flood-room', id: 'floodvict1', name: 'Victim' });
+  assert.strictEqual((await victim.next()).type, 'welcome');
+  const attacker = await wsAt(s.base);
+  attacker.sendJson({ type: 'join', room: 'flood-room', id: 'floodattk1', name: 'Attacker' });
+  assert.strictEqual((await attacker.next()).type, 'welcome');
+  assert.strictEqual((await victim.next()).type, 'peer-joined');
+
+  // A signal above the size limit is dropped (an SDP is far smaller); the sender stays connected.
+  attacker.sendJson({ type: 'signal', to: 'floodvict1', data: { sdp: 'x'.repeat(40 * 1024) } });
+  attacker.sendJson({ type: 'signal', to: 'floodvict1', data: { sdp: 'small' } });
+  assert.deepStrictEqual(await victim.next(), { type: 'signal', from: 'floodattk1', data: { sdp: 'small' } }, 'only the small one arrived');
+
+  // The victim's link is slow (it stops reading); the attacker sends as fast as it can: the attacker is cut off.
+  victim._socket.pause();
+  const closed = new Promise((r) => attacker.once('close', (code) => r(code)));
+  const big = 'x'.repeat(30 * 1024);
+  for (let i = 0; i < 300; i++) attacker.sendJson({ type: 'signal', to: 'floodvict1', data: { sdp: big } });
+  assert.strictEqual(await closed, 1008, 'the flooding sender is closed as rate limited');
+  assert.deepStrictEqual(await settled(online, ['Victim']), ['Victim'], 'the victim is still in the room');
+  victim._socket.resume();
+  victim.terminate();
+  s.stop();
+});
+// ---- TURN credentials go to members only ------------------------------------------------------------------------
+test('TURN credentials: not in the public config, in the welcome after the password check, and renewed before they expire', async () => {
+  const secret = 'turn-shared-secret';
+  const s = await spawnServer({ TURN_URLS: 'turn:turn.example.com:3478', TURN_SECRET: secret, DRIVE_DEBUG: '1', HEARTBEAT_MS: '100', ICE_REFRESH_MS: '400' });
+  const cfg = await (await fetch(s.base + '/api/config')).json();
+  assert(!JSON.stringify(cfg).includes('turn:'), 'no TURN server in /api/config');
+  assert(!JSON.stringify(cfg).includes('credential') && !JSON.stringify(cfg).includes('username'));
+  assert(cfg.iceServers.length && cfg.iceServers.every((x) => x.urls.every((u) => u.startsWith('stun:'))), 'STUN only');
+  const ck = await adminCookie(s.base);
+  await fetch(s.base + '/api/admin/rooms', { method: 'POST', headers: { 'content-type': 'application/json', cookie: ck }, body: JSON.stringify({ name: 'turn-room', password: 'tp' }) });
+
+  const bad = await wsAt(s.base);
+  bad.sendJson({ type: 'join', room: 'turn-room', id: 'turnbad001', name: 'X', password: 'wrong' });
+  const refused = await bad.next();
+  assert.strictEqual(refused.code, 'bad-password');
+  assert(!JSON.stringify(refused).includes('turn:'));
+  bad.close();
+
+  const ws = await wsAt(s.base);
+  ws.sendJson({ type: 'join', room: 'turn-room', id: 'turnmem001', name: 'M', password: 'tp' });
+  const welcome = await ws.next();
+  const turnOf = (servers) => servers.find((x) => x.urls.some((u) => u.startsWith('turn:')));
+  const turn = turnOf(welcome.iceServers);
+  assert(turn, 'the welcome carries the TURN server');
+  assert.strictEqual(turn.credential, crypto.createHmac('sha1', secret).update(turn.username).digest('base64'), 'coturn use-auth-secret credential');
+  // Renewed while connected (here after 400 ms instead of 10 h).
+  const renewed = await nextMatching(ws, (m) => m.type === 'ice', 5000);
+  assert.strictEqual(renewed.type, 'ice');
+  assert(Number(turnOf(renewed.iceServers).username.split(':')[0]) >= Number(turn.username.split(':')[0]));
+  ws.close();
+  s.stop();
+});
+
+// ---- ADMIN_PASSWORD ------------------------------------------------------------------------------------------------
+test('ADMIN_PASSWORD: an example value, a short one or only spaces stops the server, without printing it', async () => {
+  const { adminPassword, ConfigError } = require('../server/config');
+  assert.strictEqual(adminPassword({}), '', 'unset: the server generates one');
+  assert.strictEqual(adminPassword({ ADMIN_PASSWORD: '' }), '');
+  assert.strictEqual(adminPassword({ ADMIN_PASSWORD: 'a-long-enough-pw' }), 'a-long-enough-pw');
+  assert.strictEqual(adminPassword({ ADMIN_PASSWORD: 'nine-char' }), 'nine-char', '9 characters is the minimum');
+  for (const bad of ['change-me-to-something-long', ' Change-Me-To-Something-Long ', 'replace-with-a-long-random-password', 'short', '8-chars!', ' '.repeat(20)]) {
+    assert.throws(() => adminPassword({ ADMIN_PASSWORD: bad }), ConfigError, JSON.stringify(bad));
+  }
+  const exitOf = async (password) => {
+    const port = String(await freePort());
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'three-eight-pw-'));
+    const child = spawn(process.execPath, [path.join(__dirname, '..', 'server', 'server.js')], {
+      env: { ...process.env, PORT: port, HOST: '127.0.0.1', ADMIN_PASSWORD: password, DATA_DIR: dir, GOOGLE_SERVICE_ACCOUNT: '' },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let log = '';
+    child.stdout.on('data', (d) => { log += d; });
+    child.stderr.on('data', (d) => { log += d; });
+    const code = await new Promise((resolve) => child.on('exit', resolve));
+    fs.rmSync(dir, { recursive: true, force: true });
+    return { code, log };
+  };
+  const example = await exitOf('change-me-to-something-long');
+  assert.strictEqual(example.code, 1);
+  assert.match(example.log, /Configuration error: ADMIN_PASSWORD is still the example value/);
+  assert(!example.log.includes('change-me-to-something-long'), 'the value is not printed');
+  const short = await exitOf('pw123');
+  assert.strictEqual(short.code, 1);
+  assert.match(short.log, /ADMIN_PASSWORD is too short \(5 characters\)/);
+});
+
+// ---- Sockets that do not join ----------------------------------------------------------------------------------------
+test('a socket that does not join (or has left) is closed after the join deadline; members stay', { timeout: 30000 }, async () => {
+  const s = await spawnServer({ DRIVE_DEBUG: '1', JOIN_DEADLINE_MS: '300' });
+  const ck = await adminCookie(s.base);
+  await fetch(s.base + '/api/admin/rooms', { method: 'POST', headers: { 'content-type': 'application/json', cookie: ck }, body: JSON.stringify({ name: 'deadline' }) });
+  const closeCode = (ws) => new Promise((r) => ws.once('close', (code) => r(code)));
+  const idle = await wsAt(s.base);
+  const idleClosed = closeCode(idle);
+  const member = await wsAt(s.base);
+  member.sendJson({ type: 'join', room: 'deadline', id: 'deadline01', name: 'M' });
+  assert.strictEqual((await member.next()).type, 'welcome');
+  assert.strictEqual(await idleClosed, 4002, 'never joined');
+  await new Promise((r) => setTimeout(r, 500));
+  member.sendJson({ type: 'time', c: 1 });
+  assert.strictEqual((await member.next()).c, 1, 'a member is past the deadline and still connected');
+  const leftClosed = closeCode(member);
+  member.sendJson({ type: 'leave' });
+  assert.strictEqual(await leftClosed, 4002, 'left the room and stayed idle');
+  s.stop();
+});
+
+test('open sockets per client address are capped (an IPv4 address or an IPv6 /64), and freed when they close', { timeout: 30000 }, async () => {
+  const s = await spawnServer({ TRUST_PROXY: '1', MAX_ROOM_SIZE: '1' }); // cap: max(64, 2 x room size) = 64
+  const from = (ip) => wsAt(s.base, { 'X-Forwarded-For': ip });
+  const held = [];
+  for (let i = 0; i < 64; i++) held.push(await from('10.9.9.9'));
+  await assert.rejects(from('10.9.9.9'), /429/);
+  const other = await from('10.9.9.10');
+  // One IPv6 subscriber (a /64) counts once, whichever address inside it is used.
+  const v6 = [];
+  for (let i = 0; i < 64; i++) v6.push(await from(`2001:db8:1:2::${(i + 1).toString(16)}`));
+  await assert.rejects(from('2001:db8:1:2:ffff::1'), /429/);
+  assert.match(s.out.log, /Refused a WebSocket: 64 are already open from one client address/);
+  const gone = new Promise((r) => held[0].once('close', r));
+  held[0].close();
+  await gone;
+  await new Promise((r) => setTimeout(r, 200)); // the server's side of the close
+  held[0] = await from('10.9.9.9');
+  for (const ws of [...held, ...v6, other]) ws.close();
+  s.stop();
+});
+
+// ---- Drive in a room without a password ------------------------------------------------------------------------------
+test('drive: a room without a password can have a folder (the admin page warns), and removing a password keeps it working', async () => {
+  // An open room gets a folder: allowed, and every member (anyone with the link) gets a token.
+  assert.strictEqual((await json('POST', '/api/admin/rooms', { name: 'open-drive', password: '' })).status, 201);
+  assert.strictEqual((await json('PUT', '/api/admin/rooms/open-drive/drive', { link: D.rootA })).status, 200);
+  const listed = (await (await json('GET', '/api/admin/rooms')).json()).rooms.find((r) => r.name === 'open-drive');
+  assert.deepStrictEqual({ drive: listed.drive, hasPassword: listed.hasPassword }, { drive: { folderId: D.rootA }, hasPassword: false }, 'what the admin page warns about');
+  const open = await join('open-drive', '', 'opendrive1');
+  assert.strictEqual(open.welcome.drive.folder, D.rootA);
+  assert.strictEqual((await api('/api/rooms/open-drive/drive/folders/root', open.welcome.drive.token)).status, 200);
+  open.ws.close();
+
+  // A room with a password and a folder may lose its password: members get a new token (the old one stopped working).
+  assert.strictEqual((await json('PUT', '/api/admin/rooms/open-drive', { password: 'odp' })).status, 200);
+  const member = await join('open-drive', 'odp', 'opendrive2');
+  const before = member.welcome.drive.token;
+  assert.strictEqual((await json('PUT', '/api/admin/rooms/open-drive', { password: '' })).status, 200);
+  const pushed = await nextMatching(member.ws, (m) => m.type === 'drive');
+  assert.notStrictEqual(pushed.drive.token, before);
+  assert.strictEqual((await api('/api/rooms/open-drive/drive/folders/root', before)).status, 401);
+  assert.strictEqual((await api('/api/rooms/open-drive/drive/folders/root', pushed.drive.token)).status, 200);
+  member.ws.close();
+  assert.strictEqual((await json('DELETE', '/api/admin/rooms/open-drive', {})).status, 200);
+});
+
+// ---- Admin routes match their exact path ---------------------------------------------------------------------------------
+test('admin routes match their exact path: extra segments are a 404 and change nothing', async () => {
+  assert.strictEqual((await json('POST', '/api/admin/rooms', { name: 'exact-path', password: 'ep' })).status, 201);
+  const exists = async () => (await json('GET', '/api/admin/rooms').then((r) => r.json())).rooms.some((r) => r.name === 'exact-path');
+  for (const [method, p, body] of [
+    ['DELETE', '/api/admin/rooms/exact-path/extra', {}],
+    ['DELETE', '/api/admin/rooms/exact-path/drive/oops', {}],
+    ['PUT', '/api/admin/rooms/exact-path/extra', { password: '' }],
+    ['PUT', '/api/admin/rooms/exact-path/drive/extra', { link: '' }],
+    ['POST', '/api/admin/rooms/extra', { name: 'made-up' }],
+    ['GET', '/api/admin/rooms/extra/more'],
+    ['POST', '/api/admin/login/extra', { password: 'admin-pw-for-tests' }],
+    ['GET', '/api/config/extra'],
+  ]) {
+    assert.strictEqual((await json(method, p, body)).status, 404, `${method} ${p}`);
+  }
+  assert(await exists(), 'the room is still there');
+  assert.strictEqual((await fetch(BASE + '/api/rooms/exact-path')).status, 200);
+  assert.strictEqual((await json('DELETE', '/api/admin/rooms/exact-path', {})).status, 200);
+  assert(!(await exists()));
+});
+
+test('guessing room names is slow: after 30 misses a client gets 429 for every lookup, existing rooms included', async () => {
+  const s = await spawnServer({ TRUST_PROXY: '1' });
+  const ck = await adminCookie(s.base);
+  await fetch(s.base + '/api/admin/rooms', { method: 'POST', headers: { 'content-type': 'application/json', cookie: ck }, body: JSON.stringify({ name: 'real-room' }) });
+  const look = (name, ip) => fetch(`${s.base}/api/rooms/${name}`, { headers: { 'X-Forwarded-For': ip } }).then((r) => r.status);
+  // Finding a room costs nothing; only misses count.
+  for (let i = 0; i < 40; i++) assert.strictEqual(await look('real-room', '10.7.7.7'), 200);
+  for (let i = 0; i < 29; i++) assert.strictEqual(await look(`guess-${i}`, '10.7.7.7'), 404);
+  // Joins to missing rooms are misses too.
+  const ws = await wsAt(s.base, { 'X-Forwarded-For': '10.7.7.7' });
+  ws.sendJson({ type: 'join', room: 'guess-by-join', id: 'guesser001', name: 'G' });
+  assert.strictEqual((await ws.next()).code, 'no-room');
+  assert.strictEqual(await look('guess-more', '10.7.7.7'), 429);
+  assert.strictEqual(await look('real-room', '10.7.7.7'), 429, 'an existing room looks the same as a missing one now');
+  ws.sendJson({ type: 'join', room: 'real-room', id: 'guesser001', name: 'G' });
+  assert.strictEqual((await ws.next()).code, 'rate-limited');
+  assert.strictEqual(await look('real-room', '10.7.7.8'), 200, 'other clients are not affected');
+  ws.close();
+  s.stop();
+});
+
+// ---- Removing one member ---------------------------------------------------------------------------------------------
+test('admin: one member can be removed; the others stay and are told, and the room list has the ids to do it', async () => {
+  assert.strictEqual((await json('POST', '/api/admin/rooms', { name: 'kick-room', password: 'kp' })).status, 201);
+  const room = async () => (await (await json('GET', '/api/admin/rooms')).json()).rooms.find((r) => r.name === 'kick-room');
+  const alice = await join('kick-room', 'kp', 'kickalice1', 'Alice');
+  const bob = await join('kick-room', 'kp', 'kickbob001', 'Bob');
+  await alice.ws.next(); // peer-joined
+  const listed = await room();
+  assert.deepStrictEqual(listed.online.sort(), ['Alice', 'Bob'], 'online keeps listing names');
+  assert.deepStrictEqual(listed.members.sort((x, y) => x.name.localeCompare(y.name)), [{ id: 'kickalice1', name: 'Alice' }, { id: 'kickbob001', name: 'Bob' }]);
+
+  const url = '/api/admin/rooms/kick-room/members/kickbob001';
+  assert.strictEqual((await json('DELETE', url, {}, { cookie: '' })).status, 401, 'admins only');
+  const closed = new Promise((r) => bob.ws.once('close', (code) => r(code)));
+  assert.strictEqual((await json('DELETE', url, {})).status, 200);
+  assert.deepStrictEqual(await bob.ws.next(), { type: 'error', code: 'kicked', message: 'The administrator removed you from the room.' });
+  assert.strictEqual(await closed, 4001);
+  assert.deepStrictEqual(await alice.ws.next(), { type: 'peer-left', id: 'kickbob001' });
+  assert.deepStrictEqual((await room()).online, ['Alice']);
+  assert.strictEqual((await json('DELETE', url, {})).status, 404, 'not in the room any more');
+  assert.strictEqual((await json('DELETE', '/api/admin/rooms/no-such-room/members/kickalice1', {})).status, 404);
+  assert.strictEqual((await json('DELETE', '/api/admin/rooms/kick-room/members/kickalice1/extra', {})).status, 404);
+  // It does not keep anyone out: with the password, Bob can join again.
+  const again = await join('kick-room', 'kp', 'kickbob001', 'Bob');
+  assert.strictEqual(again.welcome.type, 'welcome');
+  for (const c of [alice, again]) c.ws.close();
+  assert.strictEqual((await json('DELETE', '/api/admin/rooms/kick-room', {})).status, 200);
+});
+
+test('drive: removing a member ends its Drive access at once (token, cookie, open download); the others keep theirs', { timeout: 60000 }, async () => {
+  const F = 'REVOKE_FOLDER_0001', BIG = 'REVOKE_BIG_FILE_01';
+  google.addFolder(F, 'Revoke folder');
+  google.addFile(BIG, 'big.mp4', F, bytes(48 * MiB), 'video/mp4');
+  const s = await spawnServer({ GOOGLE_SERVICE_ACCOUNT: google.writeAccount(keyDir), GOOGLE_API_BASE: google.url, DRIVE_DEBUG: '1' });
+  const ck = await adminCookie(s.base);
+  const admin = (method, p, body) => fetch(s.base + p, { method, headers: { 'content-type': 'application/json', cookie: ck }, body: body && JSON.stringify(body) });
+  assert.strictEqual((await admin('POST', '/api/admin/rooms', { name: 'revoke', password: 'rp' })).status, 201);
+  assert.strictEqual((await admin('PUT', '/api/admin/rooms/revoke/drive', { link: F })).status, 200);
+  const member = async (id) => {
+    const ws = await wsAt(s.base);
+    ws.sendJson({ type: 'join', room: 'revoke', id, name: id, password: 'rp', secret: secretOf(id) });
+    const welcome = await nextMatching(ws, (m) => m.type === 'welcome');
+    return { ws, token: welcome.drive.token };
+  };
+  const status = (token, headers = {}) => fetch(`${s.base}/api/rooms/revoke/drive/folders/root`, { headers: { ...(token && { Authorization: `Bearer ${token}` }), ...headers } }).then((r) => r.status);
+  const streams = async () => (await (await fetch(`${s.base}/api/debug/drive-streams`)).json()).streams;
+
+  const alice = await member('revokealic1');
+  const mallory = await member('revokemall1');
+  assert.notStrictEqual(alice.token, mallory.token, 'every member has its own token');
+  // Mallory's native-playback cookie, and a whole-film download she does not read, so it stays open.
+  const session = await fetch(`${s.base}/api/rooms/revoke/drive/session`, { method: 'POST', headers: { Authorization: `Bearer ${mallory.token}` } });
+  const cookie = session.headers.get('set-cookie').split(';')[0];
+  assert.strictEqual(await status(null, { cookie }), 200);
+  const download = await new Promise((resolve, reject) => {
+    const req = http.get(`${s.base}/api/rooms/revoke/drive/files/${BIG}`, { headers: { Authorization: `Bearer ${mallory.token}` } }, (res) => {
+      res.pause();
+      resolve({ req, res });
+    });
+    req.on('error', reject);
+  });
+  download.req.on('error', () => {}); // the server cuts it below
+  download.res.on('error', () => {});
+  assert.strictEqual(download.res.statusCode, 200);
+  assert.strictEqual(await streams(), 1);
+
+  assert.strictEqual((await admin('DELETE', '/api/admin/rooms/revoke/members/revokemall1', {})).status, 200);
+  for (let i = 0; i < 50 && (await streams()) > 0; i++) await new Promise((r) => setTimeout(r, 50));
+  assert.strictEqual(await streams(), 0, 'her download was cut');
+  assert.strictEqual(await status(mallory.token), 401, 'her token');
+  assert.strictEqual(await status(null, { cookie }), 401, 'her cookie');
+  assert.strictEqual((await fetch(`${s.base}/api/rooms/revoke/drive/session`, { method: 'POST', headers: { Authorization: `Bearer ${mallory.token}` } })).status, 401, 'no new cookie from it');
+  assert.strictEqual(await status(alice.token), 200, 'Alice keeps hers');
+
+  // Removing does not keep anyone out: joining again with the password gives a new token that works; the old one stays void.
+  const back = await member('revokemall1');
+  assert.strictEqual(await status(back.token), 200);
+  assert.strictEqual(await status(mallory.token), 401);
+  download.req.destroy();
+  for (const ws of [alice.ws, back.ws]) ws.close();
   s.stop();
 });

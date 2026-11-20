@@ -4,7 +4,7 @@ import { MovieSync } from './sync.js';
 import { MoviePlayer } from './player/player.js';
 import { LocalMedia, watchLevel, audioContext } from './media.js';
 import { Swarm } from './player/swarm.js';
-import { $, store, show, showMessage, toast, setIcon, colorFor, initials, randomId, mixin, pipState } from './room/util.js';
+import { $, store, show, showMessage, toast, setIcon, colorFor, initials, randomId, randomSecret, mixin, pipState } from './room/util.js';
 import { bindThemeSelect } from './theme.js';
 import { Tiles } from './room/tiles.js';
 import { Toolbar } from './room/toolbar.js';
@@ -17,30 +17,33 @@ import { Settings } from './room/settings.js';
 import { Keyboard } from './room/keyboard.js';
 import { Screen } from './room/screen.js';
 
-/** This tab's participant id (kept across reloads so a rejoin replaces our old connection). */
-function sessionId() {
+/**
+ * This tab's participant id and the secret that goes with it (kept across reloads, so a rejoin replaces our old
+ * connection). The id is visible to everyone in the room; the secret is what lets only this tab take its id over.
+ */
+function session() {
   try {
-    const id = sessionStorage.getItem('te.id') || randomId();
-    sessionStorage.setItem('te.id', id);
-    return id;
+    let id = sessionStorage.getItem('te.id');
+    let secret = sessionStorage.getItem('te.secret');
+    if (!id || !secret) {
+      id = randomId();
+      secret = randomSecret();
+      sessionStorage.setItem('te.id', id);
+      sessionStorage.setItem('te.secret', secret);
+    }
+    return { id, secret };
   } catch {
-    return randomId(); // storage blocked
+    return { id: randomId(), secret: randomSecret() }; // storage blocked
   }
 }
 
-/** ICE servers etc.; a stalled request must not leave the lobby on "Joining…" forever. */
-async function fetchConfig() {
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 15000);
+/** Forget this tab's id: the next session() makes a new one (the old one is in use by somebody else). */
+function resetSession() {
   try {
-    const res = await fetch('/api/config', { signal: ctrl.signal, cache: 'no-store' });
-    if (!res.ok) throw new Error(`The server answered with an error (${res.status}).`);
-    return await res.json();
-  } catch (err) {
-    if (err.name === 'AbortError' || err instanceof TypeError) throw new Error('Could not reach the server. Check your connection and try again.');
-    throw err;
-  } finally {
-    clearTimeout(timer);
+    sessionStorage.removeItem('te.id');
+    sessionStorage.removeItem('te.secret');
+  } catch {
+    /* storage blocked: session() makes a new one anyway */
   }
 }
 
@@ -83,6 +86,10 @@ async function startLobby(room) {
   });
   if (res.status === 404) {
     showMessage('Room not found', `There is no room called “${room}”. Check the link with whoever invited you.`);
+    return;
+  }
+  if (res.status === 429) {
+    showMessage('Please wait', 'Too many rooms that do not exist were tried from your network. Try again in a few minutes.');
     return;
   }
   if (!res.ok) throw new Error('Server error');
@@ -172,14 +179,27 @@ async function startLobby(room) {
     const password = $('lobby-password').value;
     let signaling = null;
     try {
-      const cfg = await fetchConfig();
-      const id = sessionId();
+      let me = session();
       const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-      signaling = new Signaling(`${proto}//${location.host}/ws`);
-      signaling.addEventListener('retrying', (ev) => {
-        $('lobby-join').textContent = `Can’t reach the server, retrying (${ev.detail.attempt})…`;
-      });
-      const welcome = await signaling.join({ room: info.name, id, name, password });
+      const connect = () => {
+        signaling?.close();
+        signaling = new Signaling(`${proto}//${location.host}/ws`);
+        signaling.addEventListener('retrying', (ev) => {
+          $('lobby-join').textContent = `Can’t reach the server, retrying (${ev.detail.attempt})…`;
+        });
+        return signaling.join({ room: info.name, id: me.id, secret: me.secret, name, password });
+      };
+      let welcome;
+      try {
+        welcome = await connect();
+      } catch (err) {
+        if (err.code !== 'id-taken') throw err;
+        // Somebody else's connection holds our id (everyone in the room can see it): join with a new one.
+        resetSession();
+        me = session();
+        welcome = await connect();
+      }
+      const id = me.id;
       store.set(pwKey, $('lobby-remember').checked && password ? password : null);
       store.set('media', { mic: media.micOn, cam: media.camOn, audioDevice: media.deviceIds.audio, videoDevice: media.deviceIds.video });
       inLobby = false;
@@ -187,7 +207,8 @@ async function startLobby(room) {
       media.removeEventListener('change', refreshPreview);
       preview.srcObject = null;
       // If the devices are still pending, the Room picks them up from the media 'change' events when they come.
-      new Room({ signaling, welcome, media, name, id, iceServers: cfg.iceServers, roomName: welcome.room || info.name });
+      // ICE servers (with TURN credentials, when the server has TURN) come with the welcome: only members get them.
+      new Room({ signaling, welcome, media, name, id, iceServers: Array.isArray(welcome.iceServers) ? welcome.iceServers : [], roomName: welcome.room || info.name });
     } catch (err) {
       console.error('join failed', err);
       signaling?.close(); // stop any reconnect attempts
@@ -294,11 +315,21 @@ class Room {
     signaling.addEventListener('reconnected', (e) => {
       this._setConn('');
       this._setDrive(e.detail?.drive); // the admin may have changed it while we were away
+      if (Array.isArray(e.detail?.iceServers)) this.mesh.setIceServers(e.detail.iceServers); // fresh TURN credentials
     });
+    signaling.addEventListener('ice', (e) => this.mesh.setIceServers(e.detail)); // renewed before the old ones expire
     signaling.addEventListener('drive', (e) => this._setDrive(e.detail));
     signaling.addEventListener('fatal', (e) => {
+      // A reload must not come back with an id that somebody else holds.
+      if (e.detail.code === 'id-taken') resetSession();
       this.leave(false);
       showMessage('Disconnected', e.detail.message || 'You were disconnected from the room.');
+    });
+    // This tab's id joined again elsewhere (a duplicated tab shares it): that connection took over, this one is done.
+    signaling.addEventListener('replaced', () => {
+      // The other tab uses the same Drive cookie: leave it in place.
+      this.leave(false, { keepDriveSession: true });
+      showMessage('Opened in another tab', 'You joined this room again in another tab or window, so this one was disconnected. Reload to join here instead.');
     });
     window.addEventListener('pagehide', () => this.leave(false));
     this._wakeLock();
@@ -322,7 +353,8 @@ class Room {
     $('conn-status').hidden = !text;
   }
 
-  leave(explicit) {
+  /** `keepDriveSession`: another tab of this browser still uses the Drive cookie, so it is not cleared. */
+  leave(explicit, { keepDriveSession = false } = {}) {
     if (this.left) return;
     this.left = true;
     document.removeEventListener('keydown', this._onKeydown);
@@ -334,7 +366,9 @@ class Room {
       /* ignore */
     }
     this.closePip();
-    this.drive?.endSession(); // clear the Drive cookie: it would outlive the page
+    if (keepDriveSession) {
+      if (this.drive) this.drive.ended = true; // never set it again from here
+    } else this.drive?.endSession(); // clear the Drive cookie: it would outlive the page
     this.sync.destroy();
     this.screen?.destroy();
     this.player.unload();

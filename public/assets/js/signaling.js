@@ -89,12 +89,14 @@ export class Signaling extends EventTarget {
     };
     ws.onclose = (ev) => {
       if (this.ws !== ws) return;
-      // Replaced by a newer connection of ours (another tab with our id). Only a joined socket can be
-      // replaced; while our first join is still waiting, keep trying rather than wait forever.
+      // Replaced by a newer connection of ours (another tab with our id and secret, e.g. a duplicated tab). Only a
+      // joined socket can be replaced; while our first join is still waiting, keep trying rather than wait forever.
       if (ev.code === 4000 && !this._pending) {
         this.joined = false;
+        this._fatal = true; // the other tab has the room now: never reconnect from here
         clearInterval(this._timeTimer);
         clearTimeout(this._attemptTimer);
+        this._emit('replaced');
         return;
       }
       this._lost(ws);
@@ -146,7 +148,7 @@ export class Signaling extends EventTarget {
         } else this._emit('reconnected', msg);
         break;
       case 'error':
-        if (['bad-password', 'no-room', 'room-full', 'rate-limited', 'room-deleted', 'kicked', 'bad-request', 'server-error'].includes(msg.code)) {
+        if (['bad-password', 'no-room', 'room-full', 'rate-limited', 'room-deleted', 'kicked', 'bad-request', 'server-error', 'id-taken'].includes(msg.code)) {
           this._fatal = true;
           if (this._pending) {
             this._pending.reject(Object.assign(new Error(msg.message), { code: msg.code }));
@@ -158,6 +160,10 @@ export class Signaling extends EventTarget {
       case 'drive':
         // The admin attached, changed or removed the room's Google Drive folder.
         this._emit('drive', msg.drive || null);
+        break;
+      case 'ice':
+        // Fresh TURN credentials, sent before the ones from the welcome expire.
+        if (Array.isArray(msg.iceServers)) this._emit('ice', msg.iceServers);
         break;
       case 'peer-joined':
         this._emit('peer-joined', msg);

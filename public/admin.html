@@ -58,6 +58,7 @@
     <form method="dialog" class="stack">
       <h2>Change password for <span id="pw-room"></span></h2>
       <label>New password <input id="pw-new" type="text" autocomplete="off" placeholder="leave empty to remove the password"></label>
+      <p id="pw-drive" class="warning small" hidden>This room has a Google Drive folder. Without a password, anyone who knows the room's name can join and stream the whole folder.</p>
       <label class="check"><input id="pw-kick" type="checkbox"> Disconnect people currently in the room</label>
       <button class="btn primary" value="save">Save</button>
       <button class="btn ghost" value="cancel">Cancel</button>
@@ -71,6 +72,7 @@
       <p class="muted small">Paste the link of the folder. Leave empty to remove it.</p>
       <p id="drive-share" class="muted small" hidden>Share the folder with <strong id="drive-sa"></strong> (Viewer). It doesn't need to be public. <button type="button" id="drive-copy" class="btn ghost">Copy email</button></p>
       <p id="drive-nosa" class="muted small" hidden>GOOGLE_SERVICE_ACCOUNT is not set on the server, so room members won't see this folder.</p>
+      <p id="drive-nopw" class="warning small" hidden>This room has no password: anyone who knows the room's name can join and stream the whole folder. Consider setting one (“Password…”).</p>
       <button class="btn primary" value="save">Save</button>
       <button id="drive-remove" class="btn danger" value="remove" hidden>Remove</button>
       <button class="btn ghost" value="cancel">Cancel</button>
