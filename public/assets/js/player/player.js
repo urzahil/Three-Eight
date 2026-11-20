@@ -4,7 +4,7 @@
 import { MkvDemuxer } from './mkv.js';
 import { Mp4Demuxer } from './mp4.js';
 import { MseEngine, SHIFT, mseAvailable, mseSupports } from './mse.js';
-import { NativeCaptions, SubtitleRenderer, normalizeEmbeddedCue, parseSubtitleFile, sortCues } from './subtitles.js';
+import { NativeCaptions, SubtitleRenderer, closeGaps, normalizeEmbeddedCue, parseSubtitleFile, sortCues } from './subtitles.js';
 import { humanCodec } from './codecs.js';
 
 const LANG_NAMES = (() => {
@@ -43,12 +43,6 @@ function trackLabel(t, n, kind) {
 }
 
 // Close gaps for cues without durations (end = next start).
-function closeGaps(s) {
-  for (let i = 0; i < s.cues.length - 1; i++) {
-    if (s.cues[i].end > s.cues[i + 1].start && s.cues[i].end - s.cues[i].start === 4) s.cues[i].end = s.cues[i + 1].start;
-  }
-}
-
 async function openDemuxer(file) {
   try {
     if (await MkvDemuxer.probe(file)) return await MkvDemuxer.open(file);

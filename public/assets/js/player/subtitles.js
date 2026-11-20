@@ -141,6 +141,19 @@ export function parseSubtitleFile(name, data) {
   return sortCues(cues);
 }
 
+// How long an embedded subtitle without a BlockDuration is shown (mkv.js), unless the next one starts first.
+const DEFAULT_CUE_SECONDS = 4;
+
+/** Trim embedded cues whose end was guessed so they don't overlap the next one. `s` is a subtitle with `cues`. */
+export function closeGaps(s) {
+  for (let i = 0; i < s.cues.length - 1; i++) {
+    const c = s.cues[i];
+    // `end` was guessed (no BlockDuration): computed as start + 4, which floating point does not always undo exactly.
+    const guessed = Math.abs(c.end - c.start - DEFAULT_CUE_SECONDS) < 1e-6;
+    if (c.end > s.cues[i + 1].start && guessed) c.end = s.cues[i + 1].start;
+  }
+}
+
 /** Normalize one cue extracted from a container. */
 export function normalizeEmbeddedCue(format, cue) {
   const raw = cue.raw;

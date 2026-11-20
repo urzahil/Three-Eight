@@ -76,7 +76,9 @@ export function colorFor(id) {
 }
 export function initials(name) {
   const parts = String(name || '?').trim().split(/\s+/);
-  return ((parts[0]?.[0] || '?') + (parts.length > 1 ? parts[parts.length - 1][0] : '')).toUpperCase();
+  // By code point, not UTF-16 unit: a name that starts with an emoji must not show half a surrogate pair.
+  const first = (w) => (w ? [...w][0] : '') || '';
+  return ((first(parts[0]) || '?') + (parts.length > 1 ? first(parts[parts.length - 1]) : '')).toUpperCase();
 }
 
 export function randomId() {
@@ -103,18 +105,37 @@ export async function hashText(text) {
   }
 }
 
+/**
+ * A URL found in text without the sentence punctuation that follows it ("see https://x.org/a." links to /a). A
+ * closing bracket stays when the URL itself opened one, as in https://en.wikipedia.org/wiki/Foo_(bar).
+ */
+export function trimUrl(url) {
+  for (;;) {
+    const c = url.at(-1);
+    if ('.,;:!?\'"'.includes(c)) url = url.slice(0, -1);
+    else if (c === ')' || c === ']') {
+      const open = c === ')' ? '(' : '[';
+      const count = (ch) => url.split(ch).length - 1;
+      if (count(c) > count(open)) url = url.slice(0, -1);
+      else return url;
+    } else return url;
+  }
+}
+
 export function linkify(text, parent) {
   const re = /\bhttps?:\/\/[^\s<>"']+/g;
   let last = 0, m;
   while ((m = re.exec(text))) {
+    const url = trimUrl(m[0]);
     parent.append(text.slice(last, m.index));
     const a = document.createElement('a');
-    a.href = m[0];
-    a.textContent = m[0];
+    a.href = url;
+    a.textContent = url;
     a.target = '_blank';
     a.rel = 'noopener noreferrer';
     parent.append(a);
-    last = re.lastIndex;
+    last = m.index + url.length;
+    re.lastIndex = last;
   }
   parent.append(text.slice(last));
 }

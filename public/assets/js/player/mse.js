@@ -286,6 +286,7 @@ export class MseEngine extends EventTarget {
     }
     this.ms.duration = (this.demux.duration || 0) + SHIFT;
     for (const f of this.feeders) await f._append(initSegment(f.track), f.gen);
+    if (this.destroyed) return; // replaced while the init segments were appended: attach nothing to the element
     for (const f of this.feeders) f.reposition(movieTime);
     this.video.addEventListener('seeking', this._onSeeking);
     this.video.currentTime = movieTime + SHIFT;

@@ -538,7 +538,7 @@ export class MkvDemuxer {
         if (!data) return; // a damaged block: skip it, keep the others
       }
       const start = blk.pts / this.timescale;
-      const dur = blk.duration != null ? blk.duration / this.timescale : 4;
+      const dur = blk.duration != null ? blk.duration / this.timescale : 4; // player.js closeGaps() trims these 4 s
       pending.get(blk.track).push({ start, end: start + dur, raw: td.decode(data) });
     };
 

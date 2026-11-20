@@ -459,8 +459,14 @@ export class Movie {
     const who = this.profileOf(peer.id).name;
     const by = state.by === peer.id ? who : this.profileOf(state.by).name;
     if (!sameMovie(prev.movie, state.movie)) {
-      if (state.movie) toast(`${by} started “${state.movie.name}”. ${this.drive && state.movie.drive ? 'Stream it from Google Drive' : state.movie.size > 0 && state.by === peer.id ? `Stream it from ${who}'s copy` : 'Open your copy'} to watch along.`);
-      else toast(`${by} closed the movie.`);
+      if (state.movie) {
+        // Joining a room that already plays a film: `by` is whoever acted last (paused, seeked...), not who
+        // started it, so nobody is named. Whether a friend's copy can be streamed is only known once they
+        // announce it, so it is not promised either.
+        const joined = prev.seq === 0;
+        const how = this.drive && state.movie.drive ? 'Stream it from Google Drive' : state.movie.size > 0 ? 'Open your copy, or stream it from a friend who shares theirs,' : 'Open your copy';
+        toast(`${joined ? 'The room is watching' : `${by} started`} “${state.movie.name}”. ${how} to watch along.`);
+      } else toast(`${by} closed the movie.`);
       return;
     }
     if (prev.paused !== state.paused) toast(`${by} ${state.paused ? 'paused' : 'pressed play'}`);

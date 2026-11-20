@@ -1,9 +1,9 @@
 // Unit tests for the browser-side subtitle parsers and fMP4 writer (pure functions).
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { parseSrt, parseVtt, parseAss, normalizeEmbeddedCue, activeCues, cueToVtt } from '../public/assets/js/player/subtitles.js';
+import { parseSrt, parseVtt, parseAss, normalizeEmbeddedCue, activeCues, cueToVtt, closeGaps } from '../public/assets/js/player/subtitles.js';
 import { fragment, initSegment } from '../public/assets/js/player/fmp4.js';
-import { avcCodecString, aacCodecString, makeAsc } from '../public/assets/js/player/codecs.js';
+import { avcCodecString, aacCodecString, makeAsc, mp4TrackFromMatroska, dOpsFromOpusHead } from '../public/assets/js/player/codecs.js';
 
 test('SRT', () => {
   const cues = parseSrt('1\r\n00:00:01,000 --> 00:00:02,500\r\n<i>Hi</i> <font color="red">there</font>\r\n\r\n2\n00:01:00,000 --> 00:01:01,000\nA &amp; B\n');
@@ -209,4 +209,34 @@ test('MP4: sample counts the file cannot hold make the track unusable instead of
   } finally {
     console.warn = warn;
   }
+});
+
+test('closeGaps: a guessed 4 s end is trimmed to the next cue even when floating point does not give exactly 4', () => {
+  let t = 1000;
+  while (t + 4 - t === 4) t += 0.001; // a start for which start + 4 - start is not exactly 4
+  assert.notStrictEqual(t + 4 - t, 4);
+  const s = { cues: [{ start: t, end: t + 4 }, { start: t + 1, end: t + 2 }] };
+  closeGaps(s);
+  assert.strictEqual(s.cues[0].end, t + 1);
+  const explicit = { cues: [{ start: 0, end: 5 }, { start: 1, end: 2 }] }; // a real 5 s duration is left alone
+  closeGaps(explicit);
+  assert.strictEqual(explicit.cues[0].end, 5);
+});
+
+test('codec records too short for their codec string are not turned into garbage', () => {
+  const t = (codecId, cp) => mp4TrackFromMatroska({ type: 'video', codecId, codecPrivate: cp, width: 640, height: 360 }, null);
+  assert.ok(!/undefined|NaN/.test(t('V_MPEG4/ISO/AVC', new Uint8Array([1, 0x64])).codecString || ''));
+  assert.ok(!/undefined|NaN/.test(t('V_MPEGH/ISO/HEVC', new Uint8Array([1, 1, 0x60])).codecString || ''));
+  assert.match(t('V_MPEG4/ISO/AVC', new Uint8Array([1, 0x64, 0, 0x1f, 0xff])).codecString, /^avc1\.64001F$/);
+});
+
+test('dOpsFromOpusHead: a channel mapping table cut short is rejected', () => {
+  const head = new Uint8Array(21); // family 1 with 6 channels needs 21 + 6 bytes
+  head.set([...'OpusHead'].map((c) => c.charCodeAt(0)));
+  head[9] = 6;
+  head[18] = 1;
+  assert.strictEqual(dOpsFromOpusHead(head, 6), null);
+  const full = new Uint8Array(27);
+  full.set(head);
+  assert.strictEqual(dOpsFromOpusHead(full, 6).channels, 6);
 });

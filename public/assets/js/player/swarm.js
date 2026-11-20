@@ -664,7 +664,7 @@ export class Swarm extends EventTarget {
     p = (async () => {
       const asked = new Set();
       for (;;) {
-        if (this.film !== film || film.closed) return null;
+        if (!film || this.film !== film || film.closed) return null;
         const h = this._cueHolders(track).find((x) => !asked.has(x.id));
         if (!h) return null;
         asked.add(h.id);
