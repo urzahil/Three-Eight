@@ -265,6 +265,9 @@ button:focus-visible, .seek:focus-visible { outline: 2px solid var(--accent); ou
 .dialog { background: var(--bg-2); color: var(--text); border: 1px solid var(--line); border-radius: var(--r-card); padding: 24px; width: min(440px, calc(100vw - 32px)); box-shadow: var(--shadow); }
 .dialog::backdrop { background: var(--backdrop); }
 .dialog .stack > * { min-width: 0; }
+/* A dialog's title with small print on the right (the Settings dialog: the app version and the source link). */
+.dialog-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.dialog-head .about { margin: 0; font-size: 12px; color: var(--muted); white-space: nowrap; }
 @media (max-width: 480px) { .dialog { padding: 18px 16px; } }
 
 /* ---- Google Drive browser (movie dialog) ---- */
