@@ -164,6 +164,19 @@ async function waitFor(page, fn, arg, timeout = 15000) {
   console.log('seeked:', a.time, b.time);
   assert(Math.abs(a.time - b.time) < 0.2, 'seek synced');
 
+  // Clicking the length at the right end of the seek bar shows the time remaining, and back; the choice is remembered.
+  const secs = (s) => s.replace('−', '').split(':').reduce((acc, x) => acc * 60 + Number(x), 0);
+  const length = await bob.textContent('#m-duration');
+  await ctl(bob, '#m-duration');
+  const left = await bob.textContent('#m-duration');
+  assert(left.startsWith('−'), `remaining time shown: ${left}`);
+  assert(Math.abs(secs(await bob.textContent('#m-time')) + secs(left) - secs(length)) <= 1, `elapsed + remaining = length (${left} of ${length})`);
+  assert.strictEqual(await bob.evaluate(() => localStorage.getItem('te.movieRemaining')), 'true');
+  await ctl(bob, '#m-duration');
+  assert.strictEqual(await bob.textContent('#m-duration'), length, 'clicking again shows the length');
+  assert.strictEqual(await bob.evaluate(() => localStorage.getItem('te.movieRemaining')), null);
+  console.log('length / remaining toggle ok');
+
   // Alice selects Italian audio and English subtitles
   await ctl(alice, '#m-audio');
   await alice.click('#m-audio-menu button:nth-of-type(2)');
