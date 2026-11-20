@@ -30,11 +30,21 @@ export function mseSupports(mime) {
   }
 }
 
-function waitUpdate(sb) {
+// A SourceBuffer operation takes milliseconds; one that has not ended after this is stuck (a browser or MediaSource
+// failure), and waiting longer would leave the feeder hanging for good.
+export const UPDATE_TIMEOUT_MS = 15_000;
+
+/** Resolves on the SourceBuffer's next updateend; rejects on its error event, or with a TimeoutError. */
+export function waitUpdate(sb, ms = UPDATE_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
     const ok = () => { cleanup(); resolve(); };
     const bad = () => { cleanup(); reject(new Error('SourceBuffer error')); };
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(Object.assign(new Error('The SourceBuffer did not finish updating.'), { name: 'TimeoutError' }));
+    }, ms);
     const cleanup = () => {
+      clearTimeout(timer);
       sb.removeEventListener('updateend', ok);
       sb.removeEventListener('error', bad);
     };
@@ -45,7 +55,7 @@ function waitUpdate(sb) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-class Feeder {
+export class Feeder {
   constructor(engine, track) {
     this.engine = engine;
     this.track = track;
@@ -56,10 +66,33 @@ class Feeder {
     this.eos = false;
     this.ahead = AHEAD;
     this.lastEnd = -1; // element time of the end of the last appended fragment
+    this.updateTimeoutMs = UPDATE_TIMEOUT_MS;
   }
 
+  /**
+   * Waits until the SourceBuffer is not updating. An operation that never ends is aborted once; if the buffer
+   * is still busy after that, it is broken and this throws instead of waiting (or looping) forever.
+   */
   async _whenIdle() {
-    while (this.sb.updating) await waitUpdate(this.sb).catch(() => {});
+    let aborted = false;
+    for (let errors = 0; this.sb.updating && !this.engine.destroyed; ) {
+      try {
+        await waitUpdate(this.sb, this.updateTimeoutMs);
+      } catch (err) {
+        if (err.name !== 'TimeoutError') {
+          // An error event normally ends the operation; one that keeps the buffer busy repeatedly is not normal.
+          if (++errors > 3) throw err;
+          continue;
+        }
+        if (aborted) throw err;
+        aborted = true;
+        try {
+          if (this.engine.ms?.readyState === 'open') this.sb.abort();
+        } catch {
+          /* the MediaSource is gone */
+        }
+      }
+    }
   }
 
   async _append(data, gen) {
@@ -68,7 +101,7 @@ class Feeder {
       if (gen !== this.gen || this.engine.destroyed) return false;
       try {
         this.sb.appendBuffer(data);
-        await waitUpdate(this.sb);
+        await waitUpdate(this.sb, this.updateTimeoutMs);
         return true;
       } catch (err) {
         if (err.name !== 'QuotaExceededError' || attempt > 20) throw err;
@@ -86,7 +119,7 @@ class Feeder {
     await this._whenIdle();
     try {
       this.sb.remove(start, end);
-      await waitUpdate(this.sb);
+      await waitUpdate(this.sb, this.updateTimeoutMs);
     } catch {
       /* ignore */
     }
@@ -277,7 +310,13 @@ export class MseEngine extends EventTarget {
     const f = this.audioFeeder;
     if (!f) return false;
     if (track.mime !== f.mime && !('changeType' in SourceBuffer.prototype)) return false;
-    await f.switchTrack(track, this.video.currentTime - SHIFT);
+    try {
+      await f.switchTrack(track, this.video.currentTime - SHIFT);
+    } catch (err) {
+      // The buffer is stuck or broken: the player rebuilds the whole pipeline instead (false).
+      console.warn('MSE audio switch failed', err);
+      return false;
+    }
     return true;
   }
 
