@@ -6,7 +6,14 @@ import './browser-globals.mjs';
 import { LocalMedia } from '../public/assets/js/media.js';
 
 function fakeTrack(kind, deviceId = `default-${kind}`) {
-  return { kind, deviceId, enabled: true, stopped: false, stop() { this.stopped = true; }, addEventListener() {}, getSettings: () => ({ deviceId }) };
+  const ended = [];
+  return {
+    kind, deviceId, enabled: true, stopped: false,
+    stop() { this.stopped = true; }, // like the real thing: stop() fires no 'ended'
+    end() { this.stopped = true; for (const fn of ended) fn(); }, // the browser ends the track
+    addEventListener(type, fn) { if (type === 'ended') ended.push(fn); },
+    getSettings: () => ({ deviceId }),
+  };
 }
 
 const err = (name) => Object.assign(new Error(name), { name });
@@ -14,9 +21,10 @@ const requested = (c) => (c && c.deviceId?.exact) || undefined;
 
 /**
  * Install a fake navigator.mediaDevices; `gate` (a promise) delays the answer like a permission prompt does.
- * `oneCamera`: like a phone, a camera can't be opened while another one runs. `broken`: deviceId -> error name.
+ * `oneCamera`: like Android, a camera can't be opened while another one runs. `endsOtherCamera`: like Safari on
+ * iOS, opening a camera ends the one that runs (WebKit bug 264288). `broken`: deviceId -> error name.
  */
-function fakeDevices({ fail = false, gate = null, oneCamera = false, broken = {} } = {}) {
+function fakeDevices({ fail = false, gate = null, oneCamera = false, endsOtherCamera = false, broken = {} } = {}) {
   const calls = [];
   const made = [];
   const nav = {
@@ -27,6 +35,7 @@ function fakeDevices({ fail = false, gate = null, oneCamera = false, broken = {}
         if (fail) throw err('NotAllowedError');
         for (const kind of ['audio', 'video']) if (broken[requested(c[kind])]) throw err(broken[requested(c[kind])]);
         if (c.video && oneCamera && made.some((t) => t.kind === 'video' && !t.stopped)) throw err('NotReadableError');
+        if (c.video && endsOtherCamera) for (const t of made) if (t.kind === 'video' && !t.stopped) t.end();
         const tracks = [];
         if (c.audio) tracks.push(fakeTrack('audio', requested(c.audio)));
         if (c.video) tracks.push(fakeTrack('video', requested(c.video)));
@@ -149,6 +158,19 @@ test('switching cameras stops the current one first, so it works where only one 
   assert.deepEqual(live(made, 'video'), [m.videoTrack]);
   assert.equal(m.currentDeviceId('video'), 'back');
   assert.deepEqual(seen, ['video']); // one change, with the new track: no "camera off" in between
+});
+
+test('switching cameras in Safari on iOS, where opening a camera ends the running one', async () => {
+  const { made } = fakeDevices({ endsOtherCamera: true });
+  const m = new LocalMedia({ mic: false, cam: true, videoDevice: 'front' });
+  await m.init();
+  const seen = [];
+  m.addEventListener('change', (e) => seen.push(e.detail.kind));
+  assert.equal(await m.setDevice('video', 'back'), true);
+  assert.equal(m.camOn, true);
+  assert.equal(m.videoTrack?.deviceId, 'back');
+  assert.deepEqual(live(made, 'video'), [m.videoTrack]);
+  assert.deepEqual(seen, ['video']);
 });
 
 test('a camera that cannot be opened: the previous one comes back, and setDevice says so', async () => {
