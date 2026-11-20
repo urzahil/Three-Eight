@@ -832,7 +832,9 @@ test('a fetcher that cannot get the piece from the sharer right now says busy: t
   fb.swarm.activate();
   fc.swarm.activate();
   await sleep(40);
-  b.swarm._markBad('s'); // b skips the sharer for a while (it was too slow for b once)
+  // b gave up on the sharer for a while: it failed b soleTries times in a row (after a single failure b would still
+  // ask it, as the only copy)
+  for (let i = 0; i < b.swarm.soleTries; i++) b.swarm._markBad('s');
   // streamers [b, c]: piece 0 is b's. b cannot fetch it now, so it answers busy, and c fetches it from the sharer.
   assert((await read(fc, 0, P)).equals(data.subarray(0, P)));
   assert.deepEqual(c.mesh.out(T.WANT).map((x) => x.to), ['b', 's']);
@@ -1037,6 +1039,73 @@ test('a friend that sends my pieces one after another is not skipped because the
   assert.equal(me.swarm.stats.skipped, 0, 'the holder was not skipped: piece 1 started more than 60 ms after its want, but right after piece 0');
   assert.equal(me.mesh.out(T.CANCEL).length, 0);
   assert.equal(me.mesh.out(T.WANT).length, 2);
+  net.closeAll();
+});
+
+test('the only holder of a film without a server is still asked after it was too slow once', async () => {
+  const net = new Net();
+  const data = makeData(4 * P);
+  const me = net.node('me');
+  const h = net.node('h');
+  net.connect('me', 'h');
+  h.swarm.openLocal(new Blob([data]));
+  await sleep(20);
+  // the sharer's first piece is slow: its want is lost, so it times out (a slow uplink, a busy machine)
+  const orig = net.film.bind(net);
+  let lost = 0;
+  net.film = (from, to, buf) => {
+    if (from === 'me' && decodeFrame(buf)?.type === T.WANT && lost++ === 0) return;
+    orig(from, to, buf);
+  };
+  const rf = peerFile(me.swarm, data, { retries: 1, backoff: 1 });
+  rf.swarm.activate();
+  assert((await read(rf, 0, 4 * P)).equals(data), 'the whole film arrives (the timed-out piece on RemoteFile\'s retry)');
+  assert.equal(me.swarm.stats.skipped, 1, 'one timeout');
+  assert(me.swarm.bad.get('h') > me.swarm.now(), 'h is still marked bad ...');
+  assert.equal(me.mesh.out(T.WANT).filter((x) => x.to === 'h').length, 5, '... but asked again: it is the only copy');
+  net.closeAll();
+});
+
+test('a frozen only holder: the message comes after about two timeouts, not one per queued piece', async () => {
+  const net = new Net();
+  const data = makeData(8 * P);
+  const me = net.node('me', { firstByteMs: 80 });
+  const h = net.node('h');
+  net.connect('me', 'h');
+  h.swarm.openLocal(new Blob([data]));
+  await sleep(20);
+  net.silent.add('h'); // connected, but never answers
+  const rf = peerFile(me.swarm, data, { retries: 3, backoff: 1 });
+  rf.swarm.activate();
+  const t0 = Date.now();
+  await assert.rejects(read(rf, 0, 8 * P), /Could not get this part/);
+  const took = Date.now() - t0;
+  // RemoteFile retries the read; every attempt asks the holder again until it has failed soleTries times in a row
+  assert(took >= 160 && took < 400, `two timeouts (2 x 80 ms) in all: ${took} ms`);
+  const wants = me.mesh.out(T.WANT).length;
+  assert(wants <= 2 * me.swarm.maxWantsPerPeer, `at most two rounds of wants (its slots): ${wants}`);
+  assert(me.swarm.fails.get('h') >= me.swarm.soleTries);
+  const t1 = Date.now();
+  await assert.rejects(read(rf, 0, P), /Could not get this part/);
+  assert(Date.now() - t1 < 40, 'the next read fails at once');
+  assert.equal(me.mesh.out(T.WANT).length, wants, 'without asking it again');
+  net.closeAll();
+});
+
+test('the only holder denied as unavailable (it stopped sharing): not asked again as the last resort', async () => {
+  const net = new Net();
+  const data = makeData(2 * P);
+  const me = net.node('me');
+  const h = net.node('h');
+  net.connect('me', 'h');
+  h.swarm.openLocal(new Blob([data]));
+  await sleep(20);
+  h.swarm.share = false; // its advertisement has not reached us yet
+  const rf = peerFile(me.swarm, data);
+  rf.swarm.activate();
+  await assert.rejects(read(rf, 0, P), /Could not get this part/);
+  await assert.rejects(read(rf, P, 2 * P), /Could not get this part/);
+  assert.equal(me.mesh.out(T.WANT).length, 1, 'asked once');
   net.closeAll();
 });
 

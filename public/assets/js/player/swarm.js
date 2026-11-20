@@ -68,6 +68,13 @@
 //      the origin directly: the next local holder, or the server for a Drive film. A film that only exists
 //      on friends' devices fails with a message when no holder answers (RemoteFile retries). Streamers keep
 //      relaying what they have cached when the holders are gone.
+//      Exception: when every connected holder of a film without a server is skipped, they are the only copies,
+//      so they are still asked (as the origin, by me and when I relay) instead of failing at once: one slow
+//      piece from the sharer must not make the player fail for `badMs` while the sharer is still serving. A
+//      holder is left out of this only after `soleTries` failures in a row (no piece from it in between), or
+//      after it denied us as "unavailable" (it stopped sharing). A frozen sole holder therefore costs about two
+//      timeouts before the message (two wants at a time, `maxWantsPerPeer`), not one per queued piece. A holder
+//      that leaves (peer-removed, film-close) is no longer in `have`, so that still fails at once.
 //   4. reads of a few blocks (embedded subtitles) go straight to the server (Drive films).
 
 import { RemoteFile, RemoteError } from './remotefile.js';
@@ -396,6 +403,7 @@ export class Swarm extends EventTarget {
     this.firstByteMs = o.firstByteMs ?? 4000; // no first byte by then: the peer is skipped
     this.minRate = o.minRate ?? 256 * 1024; // bytes/s: a piece must arrive within firstByteMs + size / minRate
     this.badMs = o.badMs ?? 30000; // how long a peer that failed us is left alone
+    this.soleTries = o.soleTries ?? 3; // failures in a row after which even the only holders of a film are left alone
     this.maxServing = o.maxServing ?? 8; // pieces sent to friends at once (memory: about 2 MiB each)
     this.maxPerPeer = o.maxPerPeer ?? 3; // ... and for one friend
     this.maxWantsPerPeer = o.maxWantsPerPeer ?? 2; // pieces I ask one friend for at once
@@ -404,6 +412,7 @@ export class Swarm extends EventTarget {
     this.share = o.share !== false; // send pieces of a file on this device
     this.have = new Map(); // peerId -> parsed film-have
     this.bad = new Map(); // peerId -> time until which we don't ask it
+    this.fails = new Map(); // peerId -> failed requests in a row (while bad; a piece from it resets it)
     this.film = null;
     this.reqSeq = 0;
     this.cueTimeoutMs = o.cueTimeoutMs ?? 5000;
@@ -434,6 +443,7 @@ export class Swarm extends EventTarget {
       this._on(mesh, 'peer-removed', (e) => {
         this.have.delete(e.detail.peer.id);
         this.bad.delete(e.detail.peer.id);
+        this.fails.delete(e.detail.peer.id);
         this._peerGone(e.detail.peer.id);
         this._emit('change');
       }),
@@ -732,9 +742,29 @@ export class Swarm extends EventTarget {
   }
 
   // ---- bad peers -------------------------------------------------------------------------------------------------------
-  _markBad(id) {
+  /** Skip peer `id` for `badMs`. `hard`: it said it can't serve this film at all, so don't ask it even as the last resort. */
+  _markBad(id, hard = false) {
     this.stats.skipped++;
-    this.bad.set(id, this.now() + this.badMs);
+    const now = this.now();
+    const before = this.bad.get(id) > now ? this.fails.get(id) || 0 : 0; // a skip that expired starts again
+    this.fails.set(id, hard ? Infinity : before + 1);
+    this.bad.set(id, now + this.badMs);
+  }
+
+  /**
+   * The holders to ask although I skip them: when the film has no server and I skip every connected holder,
+   * they are the only copies, so the ones that have not failed `soleTries` times in a row are asked all the same.
+   */
+  _lastResort(film, holders = this._holders(film)) {
+    if (film.server || !holders.length) return [];
+    const now = this.now();
+    if (holders.some((id) => !(this.bad.get(id) > now))) return [];
+    return holders.filter((id) => (this.fails.get(id) || 0) < this.soleTries);
+  }
+
+  /** Whether peer `id` may be asked for a piece of `film` now: not skipped, or one of its last-resort holders. */
+  _askable(film, id) {
+    return !(this.bad.get(id) > this.now()) || this._lastResort(film).includes(id);
   }
 
   _peerGone(id) {
@@ -745,10 +775,15 @@ export class Swarm extends EventTarget {
   }
 
   // ---- choosing where to get a piece ---------------------------------------------------------------------------------
-  /** Peers that hold the whole film, usable now, sorted by id and rotated so that locals[0] is `p mod count`. */
+  /**
+   * Peers that hold the whole film, usable now, sorted by id and rotated so that locals[0] is `p mod count`.
+   * When I skip all of them and the film has no server: the last-resort holders (see _lastResort).
+   */
   _locals(film, p) {
     const now = this.now();
-    const ids = this._holders(film).filter((id) => !(this.bad.get(id) > now));
+    const holders = this._holders(film);
+    let ids = holders.filter((id) => !(this.bad.get(id) > now));
+    if (!ids.length) ids = this._lastResort(film, holders);
     return ids.map((_, i) => ids[(p + i) % ids.length]);
   }
 
@@ -944,7 +979,7 @@ export class Swarm extends EventTarget {
     // Waiting for a slot can take a while: the peer may have failed other pieces (or left) meanwhile, and then
     // every piece queued behind it must not pay the timeout again.
     // It may also have switched to another movie: its pieces would be another film's bytes (there are no piece hashes).
-    if (!h || !film.keys.has(h.key) || !this._usable(id) || this.bad.get(id) > this.now() || film.closed) {
+    if (!h || !film.keys.has(h.key) || !this._usable(id) || !this._askable(film, id) || film.closed) {
       this._unslot(film, id);
       return null;
     }
@@ -955,7 +990,7 @@ export class Swarm extends EventTarget {
       // A streamer answers after fetching from the origin itself: allow the extra hop.
       const hop = h.local ? 1 : 2;
       const acq = { req, peerId: id, p, keyId: kid, buf: new Uint8Array(len), got: 0, hop, first: 0, stall: 0, total: 0, finish: null };
-      acq.finish = (data, silent) => {
+      acq.finish = (data, silent, hard) => {
         if (film.acqs.get(req) !== acq) return;
         film.acqs.delete(req);
         clearTimeout(acq.first);
@@ -963,8 +998,9 @@ export class Swarm extends EventTarget {
         clearTimeout(acq.total);
         sig.removeEventListener('abort', onAbort);
         this._unslot(film, id);
-        if (!data) {
-          if (!silent && !sig.aborted) this._markBad(id);
+        if (data) this.fails.delete(id);
+        else {
+          if (!silent && !sig.aborted) this._markBad(id, hard);
           if (this._usable(id)) this.mesh.sendFilm(id, encodeFrame({ type: T.CANCEL, req, key: kid, piece: p }), `c${req}`, URGENT);
         }
         resolve(data);
@@ -1011,7 +1047,7 @@ export class Swarm extends EventTarget {
         const acq = film.acqs.get(f.req);
         if (!acq || acq.peerId !== peer.id || acq.p !== f.piece) return;
         if (f.flags === DENIED.BUSY) acq.finish(null, true);
-        else acq.finish(null);
+        else acq.finish(null, false, true); // it can't serve this film (stopped sharing): not even as the last resort
         return;
       }
       default:
