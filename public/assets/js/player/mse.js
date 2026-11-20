@@ -67,6 +67,7 @@ export class Feeder {
     this.ahead = AHEAD;
     this.lastEnd = -1; // element time of the end of the last appended fragment
     this.updateTimeoutMs = UPDATE_TIMEOUT_MS;
+    this._skippedTo = -1; // element time of the merged range end we last continued from (_skipMerged)
   }
 
   /**
@@ -105,10 +106,14 @@ export class Feeder {
         return true;
       } catch (err) {
         if (err.name !== 'QuotaExceededError' || attempt > 20) throw err;
-        // Buffer full: drop what's behind the playhead and keep less ahead.
+        // Buffer full: drop what's behind the playhead and keep less ahead. Also drop what lies beyond what we
+        // are filling: ranges left far ahead by earlier seeks (seek forward, then back) would otherwise fill the
+        // quota for good, and every retry would free nothing.
         this.ahead = Math.max(10, this.ahead * 0.7);
         const t = this.engine.video.currentTime;
         await this._remove(0, Math.max(0, t - 3));
+        const keep = Math.max(t + this.ahead, this.lastEnd) + 1;
+        if (keep < this.engine.ms.duration) await this._remove(keep, Infinity);
         await sleep(500);
       }
     }
@@ -133,13 +138,36 @@ export class Feeder {
     return 0;
   }
 
-  /** Is element-time t inside the range we are currently extending? */
+  /**
+   * Is element-time t inside the range we are currently extending? That range may have grown past our last
+   * append by merging with data appended earlier (see _skipMerged): it is still ours if it holds that append.
+   */
   continuousAt(t) {
     const b = this.sb.buffered;
     for (let i = 0; i < b.length; i++) {
-      if (b.start(i) - GAP <= t && b.end(i) >= t) return Math.abs(b.end(i) - this.lastEnd) < 1.5 || this.eos;
+      if (b.start(i) - GAP <= t && b.end(i) >= t) return this.eos || (this.lastEnd >= b.start(i) - GAP && this.lastEnd <= b.end(i) + 1.5);
     }
     return false;
+  }
+
+  /**
+   * The range we are extending reached data appended earlier (after a seek back) and the browser merged them:
+   * the cursor is still at our last append, but everything up to the merged range's end is already there.
+   * Continue from that end, rather than demux (and download) again what is buffered.
+   */
+  _skipMerged() {
+    if (this.lastEnd < 0 || this.eos || !this.cursor) return;
+    const b = this.sb.buffered;
+    for (let i = 0; i < b.length; i++) {
+      if (this.lastEnd < b.start(i) - GAP || this.lastEnd > b.end(i) + GAP) continue;
+      // Once per end: the cursor restarts at the keyframe before it, and the first fragments from there may still
+      // end before it; jumping again would restart at the same keyframe forever.
+      if (b.end(i) > this.lastEnd + 1.5 && Math.abs(b.end(i) - this._skippedTo) > 0.5) {
+        this._skippedTo = b.end(i);
+        this.reposition(b.end(i) - SHIFT);
+      }
+      return;
+    }
   }
 
   reposition(movieTime) {
@@ -178,6 +206,7 @@ export class Feeder {
   async run() {
     const engine = this.engine;
     while (!engine.destroyed) {
+      this._skipMerged();
       const gen = this.gen;
       const t = engine.video.currentTime;
       if (!this.cursor || this.eos || this.failed || this.bufferedAhead(t) > this.ahead) {

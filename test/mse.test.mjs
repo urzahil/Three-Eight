@@ -127,3 +127,72 @@ test('setAudioTrack: a switch on a broken buffer answers false, so the player re
     console.warn = warn;
   }
 });
+
+// ---- buffered ranges: eviction ahead, merged ranges ----------------------------------------------------
+
+/** A TimeRanges stand-in. */
+const ranges = (...rs) => ({ length: rs.length, start: (i) => rs[i][0], end: (i) => rs[i][1] });
+
+function rangeFeeder(buffered, { currentTime = 0, duration = 1000 } = {}) {
+  const sb = fakeSourceBuffer();
+  sb.buffered = buffered;
+  sb.removed = [];
+  sb.remove = (a, b) => {
+    sb.removed.push([a, b]);
+    sb.updating = true;
+    setTimeout(() => { sb.updating = false; sb.dispatchEvent(new Event('updateend')); }, 0);
+  };
+  const seeks = [];
+  const engine = {
+    destroyed: false,
+    ms: { readyState: 'open', duration },
+    video: { currentTime },
+    demux: { createCursor: () => ({ seek: (t) => seeks.push(t) }) },
+    wake() {},
+  };
+  const f = new Feeder(engine, { id: 1, type: 'video' });
+  f.sb = sb;
+  f.updateTimeoutMs = 1000;
+  return { f, sb, seeks, engine };
+}
+
+test('QuotaExceededError: ranges far ahead of the playhead are freed too, not only what is behind it', async () => {
+  // Watched near the start after seeking around: [10, 30] being filled, [600, 640] and [900, 940] left by earlier seeks.
+  const { f, sb } = rangeFeeder(ranges([10, 30], [600, 640], [900, 940]), { currentTime: 12 });
+  f.lastEnd = 30;
+  let calls = 0;
+  sb.appendBuffer = () => {
+    if (++calls === 1) throw Object.assign(new Error('full'), { name: 'QuotaExceededError' });
+    sb.updating = true;
+    setTimeout(() => { sb.updating = false; sb.dispatchEvent(new Event('updateend')); }, 0);
+  };
+  assert.equal(await f._append(new Uint8Array(4), f.gen), true);
+  const ahead = sb.removed.find(([a, b]) => b === Infinity);
+  assert.ok(ahead, `removed ${JSON.stringify(sb.removed)}`);
+  assert.ok(ahead[0] > 30 && ahead[0] < 600, 'keeps what is being filled, frees the far ranges');
+});
+
+test('a range that merged with older data: the feeder continues from its end, once', () => {
+  // We appended up to 30; the browser merged [10, 30] with [30, 80] appended before a seek back.
+  const { f, seeks } = rangeFeeder(ranges([10, 80]), { currentTime: 25 });
+  f.cursor = {};
+  f.lastEnd = 30;
+  assert.equal(f.continuousAt(50), true, 'a small seek inside the merged range needs no reposition');
+  f._skipMerged();
+  assert.deepEqual(seeks, [80 - 10], 'cursor moved to the merged end (movie time = element time - SHIFT)');
+  // The first fragment from the keyframe before 80 ends at 76: no second jump to the same place.
+  f.lastEnd = 76;
+  f._skipMerged();
+  assert.deepEqual(seeks, [70]);
+  // Our own appends extending the range do not count as a merge.
+  f.lastEnd = 80;
+  f._skipMerged();
+  assert.deepEqual(seeks, [70]);
+});
+
+test('a separate range elsewhere is not continuous with ours', () => {
+  const { f } = rangeFeeder(ranges([10, 30], [600, 640]), { currentTime: 25 });
+  f.lastEnd = 30;
+  assert.equal(f.continuousAt(20), true);
+  assert.equal(f.continuousAt(610), false);
+});
