@@ -224,14 +224,12 @@ export class Movie {
       file.close?.();
       return;
     }
+    // A file of another name is asked about now; one with the same name (often a re-encode of the same film)
+    // once its duration is known, below.
+    let asked = false;
     if (s.movie && !sameMovie(quick, s.movie) && file.name !== s.movie.name) {
-      $('mismatch-text').textContent = `Everyone else is watching “${s.movie.name}” (${fmtSize(s.movie.size)}), but you picked “${file.name}” (${fmtSize(file.size)}).`;
-      const choice = await new Promise((resolve) => {
-        const d = $('mismatch-dialog');
-        d.addEventListener('close', () => resolve(d.returnValue), { once: true });
-        d.returnValue = 'cancel';
-        d.showModal();
-      });
+      asked = true;
+      const choice = await this._askMismatch(`Everyone else is watching “${s.movie.name}” (${fmtSize(s.movie.size)}), but you picked “${file.name}” (${fmtSize(file.size)}).`);
       if (choice === 'cancel') {
         file.close?.(); // a streamed file stops sharing
         return;
@@ -278,11 +276,36 @@ export class Movie {
       if (this.player.file !== file) return; // another file was picked meanwhile
       if (fp) info.fp = fp;
     } else if (file.swarm?.fp) info.fp = file.swarm.fp;
+    const room = this.sync.state.movie;
+    if (!asRoom && !asked && room && !sameMovie(info, room)) {
+      // Same name, but the length (or the content) says it is another film: ask, rather than quietly playing it
+      // for us alone.
+      const len = (m) => (m.duration ? `, ${fmtTime(m.duration)}` : '');
+      const choice = await this._askMismatch(`Everyone else is watching “${room.name}” (${fmtSize(room.size)}${len(room)}). Your “${file.name}” has the same name but is a different file (${fmtSize(file.size)}${len(info)}).`);
+      if (this.player.file !== file) return; // another file was picked meanwhile
+      if (choice === 'cancel') {
+        this.player.unload();
+        this._renderStage();
+        return;
+      }
+      asRoom = choice === 'room';
+    }
     this.sync.setLocalFile(info, asRoom);
     if (asRoom && file.drive?.folder) this._autoDriveSubtitle(file); // in the background: never holds up playback
     if (asRoom) this.mesh.broadcast({ type: 'chat', msg: { id: randomId(), from: this.id, name: this.name, text: `🎬 Started a movie: ${file.name}`, ts: this.signaling.now() } });
     this._renderStage();
     this._renderMenus();
+  }
+
+  /** Show the "different file" dialog; resolves 'mine', 'room' or 'cancel'. */
+  _askMismatch(text) {
+    $('mismatch-text').textContent = text;
+    return new Promise((resolve) => {
+      const d = $('mismatch-dialog');
+      d.addEventListener('close', () => resolve(d.returnValue), { once: true });
+      d.returnValue = 'cancel';
+      d.showModal();
+    });
   }
 
   _renderStage() {
