@@ -151,8 +151,12 @@ async function startLobby(room) {
       sel.value = media.currentDeviceId(kind);
     }
   };
-  $('lobby-audio-dev').onchange = (e) => media.setDevice('audio', e.target.value);
-  $('lobby-video-dev').onchange = (e) => media.setDevice('video', e.target.value);
+  const changeDevice = async (kind, deviceId) => {
+    if (!(await media.setDevice(kind, deviceId))) toast(`Could not start that ${kind === 'audio' ? 'microphone' : 'camera'}.`, 'warn');
+    fillDevices(); // shows the device actually in use
+  };
+  $('lobby-audio-dev').onchange = (e) => changeDevice('audio', e.target.value);
+  $('lobby-video-dev').onchange = (e) => changeDevice('video', e.target.value);
   $('lobby-mic').onclick = () => media.setMic(!media.micOn);
   $('lobby-cam').onclick = async () => {
     const ok = await media.setCam(!media.camOn);

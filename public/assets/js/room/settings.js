@@ -1,7 +1,7 @@
 // The settings dialog and the preferences it controls.
 // Methods of the Room (installed on its prototype by app.js); `this` is the Room.
 
-import { $, store, setIcon } from './util.js';
+import { $, store, setIcon, toast } from './util.js';
 
 export class Settings {
   _updateSeekTitles() {
@@ -78,8 +78,9 @@ export class Settings {
   }
 
   async _changeDevice(kind, deviceId) {
-    await this.media.setDevice(kind, deviceId);
-    store.set('media', { ...store.get('media', {}), [kind === 'audio' ? 'audioDevice' : 'videoDevice']: deviceId });
+    if (!(await this.media.setDevice(kind, deviceId))) toast(`Could not start that ${kind === 'audio' ? 'microphone' : 'camera'}.`, 'warn');
+    $(`set-${kind}-dev`).value = this.media.currentDeviceId(kind); // the device actually in use
+    store.set('media', { ...store.get('media', {}), [kind === 'audio' ? 'audioDevice' : 'videoDevice']: this.media.deviceIds[kind] });
   }
 
   async openSettings() {
