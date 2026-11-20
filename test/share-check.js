@@ -348,14 +348,31 @@ async function startServer() {
         await seekAll(20);
         t = await settle(ps, 20.5);
         assert(t.every((x) => !x.paused && x.time > 20.5), 'cached part keeps playing without Alice: ' + JSON.stringify(t.map((x) => x.time)));
-        // a part that nobody fetched: not hanging; a message, and the page still answers
-        await seekAll(75);
+        // a part that nobody fetched: not hanging; a message, and the page still answers. That part lies between where
+        // the play from the start stopped reading ahead and 100 s, so where it is depends on the machine's speed: take
+        // the middle of the longest stretch of cue points (after 35 s: 30 s must stay cached, below) whose cluster no
+        // streamer has.
+        const have = new Set();
+        for (const c of await Promise.all(ps.map((p) => p.evaluate(() => room.player.file.cachedPieces(1048576))))) for (const [f0, l0] of c) for (let k = f0; k <= l0; k++) have.add(k);
+        const gap = await ps[0].evaluate((have) => {
+          const d = room.player.demux;
+          let best = [];
+          let run = [];
+          for (const c of d.cues) {
+            const sec = (c.time * d.timecodeScale) / 1e9;
+            if (sec <= 35 || sec >= 100 || have.includes(Math.floor(c.clusterPos / 1048576))) run = [];
+            else if (run.push(sec) > best.length) best = [...run];
+          }
+          return best;
+        }, [...have]);
+        assert(gap.length >= 3, 'some part of the film was fetched by nobody before Alice left: cue points in such a part: ' + JSON.stringify(gap) + ', pieces cached: ' + JSON.stringify([...have].sort((x, y) => x - y)));
+        await seekAll(gap[Math.floor(gap.length / 2)]);
         await waitFor(ps[0], () => [...document.querySelectorAll('.toast')].some((x) => /Could not get this part of the movie|Nobody is sharing/.test(x.textContent)), undefined, 45000);
         assert.strictEqual(await ps[0].evaluate(() => 1 + 1), 2, 'the page is responsive');
         await seekAll(30);
         t = await settle(ps, 30.5);
         assert(t.every((x) => !x.paused), 'and playback resumes in the cached part: ' + JSON.stringify(t.map((x) => x.time)));
-        console.log('Alice left: cached parts kept playing, the missing part failed with a message');
+        console.log(`Alice left: cached parts kept playing, the missing part (${gap[0].toFixed(0)}-${gap[gap.length - 1].toFixed(0)} s, jumped to ${gap[Math.floor(gap.length / 2)].toFixed(0)} s) failed with a message`);
       }
     }
     console.log('SHARE CHECK OK');
