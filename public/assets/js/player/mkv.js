@@ -211,8 +211,10 @@ export class MkvDemuxer {
     this.segStart = segPos + sh.headerLen;
     this.segEnd = sh.size === UNKNOWN ? this.file.size : Math.min(this.file.size, this.segStart + sh.size);
 
-    const seeks = new Map();
-    const seen = new Set();
+    const seeks = new Map(); // element id -> position, from the SeekHead(s)
+    const heads = new Set(); // positions of further SeekHeads that a SeekHead points to
+    const seen = new Set(); // ids of the elements parsed
+    const readAt = new Set(); // positions read, so that no element is read twice (or in a circle)
     let pos = this.segStart;
     // Walk top-level elements until the first cluster.
     for (let guard = 0; guard < 64 && pos < this.segEnd; guard++) {
@@ -226,24 +228,13 @@ export class MkvDemuxer {
       if (h.size === UNKNOWN) break;
       if (h.id === ID.SeekHead || h.id === ID.Info || h.id === ID.Tracks || h.id === ID.Cues) {
         const el = await this._readElement(pos);
-        this._handleTop(el, seeks);
-        seen.add(h.id);
+        this._handleTop(el, seeks, heads);
+        if (h.id !== ID.SeekHead) seen.add(h.id);
+        readAt.add(pos);
       }
       pos += h.headerLen + h.size;
     }
-    // Elements referenced by the SeekHead that come after the clusters (typically Cues).
-    for (const id of [ID.Info, ID.Tracks, ID.Cues, ID.SeekHead]) {
-      if (seen.has(id) || !seeks.has(id)) continue;
-      const el = await this._readElement(seeks.get(id));
-      if (el && el.id === id) {
-        seen.add(id);
-        this._handleTop(el, seeks);
-        if (id === ID.SeekHead && !seen.has(ID.Cues) && seeks.has(ID.Cues)) {
-          const cues = await this._readElement(seeks.get(ID.Cues));
-          if (cues && cues.id === ID.Cues) this._handleTop(cues, seeks);
-        }
-      }
-    }
+    await this._followSeeks(seeks, heads, seen, readAt);
     if (!this.tracks.length) throw new Error('No tracks found');
     if (this.firstCluster == null) this.firstCluster = pos;
     this.timescale = 1e9 / this.timecodeScale;
@@ -274,7 +265,39 @@ export class MkvDemuxer {
     }
   }
 
-  _handleTop(el, seeks) {
+  /**
+   * Read the elements the SeekHeads point to that the walk before the first cluster did not reach (typically
+   * Cues at the end of the file). A SeekHead may point to another SeekHead (often at the end, listing the Cues):
+   * those are followed too. Bounded, and never the same position twice, so a damaged file cannot loop.
+   */
+  async _followSeeks(seeks, heads, seen, readAt) {
+    for (let round = 0; round < 8 && readAt.size < 32; round++) {
+      let progressed = false;
+      for (const id of [ID.Info, ID.Tracks, ID.Cues]) {
+        const at = seeks.get(id);
+        if (seen.has(id) || at == null || readAt.has(at)) continue;
+        readAt.add(at);
+        const el = await this._readElement(at);
+        if (el && el.id === id) {
+          seen.add(id);
+          this._handleTop(el, seeks, heads);
+          progressed = true;
+        }
+      }
+      for (const at of [...heads]) {
+        if (readAt.has(at)) continue;
+        readAt.add(at);
+        const el = await this._readElement(at);
+        if (el && el.id === ID.SeekHead) {
+          this._handleTop(el, seeks, heads);
+          progressed = true;
+        }
+      }
+      if (!progressed) return;
+    }
+  }
+
+  _handleTop(el, seeks, heads = null) {
     if (!el || !el.data) return;
     const b = el.data;
     if (el.id === ID.SeekHead) {
@@ -285,7 +308,9 @@ export class MkvDemuxer {
           if (c.id === ID.SeekID) sid = readUint(b, c.start, c.size);
           else if (c.id === ID.SeekPosition) spos = readUint(b, c.start, c.size);
         }
-        if (sid && spos >= 0 && !seeks.has(sid)) seeks.set(sid, this.segStart + spos);
+        if (!sid || spos < 0) continue;
+        if (sid === ID.SeekHead) heads?.add(this.segStart + spos);
+        else if (!seeks.has(sid)) seeks.set(sid, this.segStart + spos);
       }
     } else if (el.id === ID.Info) {
       let dur = 0;

@@ -240,3 +240,31 @@ test('dOpsFromOpusHead: a channel mapping table cut short is rejected', () => {
   full.set(head);
   assert.strictEqual(dOpsFromOpusHead(full, 6).channels, 6);
 });
+
+test('MKV: a SeekHead that points to a second SeekHead (which lists the Cues) is followed', async () => {
+  const { MkvDemuxer } = await import('../public/assets/js/player/mkv.js');
+  const el = (id, body) => [...id, 0x80 | body.length, ...body];
+  const u32 = (n) => [(n >>> 24) & 0xff, (n >> 16) & 0xff, (n >> 8) & 0xff, n & 0xff];
+  const SEEKHEAD = 0x114d9b74, CUES = 0x1c53bb6b;
+  const seek = (id, pos) => el([0x4d, 0xbb], [...el([0x53, 0xab], u32(id)), ...el([0x53, 0xac], u32(pos))]);
+  const seekHead = (...entries) => ({ id: SEEKHEAD, data: new Uint8Array(entries.flat()) });
+  const elements = new Map([
+    [5000, seekHead(seek(CUES, 9000), seek(SEEKHEAD, 100))], // the second one lists the Cues and itself again (a loop)
+    [9000, { id: CUES, data: new Uint8Array(0) }],
+  ]);
+  const d = Object.create(MkvDemuxer.prototype);
+  d.segStart = 0;
+  const reads = [];
+  d._readElement = async (pos) => { reads.push(pos); return elements.get(pos) ?? null; };
+  const handled = [];
+  const real = d._handleTop;
+  d._handleTop = function (e, ...rest) { handled.push(e.id); return real.call(this, e, ...rest); };
+  // The walk before the first cluster read the first SeekHead (at 100), which points only to the second one.
+  const seeks = new Map();
+  const heads = new Set();
+  d._handleTop(seekHead(seek(SEEKHEAD, 5000)), seeks, heads);
+  handled.length = 0;
+  await d._followSeeks(seeks, heads, new Set(), new Set([100]));
+  assert.deepStrictEqual(reads, [5000, 9000], 'the second SeekHead, then the Cues it lists; nothing twice');
+  assert.deepStrictEqual(handled, [SEEKHEAD, CUES]);
+});
