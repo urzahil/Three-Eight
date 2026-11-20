@@ -41,8 +41,11 @@
 //     DATA   (2)  holder -> receiver: bytes [offset, offset + payload.length) of the piece, in order.
 //                 payload is 1..MAX_PAYLOAD bytes, so a whole message is at most 64 KiB.
 //     DENY   (3)  holder -> receiver: cannot send it (flags: 1 busy, 2 unavailable). Receiver moves on.
+//                 Busy (at its limits, or a streamer that could not get the piece from the origin just now) does
+//                 not count against the holder; unavailable does.
 //     CANCEL (4)  receiver -> holder: stop, I don't need it any more (or gave up).
 //     keyId is a 32-bit FNV-1a hash of the key; frames for another film are dropped or denied.
+//     WANT, DENY and CANCEL go out ahead of the DATA already queued for that peer (mesh.js `urgent`).
 //
 // WHO FETCHES WHAT (per piece p, for a viewer that does not have the film as a file)
 //   The film's ORIGIN is the set of peers that advertise `local` for it (their copy of the file), or, for a
@@ -56,8 +59,12 @@
 //      the origin, so chains are one hop and cannot loop. Everyone sorts the same list, so a region that
 //      everybody jumps to at the same time is fetched from the origin about once.
 //   3. a peer that doesn't start answering in `firstByteMs` (twice that for a relay, which fetches first),
-//      stalls, is too slow, denies us or leaves is skipped for a while (`badMs`) and the plan is made again
-//      without it (the next fetcher, the same one the other viewers pick). After two failed friends we go to
+//      stalls, is too slow, denies us or leaves is skipped for a while (`badMs`) and the plan is made again.
+//      The deadlines of a want start again whenever that peer sends me bytes of another piece: it sends my
+//      pieces one after another, so a second piece waiting behind the first is not a silent peer. The
+//      assignment of step 2 is still made over every connected streamer, skipped ones too, so skipping one
+//      moves only its own pieces: to `others[floor(p / N) mod count]` (me and the streamers I do not skip),
+//      the same choice the other viewers make when they skip it too. After two failed friends we go to
 //      the origin directly: the next local holder, or the server for a Drive film. A film that only exists
 //      on friends' devices fails with a message when no holder answers (RemoteFile retries). Streamers keep
 //      relaying what they have cached when the holders are gone.
@@ -81,6 +88,9 @@ const noop = () => {};
 export const MAX_CUES = 20000;
 export const MAX_CUE_TEXT = 8 * MiB;
 const TRACK_RE = /^e[0-9]{1,6}$/;
+// WANT, DENY and CANCEL are sent ahead of the pieces queued for that friend (mesh.js): a request that waited behind
+// megabytes of pieces going the same way would eat into the time the friend has to answer it.
+const URGENT = { urgent: true };
 
 // ---- pure helpers --------------------------------------------------------------------------------------
 
@@ -400,7 +410,8 @@ export class Swarm extends EventTarget {
     this.cueReqs = new Map(); // `${peerId}|${track}` -> pending request
     this.cueFetches = new Map(); // track -> shared promise
     this.subSrc = null;
-    this.stats = { server: 0, peers: 0, served: 0, dropped: 0, fallbacks: 0 }; // bytes (dropped, fallbacks: counts)
+    // bytes; dropped, fallbacks (went to the origin after a friend failed) and skipped (a friend marked bad): counts
+    this.stats = { server: 0, peers: 0, served: 0, dropped: 0, fallbacks: 0, skipped: 0 };
     this._lastSent = '';
     this._lastAt = 0;
     this._timer = 0;
@@ -722,6 +733,7 @@ export class Swarm extends EventTarget {
 
   // ---- bad peers -------------------------------------------------------------------------------------------------------
   _markBad(id) {
+    this.stats.skipped++;
     this.bad.set(id, this.now() + this.badMs);
   }
 
@@ -736,11 +748,13 @@ export class Swarm extends EventTarget {
   /** Peers that hold the whole film, usable now, sorted by id and rotated so that locals[0] is `p mod count`. */
   _locals(film, p) {
     const now = this.now();
-    const ids = [...this.have]
-      .filter(([id, h]) => h.local && film.keys.has(h.key) && this._usable(id) && !(this.bad.get(id) > now))
-      .map(([id]) => id)
-      .sort();
+    const ids = this._holders(film).filter((id) => !(this.bad.get(id) > now));
     return ids.map((_, i) => ids[(p + i) % ids.length]);
+  }
+
+  /** Peers that hold the whole film and are connected (also the ones I skip for a while), sorted by id. */
+  _holders(film) {
+    return [...this.have].filter(([id, h]) => h.local && film.keys.has(h.key) && this._usable(id)).map(([id]) => id).sort();
   }
 
   /**
@@ -752,14 +766,22 @@ export class Swarm extends EventTarget {
    */
   _plan(film, p) {
     const now = this.now();
-    const streamers = [...this.have]
-      .filter(([id, h]) => !h.local && film.keys.has(h.key) && this._usable(id) && !(this.bad.get(id) > now))
-      .map(([id]) => id);
+    // Every connected streamer of this film, also the ones I skip for a while (bad): the assignment is made over
+    // all of them, like the other viewers make it, so that skipping a friend moves only that friend's pieces.
+    // (Leaving it out of the list instead would shift `p mod N` for every piece: I would then disagree with the
+    // others about who fetches about two thirds of all pieces, and each of those would come from the origin twice.)
+    const all = [...this.have].filter(([id, h]) => !h.local && film.keys.has(h.key) && this._usable(id)).map(([id]) => id);
+    const streamers = all.filter((id) => !(this.bad.get(id) > now));
     const origin = !!film.server || this._locals(film, p).length > 0;
     const cached = streamers.filter((id) => inRanges(this.have.get(id).ranges, p)).sort();
     if (cached.length) return { peers: [cached[p % cached.length]], origin };
     if (!origin) return { peers: [], origin: false };
-    const fetcher = assignFetcher(p, [this.selfId, ...streamers]);
+    let fetcher = assignFetcher(p, [this.selfId, ...all]);
+    if (fetcher !== this.selfId && this.bad.get(fetcher) > now) {
+      // Its pieces (every N-th) go to the next choice among the others, spread over them by floor(p / N): the one
+      // the other viewers pick when they skip it too.
+      fetcher = assignFetcher(Math.floor(p / (all.length + 1)), [this.selfId, ...streamers]);
+    }
     return { peers: fetcher === this.selfId ? [] : [fetcher], origin };
   }
 
@@ -930,7 +952,9 @@ export class Swarm extends EventTarget {
     do req = ((this.reqSeq = (this.reqSeq + 1) & 0xffff) || 1); while (film.acqs.has(req));
     const kid = keyId(h.key);
     return new Promise((resolve) => {
-      const acq = { req, peerId: id, p, keyId: kid, buf: new Uint8Array(len), got: 0, first: 0, stall: 0, total: 0, finish: null };
+      // A streamer answers after fetching from the origin itself: allow the extra hop.
+      const hop = h.local ? 1 : 2;
+      const acq = { req, peerId: id, p, keyId: kid, buf: new Uint8Array(len), got: 0, hop, first: 0, stall: 0, total: 0, finish: null };
       acq.finish = (data, silent) => {
         if (film.acqs.get(req) !== acq) return;
         film.acqs.delete(req);
@@ -941,19 +965,27 @@ export class Swarm extends EventTarget {
         this._unslot(film, id);
         if (!data) {
           if (!silent && !sig.aborted) this._markBad(id);
-          if (this._usable(id)) this.mesh.sendFilm(id, encodeFrame({ type: T.CANCEL, req, key: kid, piece: p }), `c${req}`);
+          if (this._usable(id)) this.mesh.sendFilm(id, encodeFrame({ type: T.CANCEL, req, key: kid, piece: p }), `c${req}`, URGENT);
         }
         resolve(data);
       };
       const onAbort = () => acq.finish(null, true);
       sig.addEventListener('abort', onAbort, { once: true });
       film.acqs.set(req, acq);
-      // A streamer answers after fetching from the origin itself: allow the extra hop.
-      const hop = h.local ? 1 : 2;
-      acq.first = setTimeout(() => acq.finish(null), this.firstByteMs * hop);
-      acq.total = setTimeout(() => acq.finish(null), hop * (this.firstByteMs + (len / this.minRate) * 1000));
-      if (!this.mesh.sendFilm(id, encodeFrame({ type: T.WANT, req, key: kid, piece: p }), `w${req}`)) acq.finish(null);
+      this._arm(acq);
+      if (!this.mesh.sendFilm(id, encodeFrame({ type: T.WANT, req, key: kid, piece: p }), `w${req}`, URGENT)) acq.finish(null);
     });
+  }
+
+  /**
+   * (Re)start the deadlines of a want that has not had a byte yet: its first byte within firstByteMs, the whole
+   * piece within firstByteMs + size / minRate (twice both for a relay).
+   */
+  _arm(acq) {
+    clearTimeout(acq.first);
+    clearTimeout(acq.total);
+    acq.first = setTimeout(() => acq.finish(null), this.firstByteMs * acq.hop);
+    acq.total = setTimeout(() => acq.finish(null), acq.hop * (this.firstByteMs + (acq.buf.length / this.minRate) * 1000));
   }
 
   // ---- incoming film frames -------------------------------------------------------------------------------------------
@@ -997,6 +1029,10 @@ export class Swarm extends EventTarget {
     acq.got += f.payload.length;
     clearTimeout(acq.first);
     clearTimeout(acq.stall);
+    // The friend sends my pieces one after another on one ordered channel: while it sends me this one, the next
+    // ones I asked it for cannot start. Their deadlines count from when it is free for them, so that a friend on a
+    // slow (but working) link is not taken for a silent one because a second piece waited behind the first.
+    for (const other of film.acqs.values()) if (other !== acq && other.peerId === peer.id && other.got === 0) this._arm(other);
     if (acq.got === acq.buf.length) {
       acq.finish(acq.buf);
       return;
@@ -1006,7 +1042,7 @@ export class Swarm extends EventTarget {
 
   // ---- serving ------------------------------------------------------------------------------------------------------------
   _deny(peerId, f, code) {
-    this.mesh.sendFilm(peerId, encodeFrame({ type: T.DENY, req: f.req, key: f.key, piece: f.piece, flags: code }), `d${f.req}`);
+    this.mesh.sendFilm(peerId, encodeFrame({ type: T.DENY, req: f.req, key: f.key, piece: f.piece, flags: code }), `d${f.req}`, URGENT);
   }
 
   _onWant(film, peer, f) {
@@ -1055,7 +1091,13 @@ export class Swarm extends EventTarget {
     }
     if (job.cancelled || film.closed) return;
     const reply = { req: job.req, key: job.key, piece: job.p };
-    if (!data) return this._deny(job.peerId, reply, DENIED.UNAVAILABLE);
+    if (!data) {
+      // A streamer whose film has an origin (a holder, also one I skip for a while, or the server) could not get the
+      // piece from it right now: "busy", so that the friend asks the origin itself instead of skipping me for a while
+      // (which would move my pieces to others, and the origin would send them twice).
+      const fromOrigin = !film.local && (!!film.server || this._holders(film).length > 0);
+      return this._deny(job.peerId, reply, fromOrigin ? DENIED.BUSY : DENIED.UNAVAILABLE);
+    }
     const tag = `j${job.req}`;
     for (let off = 0; off < data.length; off += MAX_PAYLOAD) {
       const payload = data.subarray(off, Math.min(data.length, off + MAX_PAYLOAD));

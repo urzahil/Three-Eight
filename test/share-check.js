@@ -312,18 +312,35 @@ async function startServer() {
       await seekAll(100);
       t = await settle(all, 99.5);
       assert(t.every((x) => x.time > 99.5) && Math.max(...t.map((x) => x.time)) - Math.min(...t.map((x) => x.time)) < 0.5, 'seek in sync: ' + JSON.stringify(t.map((x) => x.time)));
-      await sleep(3000);
+      // Measure when no piece is on its way anywhere. In the middle of transfers, a piece that Alice has sent but a
+      // streamer has not received yet counts as uploaded but not yet as needed, and the slower the machine, the more
+      // of those there are at any moment. With 40 s buffered ahead, the streamers have read to the end of the film
+      // (160 s) soon after the jump to 100 s, and then they stop fetching.
+      const inFlight = (p) => p.evaluate(() => {
+        const f = room.swarm.film;
+        return f ? f.acqs.size + f.jobs.size + f.inflight.size + f.serverInflight.size : 0;
+      });
+      const quietFrom = Date.now();
+      for (let calm = 0; calm < 3; ) {
+        assert(Date.now() - quietFrom < 90000, 'pieces were still in flight 90 s after the jump');
+        calm = (await Promise.all(all.map(inFlight))).every((n) => n === 0) ? calm + 1 : 0;
+        await sleep(300);
+      }
       const st = await Promise.all(ps.map((p) => p.evaluate(() => ({ ...room.swarm.stats, cached: room.player.file.cachedPieces(1048576) }))));
       const needed = new Set();
       for (const x of st) for (const [f0, l0] of x.cached) for (let k = f0; k <= l0; k++) needed.add(k);
       const neededBytes = [...needed].reduce((n, k) => n + Math.min(1048576, bigSize - k * 1048576), 0);
       const streamed = st.reduce((n, x) => n + x.peers, 0);
       const up = await alice.evaluate(() => room.swarm.stats.served);
-      console.log(`MEASURE sharer upload, 3 streamers: Alice uploaded ${(up / 1048576).toFixed(1)} MiB; the streamers needed ${(neededBytes / 1048576).toFixed(1)} MiB of the film (they received ${(streamed / 1048576).toFixed(1)} MiB in all) = ${(up / neededBytes).toFixed(2)} x the needed bytes; per streamer received: ${st.map((x) => (x.peers / 1048576).toFixed(1)).join(' / ')} MiB`);
+      // 1.4: about one copy, plus the pieces that the three of them ask Alice for at the same moment when they start
+      // (before they know of each other), plus a few pieces fetched again after a friend was too slow to relay them.
+      const MAX_UPLOAD = 1.4;
+      const sum = (k) => (st.some((x) => x[k] === undefined) ? 'n/a' : st.reduce((n, x) => n + x[k], 0)); // n/a: an older commit
+      console.log(`MEASURE sharer upload, 3 streamers: Alice uploaded ${(up / 1048576).toFixed(1)} MiB; the streamers needed ${(neededBytes / 1048576).toFixed(1)} MiB of the film (they received ${(streamed / 1048576).toFixed(1)} MiB in all) = ${(up / neededBytes).toFixed(2)} x the needed bytes (limit ${MAX_UPLOAD}); per streamer received: ${st.map((x) => (x.peers / 1048576).toFixed(1)).join(' / ')} MiB; friends skipped after failing a request: ${sum('skipped')}; pieces fetched from Alice because a friend could not relay them: ${sum('fallbacks')}; nothing in flight after ${((Date.now() - quietFrom) / 1000).toFixed(1)} s`);
       if (MEASURE_ONLY) {
         console.log('MEASURE ONLY done');
       } else {
-        assert(up <= 1.4 * neededBytes, `Alice uploaded ${(up / neededBytes).toFixed(2)} x what the streamers needed`);
+        assert(up <= MAX_UPLOAD * neededBytes, `Alice uploaded ${(up / neededBytes).toFixed(2)} x what the streamers needed`);
         assert(st.every((x) => x.server === 0));
         // Alice leaves in the middle of the film: what the others have cached keeps playing, the rest fails with a message
         await A2.ctx.close();

@@ -704,6 +704,36 @@ test('planner: a streamer with the piece cached, else the assigned fetcher, else
   net.closeAll();
 });
 
+test('planner: a streamer I skip loses only its own pieces, to the next choice the others make too', async () => {
+  const net = new Net();
+  const data = makeData(12 * P);
+  const ids = ['a', 'm', 'z'];
+  const nodes = ids.map((id) => net.node(id));
+  net.node('s');
+  net.connect('s', ...ids);
+  const films = nodes.map((n) => {
+    n.swarm.openRemote({ name: 'm.mkv', size: data.length, fp: fpSync(data) }).swarm.activate();
+    n.swarm.have.set('s', { key: keyOf(data), local: true, ranges: [[0, 11]], via: 'file' });
+    for (const id of ids) if (id !== n.id) n.swarm.have.set(id, { key: keyOf(data), local: false, ranges: [], via: 'peers' });
+    return n.swarm.film;
+  });
+  // who fetches piece p from the origin, as viewer i sees it (an empty plan: i itself)
+  const fetcher = (i, p) => nodes[i].swarm._plan(films[i], p).peers[0] || ids[i];
+  const pieces = [...Array(12).keys()];
+  const before = pieces.map((p) => fetcher(1, p));
+  assert.deepEqual(before, pieces.map((p) => ids[p % 3]), 'sorted [a, m, z], piece mod 3');
+  // m skips z (z was too slow for m once); a and z still count on z
+  nodes[1].swarm._markBad('z');
+  const after = pieces.map((p) => fetcher(1, p));
+  for (const p of pieces) if (before[p] !== 'z') assert.equal(after[p], before[p], `piece ${p} keeps its fetcher`);
+  assert.deepEqual(pieces.filter((p) => before[p] === 'z').map((p) => after[p]), ['a', 'm', 'a', 'm'], 'z\'s pieces 2, 5, 8, 11 go to [a, m][floor(p / 3) mod 2]');
+  assert(!after.includes('z'));
+  // when a skips z too, it makes the same choice for every piece: z's pieces are fetched once, not twice
+  nodes[0].swarm._markBad('z');
+  assert.deepEqual(pieces.map((p) => fetcher(0, p)), after);
+  net.closeAll();
+});
+
 test('one sharer, three streamers: the sharer sends about one copy; everybody gets exact bytes', async () => {
   const net = new Net();
   const data = makeData(8 * P + 777);
@@ -786,6 +816,29 @@ test('the fetcher dies: re-plan without it, the next fetcher gets the piece from
   assert.equal(c.swarm.stats.fallbacks, 1);
   // the sharer lost nothing by it: each piece was sent once
   assert.equal(s.swarm.stats.served, P);
+  net.closeAll();
+});
+
+test('a fetcher that cannot get the piece from the sharer right now says busy: the asker goes to the sharer itself and keeps the fetcher', async () => {
+  const net = new Net();
+  const data = makeData(4 * P);
+  const s = net.node('s');
+  const b = net.node('b');
+  const c = net.node('c');
+  net.connect('s', 'b', 'c');
+  s.swarm.openLocal(new Blob([data]));
+  const fb = peerFile(b.swarm, data);
+  const fc = peerFile(c.swarm, data);
+  fb.swarm.activate();
+  fc.swarm.activate();
+  await sleep(40);
+  b.swarm._markBad('s'); // b skips the sharer for a while (it was too slow for b once)
+  // streamers [b, c]: piece 0 is b's. b cannot fetch it now, so it answers busy, and c fetches it from the sharer.
+  assert((await read(fc, 0, P)).equals(data.subarray(0, P)));
+  assert.deepEqual(c.mesh.out(T.WANT).map((x) => x.to), ['b', 's']);
+  assert.deepEqual(b.mesh.out(T.DENY).map((x) => x.f.flags), [DENIED.BUSY]);
+  assert.equal(c.swarm.stats.skipped, 0, 'c does not skip b for it');
+  assert.deepEqual(c.swarm._plan(c.swarm.film, 2).peers, ['b'], 'b still fetches its pieces for c');
   net.closeAll();
 });
 
@@ -955,6 +1008,35 @@ test('a silent fetcher costs one timeout in all: pieces queued behind its slots 
   const took = Date.now() - t0;
   assert.equal(a.mesh.out(T.WANT).length, 2, 'bob was asked for two pieces (his two slots) and then left alone');
   assert(took < 330, `one timeout (160 ms) plus the reads, not one per queued piece: ${took} ms`);
+  net.closeAll();
+});
+
+test('a friend that sends my pieces one after another is not skipped because the second waited behind the first', async () => {
+  const net = new Net();
+  const data = makeData(2 * P);
+  const me = net.node('me', { minRate: 1024 * 1024 }); // first byte within 60 ms, a piece within 60 + 250 ms
+  // the holder is driven by hand: it answers both wants on one ordered channel, a frame every 30 ms
+  const wants = [];
+  const holder = new EventTarget();
+  holder.addEventListener('film', (e) => { const f = decodeFrame(e.detail.data); if (f?.type === T.WANT) wants.push(f); });
+  net.nodes.set('h', { mesh: holder, swarm: { destroy() {} } });
+  me.mesh.peers.set('h', { id: 'h', filmOpen: true });
+  const rf = peerFile(me.swarm, data);
+  rf.swarm.activate();
+  me.swarm.have.set('h', { key: keyOf(data), local: true, ranges: [[0, 1]], via: 'file' });
+  const reading = read(rf, 0, 2 * P);
+  while (wants.length < 2) await sleep(5);
+  for (const w of [...wants].sort((x, y) => x.piece - y.piece)) {
+    for (let off = 0; off < P; off += MAX_PAYLOAD) {
+      await sleep(30);
+      const payload = data.subarray(w.piece * P + off, w.piece * P + Math.min(P, off + MAX_PAYLOAD));
+      net.film('h', 'me', encodeFrame({ type: T.DATA, req: w.req, key: w.key, piece: w.piece, offset: off, payload }));
+    }
+  }
+  assert((await reading).equals(data), 'both pieces arrived from the holder');
+  assert.equal(me.swarm.stats.skipped, 0, 'the holder was not skipped: piece 1 started more than 60 ms after its want, but right after piece 0');
+  assert.equal(me.mesh.out(T.CANCEL).length, 0);
+  assert.equal(me.mesh.out(T.WANT).length, 2);
   net.closeAll();
 });
 

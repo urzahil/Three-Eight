@@ -22,7 +22,9 @@ const DATA_HIGH = 1024 * 1024;
 const DATA_LOW = 256 * 1024;
 
 // The film channel carries binary film pieces only, so they never queue up in front of chat and sync
-// messages on the JSON channel. Sends wait in a queue while more than FILM_HIGH bytes are buffered.
+// messages on the JSON channel. Sends wait in a queue while more than FILM_HIGH bytes are buffered; small
+// control messages (`urgent`: a request, a refusal, a cancel) skip that queue, so they wait behind at most
+// FILM_HIGH bytes of pieces, not behind every piece queued for that friend.
 const FILM_HIGH = 1024 * 1024;
 const FILM_LOW = 256 * 1024;
 
@@ -438,10 +440,19 @@ class Peer {
   /**
    * Send one binary film message (an ArrayBuffer or typed array). It goes out at once while the channel's
    * buffer is below the high-water mark, otherwise it waits in a queue. `tag` lets dropFilm() remove it
-   * again. Returns false if the film channel is not open.
+   * again. An `urgent` message (a few bytes) goes to the channel at once, ahead of the queue; it cannot be
+   * dropped. Returns false if the film channel is not open.
    */
-  sendFilm(buf, tag = '') {
+  sendFilm(buf, tag = '', { urgent = false } = {}) {
     if (!this.filmOpen || this.film.readyState !== 'open') return false;
+    if (urgent) {
+      try {
+        this.film.send(buf);
+        return true;
+      } catch {
+        return false;
+      }
+    }
     this.filmQueue.push({ buf, tag });
     this.filmQueued += buf.byteLength;
     this._pumpFilm();
@@ -785,8 +796,8 @@ export class Mesh extends EventTarget {
   }
 
   /** Send a binary film message to one peer (see Peer.sendFilm). */
-  sendFilm(id, buf, tag) {
-    return this.peers.get(id)?.sendFilm(buf, tag) || false;
+  sendFilm(id, buf, tag, opts) {
+    return this.peers.get(id)?.sendFilm(buf, tag, opts) || false;
   }
 
   dropFilm(id, tag) {
