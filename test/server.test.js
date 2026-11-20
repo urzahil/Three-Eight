@@ -11,7 +11,7 @@ const WebSocket = require('ws');
 const http = require('node:http');
 const net = require('node:net');
 const { RoomStore, parseDriveFolder } = require('../server/store');
-const { limiterKey } = require('../server/ip');
+const { limiterKey, limiterKeys } = require('../server/ip');
 const { startFakeGoogle } = require('./fake-google');
 
 // Ports come from the OS (see freePort): a guessed number can already be taken, e.g. by an outgoing connection.
@@ -1494,6 +1494,72 @@ test('rate limits count an IPv6 /64 (and an IPv4-mapped address as its IPv4) as 
   s.stop();
 });
 
+test('limiterKeys: an IPv6 address is also counted by its /56 and /48', () => {
+  assert.deepStrictEqual(limiterKeys('2001:db8:aa:1ff::1'), ['2001:db8:aa:1ff::/64', '2001:db8:aa:100::/56', '2001:db8:aa::/48']);
+  assert.deepStrictEqual(limiterKeys('2001:0db8:00aa:01ff:1:2:3:4'), limiterKeys('2001:db8:aa:1ff::9'));
+  assert.deepStrictEqual(limiterKeys('1.2.3.4'), ['1.2.3.4']);
+  assert.deepStrictEqual(limiterKeys('::ffff:1.2.3.4'), ['1.2.3.4']);
+  assert.deepStrictEqual(limiterKeys('junk'), ['junk']);
+  assert.strictEqual(limiterKeys('2001:db8:aa:1ff::1')[0], limiterKey('2001:db8:aa:1ff::1'));
+});
+
+test('rotating /64s inside one /56 or /48 does not give fresh attempts', async () => {
+  const s = await spawnServer({ TRUST_PROXY: '1' });
+  const attempt = (xff) => fetch(s.base + '/api/admin/login', { method: 'POST', headers: { 'content-type': 'application/json', 'X-Forwarded-For': xff }, body: JSON.stringify({ password: 'wrong' }) }).then((r) => r.status);
+  // 10 per /64, 20 per /56, 40 per /48 (PREFIX_SCALE).
+  const statuses = [];
+  for (let i = 0; i < 25; i++) statuses.push(await attempt(`2001:db8:77:${i.toString(16)}::1`)); // one /64 each, all in 2001:db8:77:0::/56
+  assert.strictEqual(statuses.filter((c) => c === 401).length, 20, 'a /56 gets twice the allowance of one client');
+  assert(statuses.slice(20).every((c) => c === 429));
+  const wide = [];
+  for (let i = 1; i < 40; i++) wide.push(await attempt(`2001:db8:77:${(i * 256).toString(16)}::1`)); // other /56s of the same /48
+  assert.strictEqual(wide.filter((c) => c === 401).length, 20, 'and the /48 four times: 40 in all');
+  assert.strictEqual(await attempt('2001:db8:78::1'), 401, 'another /48 is another client');
+  s.stop();
+});
+
+test('past 100 failed admin logins from all clients together, an address that fails gets one attempt, not ten', async () => {
+  const s = await spawnServer({ TRUST_PROXY: '1' });
+  const ck = await adminCookie(s.base);
+  const login = (xff, password = 'wrong') => fetch(s.base + '/api/admin/login', { method: 'POST', headers: { 'content-type': 'application/json', 'X-Forwarded-For': xff }, body: JSON.stringify({ password }) });
+  const statuses = [];
+  for (let a = 0; a < 10; a++) for (let i = 0; i < 10; i++) statuses.push((await login(`198.51.100.${a + 1}`)).status); // 10 each: the per-client limit
+  assert(statuses.every((c) => c === 401));
+  assert.match(s.out.log, /Too many failed admin logins from all clients together/);
+  // Now each further address gets one wrong guess, then no more until the window ends.
+  const after = [];
+  for (let i = 0; i < 3; i++) after.push((await login('198.51.100.50')).status);
+  assert.deepStrictEqual(after, [401, 429, 429]);
+  assert.match((await (await login('198.51.100.50')).json()).error, /on this server/);
+  // The admin, from an address that has not failed, still gets in with the right password; open sessions keep working.
+  assert.strictEqual((await login('203.0.113.200', 'admin-pw-for-tests')).status, 200);
+  assert.strictEqual((await fetch(s.base + '/api/admin/rooms', { headers: { cookie: ck } })).status, 200);
+  s.stop();
+});
+
+test('room password checks run a few at a time: a crowd of guesses is asked to retry instead of piling up', async () => {
+  const s = await spawnServer({ TRUST_PROXY: '1', MAX_ROOM_SIZE: '50' });
+  const ck = await adminCookie(s.base);
+  await fetch(s.base + '/api/admin/rooms', { method: 'POST', headers: { 'content-type': 'application/json', cookie: ck }, body: JSON.stringify({ name: 'gated', password: 'right' }) });
+  // 60 guesses at once, each from its own address (no per-client limit applies): 2 run, 32 wait, the rest are told "busy".
+  const sockets = await Promise.all(Array.from({ length: 60 }, (_, i) => wsAt(s.base, { 'X-Forwarded-For': `10.60.0.${i + 1}` })));
+  sockets.forEach((ws, i) => ws.sendJson({ type: 'join', room: 'gated', id: `gate${String(i).padStart(5, '0')}`, name: 'G', password: `guess${i}` }));
+  const codes = (await Promise.all(sockets.map((ws) => ws.next()))).map((m) => m.code);
+  const busy = codes.filter((c) => c === 'busy').length;
+  assert(busy >= 20, `${busy} of 60 were asked to retry`);
+  assert.strictEqual(busy + codes.filter((c) => c === 'bad-password').length, 60, JSON.stringify(codes));
+  // Being told "busy" did not count as a wrong password: one of those addresses still has its full allowance.
+  const who = codes.indexOf('busy');
+  for (let i = 0; i < 20; i++) {
+    sockets[who].sendJson({ type: 'join', room: 'gated', id: `gateagain${String(i).padStart(3, '0')}`, name: 'G', password: 'still-wrong' });
+    assert.strictEqual((await sockets[who].next()).code, 'bad-password', `attempt ${i + 1}`);
+  }
+  sockets[who].sendJson({ type: 'join', room: 'gated', id: 'gateagain999', name: 'G', password: 'right' });
+  assert.strictEqual((await sockets[who].next()).code, 'rate-limited', 'the 21st is over the limit');
+  sockets.forEach((ws) => ws.close());
+  s.stop();
+});
+
 test('a socket that floods the server is closed with a policy code', async () => {
   const s = await spawnServer({});
   // A normal burst (ICE candidates, clock pings) is fine, even a large one.
@@ -1507,9 +1573,20 @@ test('a socket that floods the server is closed with a policy code', async () =>
   assert.strictEqual(await closed, 1008);
   // It refills: the calm client can still talk after a pause.
   await new Promise((r) => setTimeout(r, 300));
-  calm.sendJson({ type: 'time', c: 'again' });
-  assert.strictEqual((await calm.next()).c, 'again');
+  calm.sendJson({ type: 'time', c: 4242 });
+  assert.strictEqual((await calm.next()).c, 4242);
   calm.close();
+  s.stop();
+});
+
+test('clock sync only echoes a number: a client cannot have the server queue large replies for it', async () => {
+  const s = await spawnServer({});
+  const ws = await wsAt(s.base);
+  for (const c of ['x'.repeat(60 * 1024), { big: 'x'.repeat(1000) }, [1, 2], null, true, '123']) ws.sendJson({ type: 'time', c });
+  ws.send('{"type":"time","c":1e999}'); // Infinity once parsed
+  ws.sendJson({ type: 'time', c: 77.5 });
+  assert.strictEqual((await ws.next()).c, 77.5, 'the first answer is the one for the number: nothing else was echoed');
+  ws.close();
   s.stop();
 });
 
@@ -1650,14 +1727,16 @@ test('admin login: concurrent wrong passwords cannot get past the limit while th
 
 test('the failure limiters remember at most 10,000 clients (expired first, then the oldest unblocked one)', async () => {
   const s = await spawnServer({ TRUST_PROXY: '1' });
-  const attempt = (xff) => fetch(s.base + '/api/admin/login', { method: 'POST', headers: { 'content-type': 'application/json', 'X-Forwarded-For': xff }, body: JSON.stringify({ password: 'wrong' }) }).then((r) => r.status);
-  for (let i = 0; i < 10; i++) assert.strictEqual(await attempt('9.9.9.9'), 401);
+  // The room-lookup limiter (30 misses): the admin login has a limit for all clients together on top, which 10,000 would trip.
+  const attempt = (xff) => fetch(s.base + '/api/rooms/no-such-room', { headers: { 'X-Forwarded-For': xff } }).then((r) => r.status);
+  for (let i = 0; i < 30; i++) assert.strictEqual(await attempt('9.9.9.9'), 404);
   assert.strictEqual(await attempt('9.9.9.9'), 429);
   // 10,000 other clients (one failure each) fill the map past its cap; the oldest unblocked entries go, a blocked one stays.
   const ips = Array.from({ length: 10000 }, (_, i) => `10.${i >> 8 & 255}.${i & 255}.1`);
   for (let i = 0; i < ips.length; i += 200) await Promise.all(ips.slice(i, i + 200).map(attempt));
   assert.strictEqual(await attempt('9.9.9.9'), 429, 'a blocked client stays blocked however many others are added');
-  assert.strictEqual(await attempt('10.39.15.1'), 401, 'a recent one is still counted (one failure so far, one more now)');
+  for (let i = 0; i < 29; i++) assert.strictEqual(await attempt('10.39.15.1'), 404, 'a recent one is still counted');
+  assert.strictEqual(await attempt('10.39.15.1'), 429, 'its first failure was remembered: 30 in all');
   s.stop();
 });
 
@@ -1926,6 +2005,63 @@ test('drive: `truncated` reaches the folders endpoint, and a room has a cap on o
   ws.close();
 });
 
+test('drive: one member cannot hold all of a room\'s streams, and requests for IDs outside the folder are limited per client', async () => {
+  const F = 'MEMBERCAP_FOLDER_1', BIG = 'MEMBERCAP_BIGFILE_1';
+  google.addFolder(F, 'Member cap folder');
+  google.addFile(BIG, 'big.mp4', F, bytes(48 * MiB), 'video/mp4');
+  const s = await spawnServer({ GOOGLE_SERVICE_ACCOUNT: google.writeAccount(keyDir), GOOGLE_API_BASE: google.url, DRIVE_DEBUG: '1', TRUST_PROXY: '1' });
+  const ck = await adminCookie(s.base);
+  const admin = { 'Content-Type': 'application/json', cookie: ck };
+  assert.strictEqual((await fetch(s.base + '/api/admin/rooms', { method: 'POST', headers: admin, body: JSON.stringify({ name: 'capped' }) })).status, 201);
+  await fetch(s.base + '/api/admin/rooms/capped/drive', { method: 'PUT', headers: admin, body: JSON.stringify({ link: F }) });
+  const tokenOf = async (id) => {
+    const ws = await wsAt(s.base);
+    ws.sendJson({ type: 'join', room: 'capped', id, name: id });
+    return { ws, token: (await nextMatching(ws, (m) => m.type === 'welcome')).drive.token };
+  };
+  const a = await tokenOf('capmember1'), b = await tokenOf('capmember2');
+  const file = (tok, xff = '192.0.2.1', id = BIG) => fetch(s.base + `/api/rooms/capped/drive/files/${id}`, { headers: { Authorization: `Bearer ${tok}`, Range: 'bytes=0-9', 'X-Forwarded-For': xff } });
+
+  // Eight streams nobody reads stay open for member A (the room allows 36); its ninth is refused, B's is not.
+  const open = (tok) => new Promise((resolve, reject) => {
+    const req = http.get(s.base + `/api/rooms/capped/drive/files/${BIG}`, { headers: { Authorization: `Bearer ${tok}` } }, (res) => {
+      res.pause();
+      resolve({ res, req });
+    });
+    req.on('error', reject);
+  });
+  const held = [];
+  for (let i = 0; i < 8; i++) held.push(await open(a.token));
+  assert(held.every((h) => h.res.statusCode === 200));
+  const refused = await file(a.token);
+  assert.strictEqual(refused.status, 429);
+  assert.match((await refused.json()).error, /You have too many movie streams/);
+  assert.strictEqual(refused.headers.get('retry-after'), '5');
+  const other = await file(b.token);
+  assert.strictEqual(other.status, 206, 'another member of the room can still stream');
+  await other.arrayBuffer();
+  for (const h of held) h.req.destroy();
+
+  // Made-up IDs: each one would cost a Drive API call. 60 misses per client in 10 minutes, then 429 for every Drive
+  // request from it (even for a file in the folder); other clients are not affected.
+  for (let i = 0; i < 60; i++) {
+    const r = await file(a.token, '192.0.2.1', `MADE_UP_ID_${String(i).padStart(6, '0')}`);
+    assert.strictEqual(r.status, 404, `miss ${i + 1}`);
+    await r.arrayBuffer();
+  }
+  const over = await file(a.token, '192.0.2.1', 'MADE_UP_ID_999999');
+  assert.strictEqual(over.status, 429);
+  assert.match((await over.json()).error, /not in this room's folder/);
+  assert.strictEqual(over.headers.get('retry-after'), '600');
+  assert.strictEqual((await file(a.token, '192.0.2.1')).status, 429, 'the same client, a file in the folder');
+  const elsewhere = await file(a.token, '192.0.2.2');
+  assert.strictEqual(elsewhere.status, 206, 'the same token from another client');
+  await elsewhere.arrayBuffer();
+  a.ws.close();
+  b.ws.close();
+  s.stop();
+});
+
 test('container health check: exits 0 while the server answers, 1 when it is down', async () => {
   const script = path.join(__dirname, '..', 'server', 'healthcheck.js');
   const run = (env) => new Promise((resolve) => {
@@ -1976,7 +2112,7 @@ async function nextMatching(ws, pred, ms = 15000) {
   }
 }
 
-test('several members flooding one (each within its own budget): the flooders are cut off, the receiver stays', { timeout: 60000 }, async () => {
+test('several members flooding one (each within its own budget): what they send past a fair share is dropped, nobody is disconnected', { timeout: 60000 }, async () => {
   const s = await spawnServer({ MAX_ROOM_SIZE: '50' }); // the receiver, an honest member and 48 flooders: a full room
   const ck = await adminCookie(s.base);
   await fetch(s.base + '/api/admin/rooms', { method: 'POST', headers: { 'content-type': 'application/json', cookie: ck }, body: JSON.stringify({ name: 'stall-room' }) });
@@ -1991,22 +2127,37 @@ test('several members flooding one (each within its own budget): the flooders ar
   const honest = await joinAs('honestpeer1');
   const senders = [];
   for (let i = 0; i < 48; i++) senders.push(await joinAs(`stallsend${String(i).padStart(2, '0')}`));
-  const closes = senders.map((b) => new Promise((r) => b.once('close', (code) => r(code))));
+  let closedSenders = 0;
+  for (const b of senders) b.once('close', () => { closedSenders++; });
   honest.sendJson({ type: 'signal', to: 'stallpeerA1', data: { sdp: 'an honest offer' } });
   // A's link is slow (here: it stops reading); together the senders queue far more than it takes.
   a._socket.pause();
   const big = 'x'.repeat(30 * 1024);
+  const sent = 48 * 16;
   for (const b of senders) for (let i = 0; i < 16; i++) b.sendJson({ type: 'signal', to: 'stallpeerA1', data: { sdp: big } });
-  const codes = await Promise.race([Promise.all(closes), new Promise((r) => setTimeout(() => r(null), 20000))]);
-  assert(codes, 'every flooder was cut off');
-  assert(codes.every((c) => c === 1008), JSON.stringify(codes));
-  const stayed = ['honestpeer1', 'stallpeerA1'];
-  assert.deepStrictEqual(await settled(async () => (await online()).sort(), stayed), stayed, 'the receiver and the honest member are still in the room');
-  honest.sendJson({ type: 'signal', to: 'stallpeerA1', data: { sdp: 'another honest offer' } });
+  await new Promise((r) => setTimeout(r, 2000));
+  // A asks the honest member for more than a fair share while it is behind (it sends offers, the honest member answers
+  // each, as browsers do): that must not get the honest member disconnected, as if it were the one flooding.
+  for (let i = 0; i < 10; i++) honest.sendJson({ type: 'signal', to: 'stallpeerA1', data: { sdp: `an answer ${i} ${'a'.repeat(8 * 1024)}` } });
   honest.sendJson({ type: 'time', c: 1 });
   assert.strictEqual((await nextMatching(honest, (m) => m.type === 'time')).c, 1, 'the honest member is still connected');
+  assert.strictEqual((await online()).length, 50, 'nobody left the room: the receiver, the honest member and the senders');
+  assert.strictEqual(closedSenders, 0, 'the senders are not cut off: their signals past a fair share are just not delivered');
+  // A catches up: it got the honest member's first signal, and far fewer of the big ones than were sent.
+  a._socket.resume();
+  let big_ = 0, honestOnes = 0;
+  for (;;) {
+    const m = await nextMatching(a, () => true, 1500);
+    if (m.type === 'timeout') break;
+    if (m.type !== 'signal') continue;
+    if (m.from === 'honestpeer1') honestOnes++;
+    else big_++;
+  }
+  assert(honestOnes >= 1, 'the honest signal from before the flood arrived');
+  assert(big_ < sent / 2, `${big_} of ${sent} big signals were delivered`);
   a.terminate();
   honest.close();
+  for (const b of senders) b.terminate();
   s.stop();
 });
 
@@ -2030,26 +2181,32 @@ test('a member that stops reading is dropped by the heartbeat, and the others ar
 
 test('the signal budget grows with MAX_ROOM_SIZE: a newcomer in a big room can send an offer to everyone', { timeout: 30000 }, async () => {
   // About 15 KB (an offer with a shared screen, and its candidates) to each of the 49 others in a full room of 50, all at
-  // once. Signals to someone who is not in the room still count against the sender's budget, so the members do not
-  // have to exist here.
+  // once. Here they all go to one member, who counts them; what is over the budget is not relayed, and the sender stays.
   const burst = async (maxRoomSize) => {
     const s = await spawnServer({ MAX_ROOM_SIZE: maxRoomSize });
     const ck = await adminCookie(s.base);
     await fetch(s.base + '/api/admin/rooms', { method: 'POST', headers: { 'content-type': 'application/json', cookie: ck }, body: JSON.stringify({ name: 'big-room' }) });
+    const rx = await wsAt(s.base);
+    rx.sendJson({ type: 'join', room: 'big-room', id: 'receiver01', name: 'R' });
+    assert.strictEqual((await rx.next()).type, 'welcome');
     const ws = await wsAt(s.base);
     ws.sendJson({ type: 'join', room: 'big-room', id: 'newcomer01', name: 'N' });
     assert.strictEqual((await ws.next()).type, 'welcome');
-    const closed = new Promise((r) => ws.once('close', (code) => r(code)));
     const offer = 'o'.repeat(15 * 1024);
-    for (let i = 0; i < 49; i++) ws.sendJson({ type: 'signal', to: `member${String(i).padStart(4, '0')}`, data: { sdp: offer } });
+    for (let i = 0; i < 49; i++) ws.sendJson({ type: 'signal', to: 'receiver01', data: { sdp: offer, i } });
     ws.sendJson({ type: 'time', c: 1 });
-    const answer = await Promise.race([nextMatching(ws, (m) => m.type === 'time', 5000), closed.then((code) => ({ type: 'closed', code }))]);
+    const answer = await nextMatching(ws, (m) => m.type === 'time', 5000);
+    let got = 0;
+    while ((await nextMatching(rx, (m) => m.type === 'signal', 1000)).type === 'signal') got++;
     ws.terminate();
+    rx.terminate();
     s.stop();
-    return answer;
+    return { connected: answer.type === 'time', got };
   };
-  assert.strictEqual((await burst('50')).type, 'time', 'MAX_ROOM_SIZE=50: still connected');
-  assert.deepStrictEqual(await burst('12'), { type: 'closed', code: 1008 }, 'MAX_ROOM_SIZE=12: that much is a flood');
+  assert.deepStrictEqual(await burst('50'), { connected: true, got: 49 }, 'MAX_ROOM_SIZE=50: all of it is relayed');
+  const small = await burst('12');
+  assert(small.connected, 'MAX_ROOM_SIZE=12: still connected');
+  assert(small.got >= 30 && small.got < 40, `MAX_ROOM_SIZE=12: only what fits in the 512 KB budget is relayed (${small.got} of 49)`);
 });
 
 test('signals: one member cannot flood another off the server; oversized signals are not relayed', { timeout: 30000 }, async () => {
@@ -2070,15 +2227,20 @@ test('signals: one member cannot flood another off the server; oversized signals
   attacker.sendJson({ type: 'signal', to: 'floodvict1', data: { sdp: 'small' } });
   assert.deepStrictEqual(await victim.next(), { type: 'signal', from: 'floodattk1', data: { sdp: 'small' } }, 'only the small one arrived');
 
-  // The victim's link is slow (it stops reading); the attacker sends as fast as it can: the attacker is cut off.
+  // The victim's link is slow (it stops reading); the attacker sends as fast as it can. What is over its budget (or,
+  // once the victim is behind, over a fair share) is not relayed: the victim is not dropped for what it was sent.
   victim._socket.pause();
-  const closed = new Promise((r) => attacker.once('close', (code) => r(code)));
   const big = 'x'.repeat(30 * 1024);
   for (let i = 0; i < 300; i++) attacker.sendJson({ type: 'signal', to: 'floodvict1', data: { sdp: big } });
-  assert.strictEqual(await closed, 1008, 'the flooding sender is closed as rate limited');
-  assert.deepStrictEqual(await settled(online, ['Victim']), ['Victim'], 'the victim is still in the room');
+  attacker.sendJson({ type: 'time', c: 5 });
+  assert.strictEqual((await nextMatching(attacker, (m) => m.type === 'time')).c, 5, 'the sender is not disconnected for it');
+  assert.deepStrictEqual(await settled(online, ['Attacker', 'Victim']), ['Attacker', 'Victim'], 'the victim is still in the room');
   victim._socket.resume();
+  let got = 0;
+  while ((await nextMatching(victim, (m) => m.type === 'signal', 1500)).type === 'signal') got++;
+  assert(got < 60, `${got} of 300 big signals were relayed (the budget is 512 KB, then 64 KB a second)`);
   victim.terminate();
+  attacker.terminate();
   s.stop();
 });
 // ---- TURN credentials go to members only ------------------------------------------------------------------------

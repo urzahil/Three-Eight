@@ -2,7 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import './browser-globals.mjs';
-import { Reassembler, ChunkSender, MAX_QUEUED, routeVideo, screenBudget } from '../public/assets/js/mesh.js';
+import { Reassembler, ChunkSender, MAX_QUEUED, routeVideo, screenBudget, Mesh, MAX_OFFERS_PER_PEER, OFFER_WINDOW_MS } from '../public/assets/js/mesh.js';
 
 const CHUNK = 12 * 1024;
 const chunk = (mid, i, n, d = 'x') => ({ type: '_chunk', mid, i, n, d });
@@ -273,4 +273,29 @@ test('a shared screen gets more upload than a camera, less with more peers and i
   const kbps = [1, 2, 3, 4, 5, 8].map((n) => screenBudget(n, false) / 1000);
   assert.deepEqual(kbps, [2500, 1800, 1000, 1000, 600, 600]);
   for (const n of [1, 2, 4, 8]) assert.ok(screenBudget(n, true) <= 800 * 1000);
+});
+
+test('offers: a peer gets at most MAX_OFFERS_PER_PEER answered per window, others are not affected', () => {
+  const realNow = Date.now;
+  const realWarn = console.warn;
+  let t = 1_000_000;
+  let warnings = 0;
+  Date.now = () => t;
+  console.warn = () => { warnings++; };
+  try {
+    const mesh = Object.create(Mesh.prototype);
+    mesh._offers = new Map();
+    const taken = Array.from({ length: MAX_OFFERS_PER_PEER + 5 }, () => mesh._takeOffer('pushy'));
+    assert.equal(taken.filter(Boolean).length, MAX_OFFERS_PER_PEER);
+    assert.deepEqual(taken.slice(MAX_OFFERS_PER_PEER), Array(5).fill(false));
+    assert.equal(warnings, 1, 'said once, not for every ignored offer');
+    assert.equal(mesh._takeOffer('calm'), true, 'another peer has its own allowance');
+    t += OFFER_WINDOW_MS - 1;
+    assert.equal(mesh._takeOffer('pushy'), false, 'still within the window');
+    t += 1;
+    assert.equal(mesh._takeOffer('pushy'), true, 'the window has passed');
+  } finally {
+    Date.now = realNow;
+    console.warn = realWarn;
+  }
 });

@@ -23,7 +23,7 @@ const crypto = require('crypto');
 const zlib = require('zlib');
 const { WebSocketServer } = require('ws');
 const { RoomStore, RoomError, parseDriveFolder } = require('./store');
-const { limiterKey, forwardedAddress } = require('./ip');
+const { limiterKeys, forwardedAddress } = require('./ip');
 const { GoogleDrive, DriveError, ID_RE: DRIVE_ID_RE, FOLDER, kindOf, loadServiceAccount, parseRange, MiB } = require('./drive');
 const { ConfigError, intSetting, trustedHops, driveCacheMb, adminPassword } = require('./config');
 
@@ -555,18 +555,96 @@ class FailLimiter {
     }
     this.map.set(key, { first: now, count: 1 });
   }
+  /** Failures counted for this key in its current window (0 when none). */
+  failures(key) {
+    const e = this.map.get(key);
+    return e && Date.now() - e.first <= this.windowMs ? e.count : 0;
+  }
   sweep() {
     const now = Date.now();
     for (const [k, e] of this.map) if (now - e.first > this.windowMs) this.map.delete(k);
   }
 }
-const adminLimiter = new FailLimiter(10, 15 * 60 * 1000);
-const roomLimiter = new FailLimiter(20, 10 * 60 * 1000);
+
+// A client is counted under each of its limiter keys (ip.js limiterKeys): an IPv4 address, or an IPv6 address's /64, /56
+// and /48. A wider prefix may use this many times the allowance of one client (several households or phones can share
+// it), but not 256 or 65,536 times: otherwise one person with a /48 gets a fresh allowance for every /64 in it.
+const PREFIX_SCALE = [1, 2, 4];
+
+/** A FailLimiter per prefix length (see PREFIX_SCALE), with the same methods taking a client's keys: blocked when any key is. */
+class TieredLimiter {
+  constructor(max, windowMs) {
+    this.tiers = PREFIX_SCALE.map((scale) => new FailLimiter(max * scale, windowMs));
+  }
+  blocked(keys) {
+    return keys.some((key, i) => this.tiers[i].blocked(key));
+  }
+  reserve(keys) {
+    if (this.blocked(keys)) return false;
+    this.fail(keys);
+    return true;
+  }
+  release(keys) {
+    keys.forEach((key, i) => this.tiers[i].release(key));
+  }
+  fail(keys) {
+    keys.forEach((key, i) => this.tiers[i].fail(key));
+  }
+  /** Has this client (or its wider prefix) failed at all in the current window? */
+  failed(keys) {
+    return keys.some((key, i) => this.tiers[i].failures(key) > 0);
+  }
+  sweep() {
+    for (const t of this.tiers) t.sweep();
+  }
+}
+
+/** The limiter keys of the client that sent this request. */
+const clientKeys = (req) => limiterKeys(clientIp(req));
+
+const adminLimiter = new TieredLimiter(10, 15 * 60 * 1000);
+// Failed admin logins from every client together. With enough addresses (a botnet) the per-client limit alone would
+// allow 10 guesses from each. Past this many in the window, a client that has failed at all in its window gets no more
+// attempts until it ends: one guess per address. Refusing everyone instead would let an attacker with a dozen addresses
+// keep the admin from logging in for as long as it likes; this way the admin, typing the password right, still gets in.
+const adminGlobalLimiter = new FailLimiter(100, 15 * 60 * 1000);
+const EVERYONE = '*'; // adminGlobalLimiter's only key
+let adminGlobalNoted = false; // logged that adminGlobalLimiter is blocking (reset by the heartbeat once it no longer is)
+const roomLimiter = new TieredLimiter(20, 10 * 60 * 1000);
 // Lookups of rooms that do not exist (the lobby's GET /api/rooms/:room, or a join): room names are often guessable, and
 // a room without a password is open to whoever finds it, so finding names by trying many must be slow. While a client
 // is over the limit every lookup is refused, existing rooms included: the answer must not tell the two apart.
-const lookupLimiter = new FailLimiter(30, 10 * 60 * 1000);
+const lookupLimiter = new TieredLimiter(30, 10 * 60 * 1000);
 const LOOKUP_LIMITED = 'Too many rooms that do not exist were tried. Try again in a few minutes.';
+
+class GateBusy extends Error {}
+
+/** Runs at most `max` tasks at once; up to `queue` more wait for a slot, and beyond that run() rejects with GateBusy. */
+class Gate {
+  constructor(max, queue) {
+    this.max = max;
+    this.queue = queue;
+    this.active = 0;
+    this.waiting = [];
+  }
+  async run(fn) {
+    if (this.active < this.max) this.active++;
+    else if (this.waiting.length >= this.queue) throw new GateBusy('busy');
+    else await new Promise((resolve) => this.waiting.push(resolve)); // the slot is handed over by the task that frees it
+    try {
+      return await fn();
+    } finally {
+      const next = this.waiting.shift();
+      if (next) next();
+      else this.active--;
+    }
+  }
+}
+
+// A room password check (scrypt) keeps a thread of libuv's pool busy for tens of milliseconds, and that pool (4 threads
+// by default) also reads the static files and resolves host names. At most this many checks run at once, so guesses
+// from many addresses cannot stall the rest of the server; a few more wait, and beyond that a join is asked to retry.
+const passwordChecks = new Gate(2, 32);
 
 // ---- Admin sessions -----------------------------------------------------------
 const adminSessions = new Map(); // token -> expiry
@@ -661,11 +739,14 @@ const driveStreams = new Map();
 // At most this many file responses are open per room at once (a viewer has a few in flight; members x 3 is generous).
 // More would be one room using the server's whole upstream budget, e.g. a client that opens requests without reading.
 const MAX_DRIVE_STREAMS_PER_ROOM = 3 * MAX_ROOM_SIZE;
+// ... and per member, so that one member cannot hold all of the room's: the app reads at most 4 parts of a film at once,
+// plus a few small reads and what the browser's own player asks for.
+const MAX_DRIVE_STREAMS_PER_MEMBER = 8;
 
 /**
  * Register a streaming response under a token checkToken() accepted. Returns the function that unregisters it, null
- * when the token no longer holds (room gone or changed, member removed: nothing is registered then), or 'busy' when
- * the room already has too many open file responses.
+ * when the token no longer holds (room gone or changed, member removed: nothing is registered then), 'busy' when
+ * the room already has too many open file responses, or 'member-busy' when this member has.
  */
 function trackDriveStream(checked, abort) {
   if (!stillValid(checked)) return null;
@@ -674,6 +755,9 @@ function trackDriveStream(checked, abort) {
   const key = RoomStore.key(room.name);
   let set = driveStreams.get(key);
   if ((set?.size || 0) >= MAX_DRIVE_STREAMS_PER_ROOM) return 'busy';
+  let mine = 0;
+  for (const e of set || []) if (e.member === checked.claim.m) mine++;
+  if (mine >= MAX_DRIVE_STREAMS_PER_MEMBER) return 'member-busy';
   if (!set) driveStreams.set(key, (set = new Set()));
   const entry = { version, member: checked.claim.m, abort };
   set.add(entry);
@@ -693,6 +777,13 @@ function dropDriveStreams(name) {
 }
 
 const DRIVE_HEADERS = { 'Cache-Control': 'private, no-store' };
+
+// Drive requests for IDs that are not in the room's folder: finding that out costs a Drive API call (a walk up the
+// folder tree) that no cache answers when the IDs are made up, and the API quota is shared by every room. The app only
+// asks for what a folder listing showed, so a client rarely misses; past the limit, every Drive request it makes gets 429
+// for a while. (drive.js also caps the rate of metadata calls for all clients together.)
+const driveMissLimiter = new TieredLimiter(60, 10 * 60 * 1000);
+const DRIVE_MISSES_LIMITED = 'Too many requests for files that are not in this room\'s folder. Try again in a few minutes.';
 
 /** After the admin attaches a folder: can the service account read it? */
 async function checkFolder(folderId) {
@@ -799,10 +890,22 @@ async function handleDrive(req, res, url, parts) {
   let id = parts[5];
   if (id === 'root' && !isFiles) id = root;
   if (!DRIVE_ID_RE.test(id)) return sendJson(res, 404, { error: 'Not found' }, DRIVE_HEADERS);
+  // Counted as a miss until the ID turns out to be in the folder (see driveMissLimiter). Reserved before the walk, so a
+  // burst of requests cannot all start one before the first misses are counted.
+  const keys = clientKeys(req);
+  if (!driveMissLimiter.reserve(keys)) return sendJson(res, 429, { error: DRIVE_MISSES_LIMITED }, { ...DRIVE_HEADERS, 'Retry-After': '600' });
 
   try {
     // Only the room's folder and what is below it: the service account may be able to read much more.
-    if (!(await driveApi.inTree(root, id))) return sendJson(res, 404, { error: 'Not found in this room\'s folder.' }, DRIVE_HEADERS);
+    let inside;
+    try {
+      inside = await driveApi.inTree(root, id);
+    } catch (err) {
+      driveMissLimiter.release(keys); // Google failed (or was busy): not the client's miss
+      throw err;
+    }
+    if (!inside) return sendJson(res, 404, { error: 'Not found in this room\'s folder.' }, DRIVE_HEADERS);
+    driveMissLimiter.release(keys);
     // The room may have changed (password, folder, deleted), or its member been removed, while Drive was asked: the
     // token only counts for the room and member it was issued to.
     if (res.destroyed) return; // the client went away while Drive was asked: nothing to do
@@ -859,6 +962,7 @@ async function serveFile(req, res, id, checked) {
     res.destroy(); // the client sees the connection cut, not a clean end
   });
   if (untrack === 'busy') return sendJson(res, 429, { error: 'Too many movie streams are open in this room right now. Wait a moment and try again.' }, { ...DRIVE_HEADERS, 'Retry-After': '5' });
+  if (untrack === 'member-busy') return sendJson(res, 429, { error: 'You have too many movie streams open right now. Wait a moment and try again.' }, { ...DRIVE_HEADERS, 'Retry-After': '5' });
   if (!untrack) return sendJson(res, 401, { error: 'Your Drive session is missing or has expired. Rejoin the room.' }, DRIVE_HEADERS);
   res.on('close', () => {
     untrack();
@@ -891,11 +995,11 @@ async function handleApi(req, res, url) {
 
   // Public: does a room exist / need a password?
   if (parts[1] === 'rooms' && parts.length === 3 && req.method === 'GET') {
-    const ip = limiterKey(clientIp(req));
-    if (lookupLimiter.blocked(ip)) return sendJson(res, 429, { error: LOOKUP_LIMITED }, { 'Retry-After': '600' });
+    const keys = clientKeys(req);
+    if (lookupLimiter.blocked(keys)) return sendJson(res, 429, { error: LOOKUP_LIMITED }, { 'Retry-After': '600' });
     const r = store.get(parts[2]);
     if (!r) {
-      lookupLimiter.fail(ip);
+      lookupLimiter.fail(keys);
       return sendJson(res, 404, { error: 'Room not found' });
     }
     return sendJson(res, 200, { name: r.name, passwordRequired: !!r.passwordHash });
@@ -925,14 +1029,21 @@ async function handleApi(req, res, url) {
   const action = parts.length === 3 ? parts[2] : '';
 
   if (action === 'login' && req.method === 'POST') {
-    const ip = limiterKey(clientIp(req));
-    if (adminLimiter.blocked(ip)) return sendJson(res, 429, { error: 'Too many attempts. Try again later.' });
+    const keys = clientKeys(req);
+    const limited = () => (adminLimiter.blocked(keys) ? 'Too many attempts. Try again later.'
+      : adminGlobalLimiter.blocked(EVERYONE) && adminLimiter.failed(keys) ? 'Too many failed logins on this server. Try again later.' : '');
+    if (limited()) return sendJson(res, 429, { error: limited() });
     const body = await readJson(req);
-    // Check again: other attempts from this client may have failed while this body was arriving. From here to
-    // fail() nothing awaits, so concurrent requests cannot all slip past the limit.
-    if (adminLimiter.blocked(ip)) return sendJson(res, 429, { error: 'Too many attempts. Try again later.' });
+    // Check again: other attempts may have failed while this body was arriving. From here to fail() nothing awaits,
+    // so concurrent requests cannot all slip past the limits.
+    if (limited()) return sendJson(res, 429, { error: limited() });
     if (!safeEqual(typeof body.password === 'string' ? body.password : '', ADMIN_PASSWORD)) {
-      adminLimiter.fail(ip);
+      adminLimiter.fail(keys);
+      adminGlobalLimiter.fail(EVERYONE);
+      if (adminGlobalLimiter.blocked(EVERYONE) && !adminGlobalNoted) {
+        adminGlobalNoted = true;
+        console.warn('Too many failed admin logins from all clients together: for up to 15 minutes, an address that fails once gets no more attempts.');
+      }
       return sendJson(res, 401, { error: 'Wrong password' });
     }
     const token = crypto.randomBytes(32).toString('base64url');
@@ -1155,8 +1266,8 @@ function sameSecret(a, b) {
 // A socket that has not joined a room within this time (after connecting, or after leaving one) is closed: an open
 // socket costs memory, and only members need one. DRIVE_DEBUG=1 lets tests shorten it.
 const JOIN_DEADLINE_MS = (DRIVE_DEBUG && parseInt(process.env.JOIN_DEADLINE_MS, 10)) || 30 * 1000;
-// Open sockets per client address (limiter key, so an IPv6 /64 counts once). Everybody on one network (a household,
-// a party on one Wi-Fi) shares an address, hence the generous floor.
+// Open sockets per client (under each of its limiter keys: an IPv6 /56 or /48 may hold PREFIX_SCALE times as many as
+// one /64). Everybody on one network (a household, a party on one Wi-Fi) shares an address, hence the generous floor.
 const MAX_SOCKETS_PER_CLIENT = Math.max(64, 2 * MAX_ROOM_SIZE);
 /** @type {Map<string, number>} limiter key -> open sockets */
 const socketsPerClient = new Map();
@@ -1166,38 +1277,39 @@ let lastSocketCapLog = 0;
 // each socket has a byte budget for what it makes the server send to others (a token bucket: a burst, then a steady
 // rate). Without it, a member with a fast uplink could fill another member's send buffer until that member counts as
 // stalled and is dropped. A newcomer sends about 9 KB per member (an offer and its candidates), and so does starting a
-// screen share: the burst covers that for a full room of MAX_ROOM_SIZE.
+// screen share: the burst covers that for a full room of MAX_ROOM_SIZE. A signal over the budget is not relayed, but
+// its sender stays connected: what a member sends is not always its own doing, since it answers every offer it gets
+// (the app answers at most MAX_OFFERS_PER_PEER a minute from each peer, see mesh.js).
 const MAX_SIGNAL_BYTES = 32 * 1024;
 const SIGNAL_BYTES_BURST = Math.max(512 * 1024, MAX_ROOM_SIZE * 16 * 1024);
 const SIGNAL_BYTES_PER_SEC = 64 * 1024;
 
 // Several members together can still send one member more than its link carries, each within its own budget. So the
-// relayed bytes are also counted per receiver and sender (in windows of RELAY_WINDOW_MS); once a receiver's send buffer
-// is past RELAY_BACKLOG, every member that sent it more than RELAY_FAIR_BYTES in the window is cut off, rather than the
-// receiver being dropped as stalled for what others sent it. An honest member sends one peer an offer and its
-// candidates (about 9 KB), a few times at most in a window. A receiver that really stopped reading is still dropped:
-// by the heartbeat, or by the MAX_WS_BUFFERED guard in send(). With at most 49 others in a room (MAX_ROOM_SIZE <= 50),
-// colluding members can add at most 49 x 48 KB past RELAY_BACKLOG in a window: about 3.4 MB in all, under the 4 MB at
-// which send() drops a receiver.
+// relayed bytes are also counted per receiver and sender (in windows of RELAY_WINDOW_MS); while a receiver's send buffer
+// is past RELAY_BACKLOG, the signals of a member that sent it more than RELAY_FAIR_BYTES in the window are not delivered
+// to it, rather than the receiver being dropped as stalled for what others sent it. The sender is not disconnected for
+// that: the receiver may be the one at fault, by not reading (a member can fill its own buffer on purpose) while asking
+// an honest member for answers. An honest member sends one peer an offer and its candidates (about 9 KB), a few times
+// at most in a window. While a receiver is behind its window does not start over, so until it has caught up each
+// sender adds at most RELAY_FAIR_BYTES: with at most 49 others in a room (MAX_ROOM_SIZE <= 50), about 3.4 MB in all,
+// under the 4 MB at which send() drops a receiver. A receiver that really stopped reading is still dropped: by the
+// heartbeat, or by that guard in send().
 const RELAY_WINDOW_MS = 10 * 1000;
 const RELAY_BACKLOG = 1024 * 1024;
 const RELAY_FAIR_BYTES = 48 * 1024;
 
 /**
- * Count a relay of `bytes` from socket `from` to socket `to`. When `to` is behind, cut off whoever sent it more than a
- * fair share in this window. False when `from` is cut off (then the signal is not delivered).
+ * Count a relay of `bytes` from socket `from` to socket `to`. False (the signal is not delivered) when `to` is behind
+ * and `from` has sent it more than a fair share in this window.
  */
 function relayAllowed(from, to, bytes, now) {
+  const behind = to.bufferedAmount > RELAY_BACKLOG;
   let inbound = to.inbound;
-  if (!inbound || now - inbound.since > RELAY_WINDOW_MS) inbound = to.inbound = { since: now, bytes: new Map() };
-  inbound.bytes.set(from, (inbound.bytes.get(from) || 0) + bytes);
-  if (to.bufferedAmount <= RELAY_BACKLOG) return true;
-  for (const [sender, n] of inbound.bytes) {
-    if (n <= RELAY_FAIR_BYTES) continue;
-    inbound.bytes.delete(sender);
-    sender.cutOff?.();
-  }
-  return !from.limited;
+  // Keyed by socket, weakly: senders that have gone are not kept alive by a receiver that stays behind.
+  if (!inbound || (now - inbound.since > RELAY_WINDOW_MS && !behind)) inbound = to.inbound = { since: now, bytes: new WeakMap() };
+  const sent = (inbound.bytes.get(from) || 0) + bytes;
+  inbound.bytes.set(from, sent);
+  return !behind || sent <= RELAY_FAIR_BYTES;
 }
 
 function armJoinDeadline(ws) {
@@ -1260,13 +1372,13 @@ async function handleJoin(ws, msg) {
   const password = msg.password == null ? '' : msg.password;
   // Without a secret (a client from before secrets existed) a join can use a free id, but never take over a live one.
   const secret = secretHash(msg.secret);
-  if (lookupLimiter.blocked(ws.ip)) {
+  if (lookupLimiter.blocked(ws.keys)) {
     send(ws, { type: 'error', code: 'rate-limited', message: LOOKUP_LIMITED });
     return;
   }
   const r = store.get(roomName);
   if (!r) {
-    lookupLimiter.fail(ws.ip);
+    lookupLimiter.fail(ws.keys);
     send(ws, { type: 'error', code: 'no-room', message: 'This room does not exist.' });
     return;
   }
@@ -1278,15 +1390,21 @@ async function handleJoin(ws, msg) {
   // Count the attempt before the (slow) password check, so a burst cannot get past the limit while earlier
   // attempts are still being evaluated. A correct password gives the attempt back. Open rooms cost nothing.
   const reserved = !!r.passwordHash;
-  if (reserved && !roomLimiter.reserve(ws.ip)) {
+  if (reserved && !roomLimiter.reserve(ws.keys)) {
     send(ws, { type: 'error', code: 'rate-limited', message: 'Too many wrong passwords. Try again in a few minutes.' });
     return;
   }
   let ok = false;
   try {
-    ok = await store.check(roomName, password);
+    ok = reserved ? await passwordChecks.run(() => store.check(roomName, password)) : await store.check(roomName, password);
+  } catch (err) {
+    if (!(err instanceof GateBusy)) throw err;
+    // Not checked at all: the attempt does not count. 'busy' is not final for the client, which tries again shortly.
+    roomLimiter.release(ws.keys);
+    send(ws, { type: 'error', code: 'busy', message: 'The server is busy. Trying again shortly.' });
+    return;
   } finally {
-    if (reserved && ok) roomLimiter.release(ws.ip);
+    if (reserved && ok) roomLimiter.release(ws.keys);
   }
   if (!ok) {
     send(ws, { type: 'error', code: 'bad-password', message: 'Wrong room password.' });
@@ -1400,15 +1518,15 @@ function originAllowed(req) {
   return false;
 }
 
-/** Is this client below its socket limit? Says so in the log (at most once a minute) when it is not. */
-function socketAllowed(key) {
-  const open = socketsPerClient.get(key) || 0;
-  if (open < MAX_SOCKETS_PER_CLIENT) return true;
+/** Is this client below its socket limit under each of its keys? Says so in the log (at most once a minute) when it is not. */
+function socketAllowed(keys) {
+  const full = keys.findIndex((key, i) => (socketsPerClient.get(key) || 0) >= MAX_SOCKETS_PER_CLIENT * PREFIX_SCALE[i]);
+  if (full < 0) return true;
   const now = Date.now();
   if (now - lastSocketCapLog > 60 * 1000) {
     lastSocketCapLog = now;
-    console.warn(`Refused a WebSocket: ${open} are already open from one client address (${key}). If every visitor shows `
-      + 'the same address, the server runs behind a proxy without TRUST_PROXY.');
+    console.warn(`Refused a WebSocket: ${socketsPerClient.get(keys[full])} are already open from one client address (${keys[full]}). `
+      + 'If every visitor shows the same address, the server runs behind a proxy without TRUST_PROXY.');
   }
   return false;
 }
@@ -1419,15 +1537,15 @@ const wss = new WebSocketServer({
   maxPayload: MAX_MESSAGE_BYTES,
   verifyClient: ({ req }, done) => {
     if (!originAllowed(req)) return done(false, 403, 'Forbidden origin');
-    if (!socketAllowed(limiterKey(clientIp(req)))) return done(false, 429, 'Too many connections');
+    if (!socketAllowed(clientKeys(req))) return done(false, 429, 'Too many connections');
     return done(true);
   },
 });
 
 wss.on('connection', (ws, req) => {
   ws.isAlive = true;
-  ws.ip = limiterKey(clientIp(req));
-  socketsPerClient.set(ws.ip, (socketsPerClient.get(ws.ip) || 0) + 1);
+  ws.keys = clientKeys(req);
+  for (const key of ws.keys) socketsPerClient.set(key, (socketsPerClient.get(key) || 0) + 1);
   armJoinDeadline(ws);
   ws.on('pong', () => { ws.isAlive = true; });
   let tokens = MSG_BURST;
@@ -1435,7 +1553,7 @@ wss.on('connection', (ws, req) => {
   let signalBytes = SIGNAL_BYTES_BURST;
   let signalRefilled = refilled;
   ws.limited = false;
-  // Also called by relayAllowed() for a member that floods another one.
+  // For a socket that sends more messages than MSG_BURST / MSG_REFILL_PER_SEC allow.
   ws.cutOff = () => {
     if (ws.limited) return;
     ws.limited = true;
@@ -1466,8 +1584,9 @@ wss.on('connection', (ws, req) => {
 
       switch (msg.type) {
         case 'time':
-          // Clock sync: echo client timestamp with server time.
-          send(ws, { type: 'time', c: msg.c, s: Date.now() });
+          // Clock sync: echo the client's timestamp with server time. Only a number: otherwise a client could make the
+          // server queue replies of up to 64 KB each for it, e.g. to fill its own send buffer on purpose (see relayAllowed).
+          if (typeof msg.c === 'number' && Number.isFinite(msg.c)) send(ws, { type: 'time', c: msg.c, s: Date.now() });
           break;
 
         case 'join':
@@ -1494,11 +1613,12 @@ wss.on('connection', (ws, req) => {
           }
           signalBytes = Math.min(SIGNAL_BYTES_BURST, signalBytes + ((now - signalRefilled) / 1000) * SIGNAL_BYTES_PER_SEC);
           signalRefilled = now;
-          signalBytes -= raw.length;
-          if (signalBytes < 0) {
-            ws.cutOff();
+          if (signalBytes < raw.length) {
+            // Over the budget: not relayed (and not charged), the sender stays (see SIGNAL_BYTES_BURST).
+            logBadMessage(ws, 'signal', new Error('over the signal byte budget, not relayed'));
             return;
           }
+          signalBytes -= raw.length;
           const target = live.get(ws.room)?.get(msg.to);
           if (target && relayAllowed(ws, target.ws, raw.length, now)) send(target.ws, { type: 'signal', from: ws.id, data: msg.data });
           break;
@@ -1526,9 +1646,11 @@ wss.on('connection', (ws, req) => {
   ws.on('close', () => {
     leave(ws);
     clearTimeout(ws.joinDeadline);
-    const open = (socketsPerClient.get(ws.ip) || 1) - 1;
-    if (open > 0) socketsPerClient.set(ws.ip, open);
-    else socketsPerClient.delete(ws.ip);
+    for (const key of ws.keys) {
+      const open = (socketsPerClient.get(key) || 1) - 1;
+      if (open > 0) socketsPerClient.set(key, open);
+      else socketsPerClient.delete(key);
+    }
   });
   ws.on('error', () => leave(ws));
 });
@@ -1559,8 +1681,11 @@ const heartbeat = setInterval(() => {
     ws.ping();
   }
   adminLimiter.sweep();
+  adminGlobalLimiter.sweep();
+  if (!adminGlobalLimiter.blocked(EVERYONE)) adminGlobalNoted = false;
   roomLimiter.sweep();
   lookupLimiter.sweep();
+  driveMissLimiter.sweep();
   const now = Date.now();
   for (const [t, exp] of adminSessions) if (exp < now) adminSessions.delete(t);
   for (const [k, at] of revokedMembers) if (now - at > TOKEN_TTL_MS) revokedMembers.delete(k); // older tokens have expired
