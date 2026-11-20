@@ -158,6 +158,20 @@ async function waitFor(page, fn, arg, timeout = 15000) {
   assert(/Twenty seconds/.test(b.subs) && /Twenty seconds/.test(a.subs), 'subtitles synced');
   assert(Math.abs(a.time - b.time) < 0.35, 'still in sync after track change');
 
+  // Bob hides the subtitles just for himself: Alice keeps hers; "Same as everyone" brings them back
+  const mine = (page, label) => page.locator('#m-subs-menu h4:text-is("Just for me") ~ button', { hasText: label }).first();
+  await ctl(bob, '#m-subs');
+  await mine(bob, 'Off').click();
+  await sleep(500);
+  a = await state(alice); b = await state(bob);
+  console.log('bob hid subtitles for himself:', JSON.stringify(a.subs), JSON.stringify(b.subs));
+  assert(b.subs === '' && /seconds/.test(a.subs), 'subtitles off only for bob');
+  await ctl(bob, '#m-subs');
+  await mine(bob, 'Same as everyone').click();
+  await sleep(500);
+  b = await state(bob);
+  assert(b.subs !== '', 'bob follows the room again');
+
   // External subtitle file shared from Bob to Alice
   await bob.setInputFiles('#sub-file', path.resolve(__dirname, 'fixtures', 'subs_it.ass'));
   await sleep(1000);

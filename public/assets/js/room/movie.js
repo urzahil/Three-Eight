@@ -174,9 +174,9 @@ export class Movie {
     return p.installCues(id, cues);
   }
 
-  /** The room's selected subtitle is an embedded track we lack, and someone has it: get it from them. */
+  /** The subtitle we show (the room's or our own) is an embedded track we lack, and someone has it: get it from them. */
   _wantCues() {
-    const id = this.sync.state.sub;
+    const id = this.sync.subtitle;
     const p = this.player;
     if (!id || !/^e\d+$/.test(id) || !p.file?.remote || !p.needsCues(id) || !this.swarm.hasCueHolder(id)) return;
     const failed = this._cueFail.get(id);
@@ -442,7 +442,7 @@ export class Movie {
     });
   }
 
-  _announce({ peer, prev, state }) {
+  _announce({ peer, prev, state, resetMine }) {
     const who = this.profileOf(peer.id).name;
     const by = state.by === peer.id ? who : this.profileOf(state.by).name;
     if (!sameMovie(prev.movie, state.movie)) {
@@ -458,7 +458,8 @@ export class Movie {
     }
     if (prev.sub !== state.sub) {
       const t = state.sub ? this.player.subtitles.get(state.sub) : null;
-      toast(state.sub ? `${by} turned on subtitles${t ? ': ' + t.label : ''}` : `${by} turned subtitles off`);
+      const mine = resetMine ? '. Your own subtitle choice was reset.' : '';
+      toast((state.sub ? `${by} turned on subtitles${t ? ': ' + t.label : ''}` : `${by} turned subtitles off`) + mine);
     }
   }
 

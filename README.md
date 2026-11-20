@@ -87,7 +87,7 @@ Click **Movie** in the room. You can:
 - **Stream from a friend's copy:** join the movie without having the file. Your browser receives movie data from other participants over WebRTC.
 - **Google Drive:** if an administrator has attached a Drive folder to the room, select a movie from it. The server streams it from Drive, and participants may share the movie data between browsers.
 
-Playback is synchronized for the room, including play/pause, seeking, audio-track selection, and subtitles. Movie volume is per person. Headphones are recommended to prevent movie audio from feeding back through your microphone.
+Playback is synchronized for the room, including play/pause, seeking, audio-track selection, and subtitles (which anyone can also turn off or change just for themselves). Movie volume is per person. Headphones are recommended to prevent movie audio from feeding back through your microphone.
 
 Your copy of a movie is offered to friends automatically; turn this off in **Settings → Share my movie file with the room**. See [Movie player](docs/movie-player.md) for sources, codecs, subtitles, and picture-in-picture.
 

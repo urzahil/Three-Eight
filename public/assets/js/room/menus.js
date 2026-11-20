@@ -60,22 +60,34 @@ export class MovieMenus {
       : [this._menuItem(this.player.loaded ? 'Default' : 'Load the movie first', true, () => {}, '', true)]));
     $('m-audio').hidden = audioTracks.length < 2;
 
-    // Subtitles
+    // Subtitles: the room's choice, then our own (which only changes what this browser shows).
     const sm = $('m-subs-menu');
     const sh = document.createElement('h4');
     sh.textContent = 'Subtitles (changes it for everyone)';
-    const items = [this._menuItem('Off', !s.sub, () => this.sync.setSubtitle(null))];
+    const tracks = [];
     for (const t of info?.subtitleTracks || []) {
       let note = '';
       if (t.unsupported) note = ['not available when streaming', 'could not be loaded'].includes(t.unsupported) ? t.unsupported : 'not supported';
       else if (t.waiting) note = 'loads when selected'; // streaming: read on demand
       else if (t.progress < 1) note = `loading ${Math.round(t.progress * 100)}%`;
       else if (t.source === 'external') note = 'file';
-      items.push(this._menuItem(t.label, s.sub === t.id, () => this.sync.setSubtitle(t.id), note, !!t.unsupported));
+      tracks.push({ id: t.id, label: t.label, note, disabled: !!t.unsupported });
     }
     // Shared subtitle files we haven't received yet.
     for (const f of s.subFiles) {
-      if (!info?.subtitleTracks.some((t) => t.id === f.id)) items.push(this._menuItem(f.name, s.sub === f.id, () => this.sync.setSubtitle(f.id), 'receiving…', true));
+      if (!info?.subtitleTracks.some((t) => t.id === f.id)) tracks.push({ id: f.id, label: f.name, note: 'receiving…', disabled: true });
+    }
+    const items = [this._menuItem('Off', !s.sub, () => this.sync.setSubtitle(null))];
+    for (const t of tracks) items.push(this._menuItem(t.label, s.sub === t.id, () => this.sync.setSubtitle(t.id), t.note, t.disabled));
+    if (tracks.length) {
+      const mine = this.sync.mySub;
+      const mh = document.createElement('h4');
+      mh.textContent = 'Just for me';
+      items.push(mh, this._menuItem('Same as everyone', mine === undefined, () => this.sync.setMySubtitle(undefined)));
+      if (s.sub) items.push(this._menuItem('Off', mine === null, () => this.sync.setMySubtitle(null)));
+      for (const t of tracks) {
+        if (t.id !== s.sub) items.push(this._menuItem(t.label, mine === t.id, () => this.sync.setMySubtitle(t.id), t.note, t.disabled));
+      }
     }
     // Subtitle files next to the movie on Drive (ones already shared show up above as normal entries).
     const dsubs = this._driveSubtitles();
