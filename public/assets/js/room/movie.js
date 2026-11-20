@@ -247,7 +247,7 @@ export class Movie {
       await this.player.load(file, { audioIndex: asRoom ? 0 : s.audio });
     } catch (err) {
       console.error(err);
-      toast(file.remote && err.remote ? err.message : 'Could not open this file: ' + (err.message || err), 'warn', err.permanent ? 25000 : 0);
+      toast(err.userMessage || (file.remote && err.remote ? err.message : 'Could not open this file: ' + (err.message || err)), 'warn', err.permanent ? 25000 : 0);
       this.player.unload();
       this.loadingMovie = false;
       this._renderStage();

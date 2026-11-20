@@ -296,12 +296,24 @@ export class MoviePlayer extends EventTarget {
       }
     }
 
-    await this._start(mode, startTime);
+    // Errors while the film first opens are handled here, awaited, rather than by the element's error listener:
+    // load() resolves once the film plays (in whichever mode worked) and rejects when none does, so the caller
+    // never announces a film that cannot play.
+    this._recovering = token; // the film whose errors are being handled; a stale recovery cannot clear it
+    try {
+      if (!(await this._start(mode, startTime)) && token === this._loadToken) {
+        const fatal = await this._recover(startTime);
+        if (fatal) throw Object.assign(new Error(fatal.text), { userMessage: fatal.text, permanent: fatal.long });
+      }
+    } finally {
+      if (this._recovering === token) this._recovering = null;
+    }
     if (token !== this._loadToken) return;
     this._emit('tracks');
     this._extractSubtitles(token);
   }
 
+  /** Start playing the film in `mode`. Resolves false when the element reported an error instead of loading. */
   async _start(mode, startTime) {
     // Swapping the source pauses the element; let listeners know it's not the user.
     this._emit('reloading');
@@ -322,17 +334,21 @@ export class MoviePlayer extends EventTarget {
       } catch {
         /* the element's own request will fail the same way and the error handling takes over */
       }
-      if (loadToken !== this._loadToken) return; // another film was loaded (or this one unloaded) meanwhile
+      if (loadToken !== this._loadToken) return false; // another film was loaded (or this one unloaded) meanwhile
     }
     const metadata = new Promise((resolve) => {
-      const done = () => {
-        this.video.removeEventListener('loadedmetadata', done);
-        this.video.removeEventListener('error', done);
-        resolve();
+      let timer;
+      const done = (ok) => {
+        clearTimeout(timer);
+        this.video.removeEventListener('loadedmetadata', loaded);
+        this.video.removeEventListener('error', failed);
+        resolve(ok);
       };
-      this.video.addEventListener('loadedmetadata', done);
-      this.video.addEventListener('error', done);
-      setTimeout(done, 15000);
+      const loaded = () => done(true);
+      const failed = () => done(false);
+      this.video.addEventListener('loadedmetadata', loaded);
+      this.video.addEventListener('error', failed);
+      timer = setTimeout(loaded, 15000); // slow, not failed: carry on and let a later error take over
     });
     if (mode === 'native') {
       if (this.file.remote) this.video.src = this.file.nativeUrl; // the browser streams it by itself
@@ -342,7 +358,7 @@ export class MoviePlayer extends EventTarget {
       }
       // The element picks its own audio decoder: every track counts as playable when it can be selected (or is the only one).
       if (this.nativeAudioApi || this.audioTracks.length <= 1) for (const t of this.audioTracks) t.supported = true;
-      await metadata;
+      if (!(await metadata)) return false;
       if (startTime) this.video.currentTime = startTime;
       this._applyNativeAudio();
       for (const tt of this.video.textTracks || []) if (tt !== this.nativeCaptions.track) tt.mode = 'disabled';
@@ -356,12 +372,13 @@ export class MoviePlayer extends EventTarget {
       const audio = at && this.audioTracks[this.audioIndex]?.mseSupported ? at : null;
       this.mseAudio = audio;
       await engine.start(this.videoTrack, audio, startTime);
-      await metadata;
+      if (!(await metadata)) return false;
       if (this.audioTrackList.length && !audio) this._emit('notice', { text: 'This audio track cannot be played in your browser — playing without sound.' });
     }
     this._emit('status', { text: '' });
     this._showCues(true); // native caption times depend on the mode
     this._emit('modechange', { mode });
+    return true;
   }
 
   _applyNativeAudio() {
@@ -604,60 +621,75 @@ export class MoviePlayer extends EventTarget {
     return true;
   }
 
+  /** The element (or the MSE engine) failed while playing. Ignored while load() or another recovery handles it. */
   async _onVideoError() {
-    if (!this.file) return;
-    const err = this.video.error;
-    console.warn('Video error', err);
-    const time = this.time;
-    if (this.mode === 'native' && this.file.prepareNative && !this.sessionRetried && (err?.code === 2 || err?.code === 4)) {
-      // The cookie may be missing or expired: renew it once and try again before looking for other causes.
-      this.sessionRetried = true;
-      const file = this.file;
-      let renewed = true;
+    const token = this._loadToken;
+    if (!this.file || this._recovering === token) return;
+    this._recovering = token;
+    let fatal;
+    try {
+      fatal = await this._recover(this.time);
+    } finally {
+      if (this._recovering === token) this._recovering = null;
+    }
+    if (fatal && token === this._loadToken) this._emit('fatal', fatal);
+  }
+
+  /**
+   * After a playback error, try what may still work, in order, until something plays: renew the Drive cookie,
+   * ask the server why it failed, switch to the other player. Resolves null once playing again (or when another
+   * film was loaded meanwhile), else { text, long } to tell the user.
+   */
+  async _recover(time) {
+    const token = this._loadToken;
+    for (;;) {
+      const err = this.video.error;
+      if (err) console.warn('Video error', err);
+      const step = await this._nextStep(err);
+      if (token !== this._loadToken) return null;
+      if (step.fatal) return step.fatal;
+      if (step.notice) this._emit('notice', { text: step.notice });
+      let ok;
       try {
-        await file.prepareNative(true);
-      } catch {
-        renewed = false;
+        ok = await this._start(step.mode, time);
+      } catch (e) {
+        console.warn(`Could not switch to ${step.mode} playback`, e);
+        ok = false;
       }
-      if (this.file !== file) return;
-      if (renewed) {
-        await this._start('native', time);
+      if (token !== this._loadToken) return null;
+      if (ok) {
         this._emit('tracks');
-        return;
+        return null;
       }
     }
-    if (this.mode === 'native' && this.file.remote && !this.diagnosed && (err?.code === 2 || err?.code === 4)) {
+  }
+
+  /** What to try after error `err`: { mode, notice? } to start again, or { fatal: { text, long } }. */
+  async _nextStep(err) {
+    const file = this.file;
+    const net = err?.code === 2 || err?.code === 4;
+    if (this.mode === 'native' && file.prepareNative && !this.sessionRetried && net) {
+      // The cookie may be missing or expired: renew it once and try again before looking for other causes.
+      this.sessionRetried = true;
+      try {
+        await file.prepareNative(true);
+        return { mode: 'native' };
+      } catch {
+        /* go on below */
+      }
+    }
+    if (this.mode === 'native' && file.remote && !this.diagnosed && net) {
       // The element downloads by itself and only says "network error". Find out whether the server is
       // refusing us (or we are offline) before trying anything else.
       this.diagnosed = true;
-      const file = this.file;
       const why = await file.diagnoseFailure?.();
-      if (this.file !== file) return;
-      if (why) {
-        this._emit('fatal', { text: why.message, long: !!why.permanent });
-        return;
-      }
+      if (why) return { fatal: { text: why.message, long: !!why.permanent } };
     }
     if (this.mode === 'native' && this.mseOk && !this.triedModes.has('mse')) {
-      this._emit('notice', { text: 'Native playback failed, switching to the built-in player…' });
-      if (await this._fallback('mse', time)) return;
-    } else if (this.mode === 'mse' && !this.triedModes.has('native') && (!this.file.remote || this.file.nativeUrl)) {
-      if (await this._fallback('native', time)) return;
+      return { mode: 'mse', notice: 'Native playback failed, switching to the built-in player…' };
     }
-    this._emit('fatal', { text: 'Your browser cannot play this file' + (err?.message ? `: ${err.message}` : '.') });
-  }
-
-  /** Switch to the other player after a failure. False if that failed too (nobody awaits the error handler). */
-  async _fallback(mode, time) {
-    const file = this.file;
-    try {
-      await this._start(mode, time);
-    } catch (err) {
-      console.warn(`Could not switch to ${mode} playback`, err);
-      return this.file !== file; // another film meanwhile: nothing to report
-    }
-    this._emit('tracks');
-    return true;
+    if (this.mode === 'mse' && !this.triedModes.has('native') && (!file.remote || file.nativeUrl)) return { mode: 'native' };
+    return { fatal: { text: 'Your browser cannot play this file' + (err?.message ? `: ${err.message}` : '.'), long: false } };
   }
 
   _onEngineError(err) {

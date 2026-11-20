@@ -83,6 +83,54 @@ const BASE = process.env.BASE || 'http://localhost:4567';
     if (!(res.t1 > 1.5 && res.t2 > res.t1 && res.t3 > 25 && res.t4 > 2 && res.t4 < 5)) { failed = true; console.log('  -> FAILED timing checks'); }
     await page.close();
   }
+  // Files nothing can play: load() must reject (with a message for the user), not resolve as if the film were
+  // playing, and must not leave the player half loaded. The room relies on that to not announce such a film.
+  {
+    const fs = require('fs');
+    const os = require('os');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'three-eight-broken-'));
+    const crypto = require('crypto');
+    const real = fs.readFileSync(process.argv[2]);
+    const broken = {
+      'empty.mp4': Buffer.alloc(0),
+      'noise.mp4': crypto.randomBytes(256 * 1024),
+      'cut.mkv': real.subarray(0, 300), // a Matroska header and nothing after it
+    };
+    const page = await browser.newPage();
+    page.on('pageerror', (e) => console.log('  [pageerror]', e.message));
+    await page.goto(BASE + '/healthz');
+    await page.setContent('<input type=file id=f multiple><div id=stage style="position:relative;width:640px;height:360px"><video id=v muted></video><div id=o></div></div>');
+    const files = Object.entries(broken).map(([name, data]) => {
+      fs.writeFileSync(path.join(dir, name), data);
+      return path.join(dir, name);
+    });
+    await page.setInputFiles('#f', files);
+    const out = await page.evaluate(async (base) => {
+      const { MoviePlayer } = await import(base + '/assets/js/player/player.js');
+      const p = new MoviePlayer(document.getElementById('v'), document.getElementById('o'));
+      const res = [];
+      for (const file of document.getElementById('f').files) {
+        let fatal = 0;
+        const onFatal = () => fatal++;
+        p.addEventListener('fatal', onFatal);
+        const r = await Promise.race([
+          p.load(file).then(() => ({ resolved: true }), (err) => ({ rejected: true, message: err.userMessage || err.message })),
+          new Promise((ok) => setTimeout(() => ok({ hung: true }), 40000)),
+        ]);
+        p.removeEventListener('fatal', onFatal);
+        res.push({ name: file.name, ...r, fatal });
+        p.unload();
+      }
+      return res;
+    }, BASE);
+    fs.rmSync(dir, { recursive: true, force: true });
+    for (const r of out) {
+      console.log('MEASURE broken file', JSON.stringify(r));
+      if (!r.rejected || !r.message) { failed = true; console.log(`  -> FAILED: ${r.name} must make load() reject with a message`); }
+      if (r.fatal) { failed = true; console.log(`  -> FAILED: ${r.name} also fired 'fatal' during load()`); }
+    }
+    await page.close();
+  }
   await browser.close();
   process.exit(failed ? 1 : 0);
 })();
