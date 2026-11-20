@@ -180,6 +180,64 @@ test('a short message goes out at once', () => {
   assert.deepEqual(dc.sent, ['{"type":"a"}']);
 });
 
+test('a short message waits in the queue while the channel is over the high-water mark', () => {
+  const dc = fakeChannel();
+  const s = new ChunkSender(dc);
+  dc.bufferedAmount = 1024 * 1024 + 1; // stalled: the browser buffer is full
+  assert.equal(s.send('{"type":"a"}'), true);
+  assert.deepEqual(dc.sent, []);
+  assert.equal(s.queue.length, 1);
+  dc.drain(); // bufferedamountlow
+  s.pump();
+  assert.deepEqual(dc.sent, ['{"type":"a"}']);
+  assert.equal(s.queue.length, 0);
+  assert.equal(s.queued, 0);
+  assert.equal(s.send('{"type":"b"}'), true); // recovered: straight out again
+  assert.deepEqual(dc.sent, ['{"type":"a"}', '{"type":"b"}']);
+});
+
+test('short messages on a stalled channel overflow the bounded queue instead of growing the browser buffer', () => {
+  const dc = fakeChannel();
+  const s = new ChunkSender(dc, 1000);
+  let overflows = 0;
+  s.onoverflow = () => overflows++;
+  dc.bufferedAmount = 1024 * 1024 + 1;
+  const msg = '{"type":"state","t":12345}'; // 26 chars
+  let ok = 0;
+  for (let k = 0; k < 100; k++) if (s.send(msg)) ok++;
+  assert.equal(dc.sent.length, 0);
+  assert.ok(overflows >= 1);
+  assert.ok(s.queued <= 1000);
+  assert.ok(ok < 100);
+});
+
+test('a short message whose send throws is reported, not thrown', () => {
+  const dc = fakeChannel();
+  const s = new ChunkSender(dc);
+  dc.send = () => {
+    const err = new Error('send queue full');
+    err.name = 'OperationError';
+    throw err;
+  };
+  assert.equal(s.send('{"type":"a"}'), false);
+  assert.equal(s.queue.length, 0);
+});
+
+test('queued messages are dropped when the channel closes, and nothing is sent after', () => {
+  const dc = fakeChannel();
+  const s = new ChunkSender(dc);
+  dc.bufferedAmount = 1024 * 1024 + 1;
+  s.send('{"type":"a"}');
+  s.send('{"type":"b"}');
+  dc.readyState = 'closed';
+  s.clear(); // what the channel's onclose does
+  dc.drain();
+  s.pump();
+  assert.deepEqual(dc.sent, []);
+  assert.equal(s.queued, 0);
+  assert.equal(s.send('{"type":"c"}'), false);
+});
+
 test('send reports a closed channel', () => {
   const dc = fakeChannel();
   dc.readyState = 'closed';

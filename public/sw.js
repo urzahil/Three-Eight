@@ -1,7 +1,8 @@
 // Service worker: makes Three-Eight installable as an app and lets the page itself open without a connection.
 // Network first: the server revalidates every file (Cache-Control: no-cache), so updates show up on the next load,
 // and the cache is used only when the network fails. Calls, signaling, the API and Drive movies are never touched.
-const CACHE = 'three-eight-shell-v2'; // v2: drops a shell that v1 may have replaced with /healthz
+const CACHE_PREFIX = 'three-eight-';
+const CACHE = `${CACHE_PREFIX}shell-v2`; // v2: drops a shell that v1 may have replaced with /healthz
 // Every room path serves the same index.html: keep one copy of it, under "/".
 const SHELL_KEY = '/';
 // Paths that are not rooms (server/store.js RESERVED).
@@ -11,7 +12,8 @@ self.addEventListener('install', () => self.skipWaiting());
 
 self.addEventListener('activate', (event) => {
   event.waitUntil((async () => {
-    for (const key of await caches.keys()) if (key !== CACHE) await caches.delete(key);
+    // Only our own older caches: other apps served from this origin keep theirs.
+    for (const key of await caches.keys()) if (key.startsWith(CACHE_PREFIX) && key !== CACHE) await caches.delete(key);
     await self.clients.claim();
   })());
 });

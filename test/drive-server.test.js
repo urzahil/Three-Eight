@@ -229,3 +229,12 @@ test('metadata calls share one rate for all callers; past the waiting room they 
   google.addFile(id(910), 'later.mp4', id(900), Buffer.from('x'), 'video/mp4');
   assert.strictEqual((await drive.fileMeta(id(910))).name, 'later.mp4');
 });
+
+test('kindOf: a shortcut is never a video or subtitle, whatever its name', () => {
+  const { kindOf } = require('../server/drive');
+  const SHORTCUT = 'application/vnd.google-apps.shortcut';
+  assert.strictEqual(kindOf({ name: 'movie.mkv', mimeType: SHORTCUT }), null);
+  assert.strictEqual(kindOf({ name: 'movie.srt', mimeType: SHORTCUT }), null);
+  assert.strictEqual(kindOf({ name: 'movie.mkv', mimeType: 'application/octet-stream' }), 'video');
+  assert.strictEqual(kindOf({ name: 'x', mimeType: 'application/vnd.google-apps.folder' }), 'folder');
+});

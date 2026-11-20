@@ -22,6 +22,8 @@ const fs = require('fs');
 const MiB = 1024 * 1024;
 const ID_RE = /^[A-Za-z0-9_-]{10,200}$/;
 const FOLDER = 'application/vnd.google-apps.folder';
+// A shortcut points at another file and has no content of its own: we don't resolve them, so they are never listed.
+const SHORTCUT = 'application/vnd.google-apps.shortcut';
 const VIDEO_EXT = new Set(['mkv', 'mp4', 'm4v', 'mov', 'webm', 'avi']);
 const SUB_EXT = new Set(['srt', 'vtt', 'ass', 'ssa']);
 const SCOPE = 'https://www.googleapis.com/auth/drive.readonly';
@@ -51,6 +53,7 @@ const ext = (name) => (String(name).match(/\.([A-Za-z0-9]+)$/)?.[1] || '').toLow
 /** What a Drive entry is for us: 'folder', 'video', 'subtitle', or null (documents, images, shortcuts, ...). */
 function kindOf(f) {
   if (f.mimeType === FOLDER) return 'folder';
+  if (f.mimeType === SHORTCUT) return null; // even one named movie.mkv
   const e = ext(f.name);
   if (String(f.mimeType).startsWith('video/') || VIDEO_EXT.has(e)) return 'video';
   if (SUB_EXT.has(e)) return 'subtitle';

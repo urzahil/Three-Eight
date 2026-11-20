@@ -171,8 +171,16 @@ export class ChunkSender {
   /** Returns false if the channel is not open, or the message did not fit in the queue. */
   send(s) {
     if (this.dc.readyState !== 'open') return false;
-    if (s.length <= CHUNK && !this.queue.length) {
-      this.dc.send(s);
+    // The shortcut is only taken while the channel is draining: otherwise short messages too wait in the bounded
+    // queue, so a channel that stays open but stops draining ends in onoverflow (a reconnect) instead of growing
+    // the browser's buffer without limit.
+    if (s.length <= CHUNK && !this.queue.length && this.dc.bufferedAmount <= DATA_HIGH) {
+      try {
+        this.dc.send(s);
+      } catch {
+        this.clear();
+        return false;
+      }
       return true;
     }
     if (this.queued + s.length > this.maxQueued) {
