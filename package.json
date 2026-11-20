@@ -10,7 +10,7 @@
     "test:browser": "node test/run-browser.js"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=22"
   },
   "license": "GPL-3.0",
   "dependencies": {

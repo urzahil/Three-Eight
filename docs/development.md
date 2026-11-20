@@ -1,6 +1,6 @@
 # Development and testing
 
-Three-Eight is a Node.js application with the `ws` runtime dependency and Playwright-based browser tests. Node.js 18 or newer is required (the Docker image uses Node 22).
+Three-Eight is a Node.js application with the `ws` runtime dependency and Playwright-based browser tests. Node.js 22 or newer is required (the Docker image uses Node 24).
 
 ## Local development
 
