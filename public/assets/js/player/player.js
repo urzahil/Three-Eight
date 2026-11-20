@@ -417,20 +417,21 @@ export class MoviePlayer extends EventTarget {
     return this.renderer.delay;
   }
 
-  /** Add an external subtitle file (text). Returns its id. */
-  addExternalSubtitle(id, name, text) {
+  /** Add an external subtitle file (text): 'external' if the room shares it, 'private' if only we see it. Returns its id. */
+  addExternalSubtitle(id, name, text, source = 'external') {
     if (this.subtitles.has(id)) return id;
     const cues = parseSubtitleFile(name, text);
     const label = name.replace(/\.(srt|vtt|ass|ssa|sub|txt)$/i, '');
-    this.subtitles.set(id, { id, label, cues, source: 'external', progress: 1 });
+    this.subtitles.set(id, { id, label, cues, source, progress: 1 });
     if (this.subtitleId === id) this._showCues(true);
     this._emit('tracks');
     return id;
   }
 
-  /** Forget an external subtitle file (the room stopped sharing it, or moved on to another movie). */
+  /** Forget an external or private subtitle file (no longer shared, or the room moved on to another movie). */
   removeExternalSubtitle(id) {
-    if (this.subtitles.get(id)?.source !== 'external') return;
+    const source = this.subtitles.get(id)?.source;
+    if (source !== 'external' && source !== 'private') return;
     this.subtitles.delete(id);
     if (this.subtitleId === id) this._showCues(true);
     this._emit('tracks');

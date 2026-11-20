@@ -493,7 +493,24 @@ async function adminApi(base) {
       await seekAll(100);
       t = await settle([va, vb, vc], 99.5);
       assert(t.every((x) => x.time > 99.5) && Math.max(...t.map((x) => x.time)) - Math.min(...t.map((x) => x.time)) < 0.5, 'seek in sync: ' + JSON.stringify(t.map((x) => x.time)));
-      await sleep(3000);
+      // Measure when nothing is on its way anywhere. In the middle of transfers, a piece that the server has sent but a
+      // viewer has not finished receiving counts in bytes.total (from the response headers) but not yet as needed,
+      // and the slower the machine, the more of those there are at any moment. With 40 s buffered ahead, the viewers
+      // have read to the end of the film (160 s) soon after the jump to 100 s, and then they stop fetching. The swarm
+      // maps cover the viewers' own server fetches; bytes.total must also stay put, for any other read of the film.
+      const inFlight = (p) => p.evaluate(() => {
+        const f = room.swarm.film;
+        return f ? f.acqs.size + f.jobs.size + f.inflight.size + f.serverInflight.size : 0;
+      });
+      const quietFrom = Date.now();
+      for (let calm = 0, last = -1; calm < 3; ) {
+        assert(Date.now() - quietFrom < 90000, 'pieces were still in flight 90 s after the jump');
+        const idle = (await Promise.all([va, vb, vc].map(inFlight))).every((n) => n === 0);
+        calm = idle && bytes.total === last ? calm + 1 : 0;
+        last = bytes.total;
+        await sleep(300);
+      }
+      const quietAfter = (Date.now() - quietFrom) / 1000;
       const unique = (() => {
         const r = [...bytes.ranges].sort((x, y) => x[0] - y[0]);
         let n = 0, hi = -1;
@@ -506,7 +523,7 @@ async function adminApi(base) {
       for (const x of stats) for (const [f0, l0] of x.cached) for (let k = f0; k <= l0; k++) needed.add(k);
       const neededBytes = [...needed].reduce((n, k) => n + Math.min(1048576, big.length - k * 1048576), 0);
       const ratio = bytes.total / big.length;
-      console.log(`MEASURE 3 viewers, ${(big.length / 1048576).toFixed(1)} MiB film: our server sent ${(bytes.total / 1048576).toFixed(2)} MiB in ${bytes.ranges.length} requests = ${ratio.toFixed(2)} x the file size; the viewers needed ${(neededBytes / 1048576).toFixed(2)} MiB of it, so ${(bytes.total / neededBytes).toFixed(2)} x what was needed; duplicated bytes: ${(bytes.total / unique).toFixed(2)} x`);
+      console.log(`MEASURE 3 viewers, ${(big.length / 1048576).toFixed(1)} MiB film: our server sent ${(bytes.total / 1048576).toFixed(2)} MiB in ${bytes.ranges.length} requests = ${ratio.toFixed(2)} x the file size; the viewers needed ${(neededBytes / 1048576).toFixed(2)} MiB of it, so ${(bytes.total / neededBytes).toFixed(2)} x what was needed; duplicated bytes: ${(bytes.total / unique).toFixed(2)} x; nothing in flight after ${quietAfter.toFixed(1)} s`);
       console.log('MEASURE swarm per viewer (bytes from server / from friends / served to friends):', stats.map((x) => `${x.server}/${x.peers}/${x.served}`).join('  '), ' pieces cached:', JSON.stringify(stats.map((x) => x.cached)));
       // the people list says where each viewer gets the film from
       await va.evaluate(() => document.querySelector('.tab[data-tab="people"]').click());

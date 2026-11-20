@@ -30,14 +30,15 @@ export class LocalMedia extends EventTarget {
     return c;
   }
 
-  async _get(kind) {
+  /** `fallback`: if the chosen device is gone, open the default one instead of failing. */
+  async _get(kind, fallback = true) {
     if (!navigator.mediaDevices?.getUserMedia) throw Object.assign(new Error('Camera and microphone need HTTPS.'), { name: 'NotSupportedError' });
     const constraints = kind === 'audio' ? { audio: this._audioConstraints() } : { video: this._videoConstraints() };
     try {
       const s = await navigator.mediaDevices.getUserMedia(constraints);
       return s.getTracks()[0];
     } catch (err) {
-      if (err.name === 'OverconstrainedError' && this.deviceIds[kind]) {
+      if (fallback && err.name === 'OverconstrainedError' && this.deviceIds[kind]) {
         // Saved device is gone: fall back to the default one.
         this.deviceIds[kind] = '';
         return this._get(kind);
@@ -96,9 +97,9 @@ export class LocalMedia extends EventTarget {
     return t;
   }
 
-  async _acquire(kind, replace = false) {
+  async _acquire(kind, replace = false, fallback = true) {
     try {
-      const t = await this._get(kind);
+      const t = await this._get(kind, fallback);
       this.errors[kind] = null;
       return this._adopt(kind, t, replace);
     } catch (err) {
@@ -148,13 +149,45 @@ export class LocalMedia extends EventTarget {
     return this.camOn === on;
   }
 
-  async setDevice(kind, deviceId) {
+  /**
+   * Switch to another microphone or camera. Resolves to false if that device could not be opened: the previous
+   * one is then reopened (if that fails too, the device is off). With the camera off, the choice is only
+   * remembered for when it is turned on. Switches run one after another.
+   */
+  setDevice(kind, deviceId) {
+    const run = () => this._setDevice(kind, deviceId);
+    const done = (this._deviceSwitch || Promise.resolve()).then(run, run);
+    this._deviceSwitch = done.catch(() => {});
+    return done;
+  }
+
+  async _setDevice(kind, deviceId) {
+    const prop = kind === 'audio' ? 'audioTrack' : 'videoTrack';
+    const old = this[prop];
+    const previousId = this.currentDeviceId(kind);
     this.deviceIds[kind] = deviceId;
-    // replace: the new track takes over from the current one (which is stopped), if the device could be opened.
-    if (kind === 'audio') await this._acquire('audio', true);
-    else if (this.camOn) await this._acquire('video', true);
+    let ok = true;
+    if (!this.stopped && (kind === 'audio' || this.camOn)) {
+      // Stop the current device before opening the new one: phones (and some drivers) can't run two cameras at
+      // once, so opening the new one first fails (NotReadableError on Android) or ends the current one (iOS).
+      // Until the new track is in, the stopped one stays in place (no "camera off" flicker for anyone).
+      old?.stop();
+      await this._acquire(kind, true, false); // no silent fallback to the default device: go back to the previous one
+      ok = !this.errors[kind];
+      if (!ok) {
+        this.deviceIds[kind] = previousId;
+        if (old && this[prop] === old) {
+          await this._acquire(kind, true);
+          if (this[prop] === old) {
+            this[prop] = null;
+            if (kind === 'video') this.camOn = false;
+          }
+        }
+      }
+    }
     this._watchEnded();
     this._emit(kind);
+    return ok;
   }
 
   async setProcessing(on) {

@@ -237,8 +237,11 @@
 
   <dialog id="settings-dialog" class="dialog">
     <form method="dialog" class="stack">
-      <h2>Settings</h2>
-      <label>Your name <input id="set-name" maxlength="40"></label>
+      <div class="dialog-head">
+        <h2>Settings</h2>
+        <p class="about"><span id="app-version" title="Three-Eight version">v3.4.3</span> · <a href="https://github.com/urzahil/Three-Eight" target="_blank" rel="noopener noreferrer">GitHub</a></p>
+      </div>
+      <label>Your name <input id="set-name" maxlength="40" autofocus></label>
       <label>Interface style <select id="set-ui" data-theme-select></select></label>
       <label>Microphone <select id="set-audio-dev"></select></label>
       <label>Camera <select id="set-video-dev"></select></label>
@@ -268,6 +271,7 @@
 
   <div id="toasts" class="toasts" aria-live="polite"></div>
   <input id="sub-file" type="file" accept=".srt,.vtt,.ass,.ssa,text/vtt" hidden>
+  <input id="my-sub-file" type="file" accept=".srt,.vtt,.ass,.ssa,text/vtt" hidden>
 
   <script type="module" src="/assets/js/app.js"></script>
 </body>

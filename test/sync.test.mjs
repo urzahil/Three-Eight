@@ -279,6 +279,8 @@ test('seek latency: one listener per seek, and a seek that took ages is not lear
   player.addEventListener = (t, f) => { if (t === 'seeked') listeners++; add(t, f); };
   player.removeEventListener = (t, f) => { if (t === 'seeked') listeners--; remove(t, f); };
   player.seek = () => {};
+  player.pause = () => {};
+  player.play = async () => {};
   let now = 0;
   sync._clock = () => now; // (performance.now itself is read-only on some Node versions)
   sync._seekTo(10);
@@ -292,4 +294,85 @@ test('seek latency: one listener per seek, and a seek that took ages is not lear
   now += 500;
   player.dispatchEvent(new Event('seeked'));
   assert(Math.abs(sync.seekLatency - (0.15 * 0.6 + 0.5 * 0.4)) < 1e-9);
+});
+
+/** A sync whose player has the room's movie loaded, with subtitle tracks e0, e1 and file x1. */
+function loadedSync(t) {
+  const r = subSync(t);
+  const { sync, player, peer } = r;
+  Object.assign(player, { loaded: true, time: 12.5, playbackRate: 1, audioIndex: 1, audioTracks: [{}, {}], subtitleId: null });
+  player.subtitles = new Map([['e0', {}], ['e1', {}], ['x1', {}]]);
+  player.setSubtitle = (id) => { player.subtitleId = id; };
+  player.seek = () => {};
+  player.pause = () => {};
+  player.play = async () => {};
+  player.video = { readyState: 4 };
+  sync.localFile = { name: 'A.mkv', size: 100, duration: 60 };
+  sync._onMessage(peer, { type: 'sync-state', state: good() }); // the room shows e0
+  return r;
+}
+
+test('own subtitle choice: off or another track just here, never sent to the room', (t) => {
+  const { sync, player } = loadedSync(t);
+  const sent = [];
+  sync.mesh.broadcast = (m) => sent.push(m);
+  assert.equal(player.subtitleId, 'e0');
+  sync.setMySubtitle(null);
+  assert.equal(player.subtitleId, null);
+  sync.setMySubtitle('e1');
+  assert.equal(player.subtitleId, 'e1');
+  assert.equal(sync.state.sub, 'e0', 'the room keeps its track');
+  assert.equal(sent.length, 0);
+  sync.setMySubtitle(undefined);
+  assert.equal(player.subtitleId, 'e0', 'following the room again');
+  sync.setMySubtitle('e1');
+  sync.setMySubtitle('e0'); // the room's own track: same as following it
+  assert.equal(sync.mySub, undefined);
+});
+
+test('own subtitle choice survives other room changes, and resets when the room picks another subtitle', (t) => {
+  const { sync, player, peer } = loadedSync(t);
+  let reset = null;
+  sync.addEventListener('remote-change', (e) => { reset = e.detail.resetMine; });
+  sync.setMySubtitle(null);
+  sync._onMessage(peer, { type: 'sync-state', state: good({ seq: 4, paused: true }) });
+  assert.equal(reset, false);
+  assert.equal(player.subtitleId, null, 'a pause keeps it');
+  sync._onMessage(peer, { type: 'sync-state', state: good({ seq: 5, sub: 'e1' }) });
+  assert.equal(reset, true);
+  assert.equal(sync.mySub, undefined);
+  assert.equal(player.subtitleId, 'e1', 'the room\'s new choice shows here too');
+  sync.setMySubtitle('x1');
+  sync._onMessage(peer, { type: 'sync-state', state: good({ seq: 6, sub: 'e1', movie: { name: 'B.mkv', size: 200, duration: 90 } }) });
+  assert.equal(sync.mySub, undefined, 'another movie resets it');
+});
+
+test('choosing a subtitle for the room also clears our own choice', (t) => {
+  const { sync, player } = loadedSync(t);
+  sync.setMySubtitle('e1');
+  sync.setSubtitle('x1');
+  assert.equal(sync.mySub, undefined);
+  assert.equal(player.subtitleId, 'x1');
+  sync.setMySubtitle(null);
+  sync.addSubtitleFile({ id: 'x2', name: 'b.srt', text: '' }); // sharing a file turns it on for everyone, us included
+  assert.equal(sync.mySub, undefined);
+});
+
+test('a subtitle file loaded just for us is shown here only, kept while the room changes subtitles, dropped with the movie', (t) => {
+  const { sync, player, peer } = loadedSync(t);
+  const sent = [];
+  sync.mesh.broadcast = (m) => sent.push(m);
+  player.addExternalSubtitle = (id, name, text, source) => { player.subs.set(id, { name, text, source }); player.subtitles.set(id, {}); };
+  player.removeExternalSubtitle = (id) => { player.subs.delete(id); player.subtitles.delete(id); };
+  sync.addMySubtitleFile({ id: 'p1', name: 'mine.srt', text: 'x' });
+  assert.equal(player.subs.get('p1').source, 'private');
+  assert.equal(player.subtitleId, 'p1');
+  assert.equal(sent.length, 0, 'nothing sent to the room');
+  assert.equal(sync.state.subFiles.some((f) => f.id === 'p1'), false);
+  sync._onMessage(peer, { type: 'sync-state', state: good({ seq: 4, sub: 'e1' }) });
+  assert.equal(player.subtitleId, 'e1', 'the room\'s new choice replaces ours');
+  assert(player.subs.has('p1'), 'but the file stays available to pick again');
+  sync._onMessage(peer, { type: 'sync-state', state: good({ seq: 5, sub: null, subFiles: [], movie: { name: 'B.mkv', size: 200, duration: 90 } }) });
+  assert.equal(player.subs.has('p1'), false, 'another movie drops it');
+  assert.equal(sync.myFiles.size, 0);
 });

@@ -1,12 +1,12 @@
 {
   "name": "three-eight",
-  "version": "1.0.0",
+  "version": "3.4.3",
   "description": "Peer-to-peer video meetups with synchronized movie watching, running entirely in the browser.",
   "main": "server/server.js",
   "private": true,
   "scripts": {
     "start": "node server/server.js",
-    "test": "node --test test/server.test.js test/parsers.test.mjs test/remotefile.test.mjs test/drive.test.mjs test/swarm.test.mjs test/sync.test.mjs test/mesh.test.mjs test/media.test.mjs test/mse.test.mjs test/drive-server.test.js",
+    "test": "node --test test/server.test.js test/version.test.js test/parsers.test.mjs test/remotefile.test.mjs test/drive.test.mjs test/swarm.test.mjs test/sync.test.mjs test/mesh.test.mjs test/media.test.mjs test/mse.test.mjs test/drive-server.test.js",
     "test:browser": "node test/run-browser.js"
   },
   "engines": {
