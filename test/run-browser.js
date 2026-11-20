@@ -147,6 +147,10 @@ async function runOne(s) {
   const secs = ((Date.now() - t0) / 1000).toFixed(1);
   console.log(`${status}  ${s.name.padEnd(16)} ${secs}s${note ? '  (' + note + ')' : ''}`);
   if (status === 'FAIL') console.log(`----- output of ${s.name} -----\n${log.join('').trimEnd()}\n----- end of ${s.name} -----`);
+  else {
+    // A passing check still shows its measurements, so that the log shows how close they came to their limits.
+    for (const line of log.join('').split('\n')) if (line.startsWith('MEASURE ')) console.log(`      ${line.trimEnd()}`);
+  }
   return status === 'PASS';
 }
 
