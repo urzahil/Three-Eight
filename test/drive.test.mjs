@@ -168,6 +168,156 @@ test('DriveClient: endSession clears the cookie (keepalive) and later sessions a
   }
 });
 
+/**
+ * A fetch whose session POSTs stay pending until released, honouring `signal`, and a cookie jar that applies
+ * Set-Cookie in the order responses arrive, as a browser would.
+ */
+function heldFetch() {
+  const log = [];
+  const held = [];
+  const jar = { cookie: null };
+  const fetch = (url, init) => {
+    const auth = init.headers?.Authorization ?? null;
+    log.push([init.method, auth]);
+    if (init.method === 'DELETE') {
+      jar.cookie = null;
+      return Promise.resolve(new Response(null, { status: 204 }));
+    }
+    return new Promise((resolve, reject) => {
+      const h = {
+        auth,
+        aborted: false,
+        release() {
+          if (h.aborted) return; // the browser drops the response of an aborted request: no cookie
+          jar.cookie = auth;
+          resolve(new Response(null, { status: 204 }));
+        },
+      };
+      init.signal?.addEventListener('abort', () => {
+        h.aborted = true;
+        reject(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+      });
+      held.push(h);
+    });
+  };
+  return { fetch, log, held, jar };
+}
+const tick = () => new Promise((r) => setTimeout(r, 0));
+
+test('DriveClient: leaving while the session POST is pending leaves the cookie cleared', async () => {
+  const realFetch = globalThis.fetch;
+  const f = heldFetch();
+  globalThis.fetch = f.fetch;
+  try {
+    const d = new DriveClient({ room: 'My Room', token: 't1', folder: 'ROOTFOLDER_0001' });
+    const waiting = d.ensureSession();
+    await tick();
+    assert.equal(f.held.length, 1);
+    d.endSession();
+    f.held[0].release(); // the server's answer arrives after the DELETE was sent
+    await assert.rejects(waiting, { name: 'AbortError' });
+    await tick();
+    await tick();
+    assert.equal(f.jar.cookie, null);
+    assert.equal(f.log.filter(([m]) => m === 'DELETE').length, 2, 'cleared again once the POST settled');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('DriveClient: leaving while a POST is pending clears the cookie even if the response could not be stopped', async () => {
+  const realFetch = globalThis.fetch;
+  const f = heldFetch();
+  // A response already on its way when abort() is called: the cookie gets set anyway.
+  globalThis.fetch = (url, init) => f.fetch(url, init.method === 'POST' ? { ...init, signal: undefined } : init);
+  try {
+    const d = new DriveClient({ room: 'My Room', token: 't1', folder: 'ROOTFOLDER_0001' });
+    await tick();
+    d.endSession();
+    f.held[0].release();
+    await tick();
+    await tick();
+    assert.equal(f.jar.cookie, null);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('DriveClient: overlapping renewals are serialized and only the newest token ends up in the cookie', async () => {
+  const realFetch = globalThis.fetch;
+  const f = heldFetch();
+  // Responses that cannot be stopped by abort() either, so ordering is what keeps the newest token.
+  globalThis.fetch = (url, init) => f.fetch(url, { ...init, signal: undefined });
+  try {
+    const d = new DriveClient({ room: 'My Room', token: 't1', folder: 'ROOTFOLDER_0001' });
+    const first = d.ensureSession();
+    await tick();
+    d.setToken('t2');
+    d.setToken('t3');
+    const latest = d.ensureSession();
+    await tick();
+    assert.equal(f.held.length, 1, 'the next POST waits for the pending one');
+    f.held[0].release(); // t1's answer
+    await tick();
+    await tick();
+    await tick();
+    assert.equal(f.held.length, 2, 't2 was superseded before it was sent');
+    assert.equal(f.held[1].auth, 'Bearer t3');
+    f.held[1].release();
+    await latest;
+    await first;
+    assert.equal(f.jar.cookie, 'Bearer t3');
+    assert.deepEqual(f.log.filter(([m]) => m === 'POST').map(([, a]) => a), ['Bearer t1', 'Bearer t3']);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('DriveClient: a renewal aborts the pending POST, whose waiters get the newest session', async () => {
+  const realFetch = globalThis.fetch;
+  const f = heldFetch();
+  globalThis.fetch = f.fetch;
+  try {
+    const d = new DriveClient({ room: 'My Room', token: 't1', folder: 'ROOTFOLDER_0001' });
+    const old = d.ensureSession();
+    await tick();
+    d.setToken('t2');
+    assert.equal(f.held[0].aborted, true);
+    await tick();
+    await tick();
+    f.held[1].release();
+    await old; // resolves with t2's outcome instead of failing
+    assert.equal(old.failed, false);
+    assert.equal(f.jar.cookie, 'Bearer t2');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('DriveClient: a client for a new folder retires the old one, whose late answer cannot win', async () => {
+  const realFetch = globalThis.fetch;
+  const f = heldFetch();
+  globalThis.fetch = (url, init) => f.fetch(url, { ...init, signal: undefined }); // answers abort() cannot stop
+  try {
+    const a = new DriveClient({ room: 'My Room', token: 'old', folder: 'ROOTFOLDER_0001' });
+    await tick();
+    const b = new DriveClient({ room: 'My Room', token: 'new', folder: 'ROOTFOLDER_0002', replaces: a });
+    await tick();
+    assert.equal(f.held.length, 1, 'the new client waits for the old request');
+    f.held[0].release();
+    await tick();
+    await tick();
+    f.held[1].release();
+    await b.ensureSession();
+    assert.equal(f.jar.cookie, 'Bearer new');
+    a.setToken('old2');
+    await tick();
+    assert.equal(f.held.length, 2, 'a retired client posts nothing');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
 test('DriveClient: the cookie session is posted for every token and retried after a failure', async () => {
   const realFetch = globalThis.fetch;
   const posts = [];
