@@ -9,7 +9,7 @@
 //
 // Failure modes (properties of g.mode): quotaIds (Set of file ids whose media gets a 403
 // downloadQuotaExceeded), failMedia (number of next media requests that answer 500), shiftMedia (number of next range requests answered with another offset), slowMs (delay
-// of media responses), tokenTtl (expires_in of new tokens, seconds), pageLimit (items per list page).
+// of media responses; a request the caller cancels meanwhile is marked `aborted` and gets no answer), tokenTtl (expires_in of new tokens, seconds), pageLimit (items per list page).
 'use strict';
 
 const http = require('http');
@@ -19,7 +19,6 @@ const path = require('path');
 
 const FOLDER = 'application/vnd.google-apps.folder';
 const SCOPE = 'https://www.googleapis.com/auth/drive.readonly';
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function startFakeGoogle() {
   const { publicKey, privateKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
@@ -121,7 +120,14 @@ async function startFakeGoogle() {
       log.push(entry);
       res.on('close', () => { if (!res.writableEnded) entry.aborted = true; }); // the caller gave up
       if (!f || !f.data) return gerr(res, 404, 'notFound', 'File not found: ' + m[1]);
-      if (mode.slowMs) await sleep(mode.slowMs);
+      if (mode.slowMs) {
+        // A caller that gives up meanwhile ends the wait: there is nobody left to answer.
+        await new Promise((resolve) => {
+          const t = setTimeout(resolve, mode.slowMs);
+          res.once('close', () => { clearTimeout(t); resolve(); });
+        });
+        if (entry.aborted) return;
+      }
       if (mode.quotaIds.has(f.id)) {
         entry.status = 403;
         return gerr(res, 403, 'downloadQuotaExceeded', 'The download quota for this file has been exceeded.');

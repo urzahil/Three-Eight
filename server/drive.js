@@ -626,6 +626,11 @@ class GoogleDrive {
     }
   }
 
+  /** Media work not finished yet: runs being fetched, requests to Google under way, and requests waiting for a slot. */
+  inFlight() {
+    return { runs: new Set([...this.pending.values()].map((p) => p.run)).size, upstream: this.active, queued: this.queue.length };
+  }
+
   /**
    * Start fetching blocks a..b of a file with one upstream request. A "run" is shared by everyone who
    * wants any of its blocks; `refs` counts them, and the request is cancelled when nobody is left.

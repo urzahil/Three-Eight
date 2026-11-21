@@ -765,28 +765,48 @@ test('drive: clients that disconnect right after sending a file request leave no
   const token = m.welcome.drive.token;
   const registry = async () => (await fetch(BASE + '/api/debug/drive-streams')).json(); // DRIVE_DEBUG=1 test hook
   const request = `GET ${files('leak-room', FILE)} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer ${token}\r\n\r\n`;
-  await Promise.all(Array.from({ length: 50 }, (_, i) => new Promise((resolve) => {
-    const sock = net.connect(PORT, '127.0.0.1', () => {
-      sock.write(request);
-      // gone before the first byte; some right away, some while the server is still asking Google
-      setTimeout(() => sock.destroy(), i % 5);
-    });
-    sock.on('error', () => {});
-    sock.on('close', resolve);
-  })));
-  let left;
-  for (let i = 0; i < 50; i++) {
-    left = await registry();
-    if (left.streams === 0 && left.rooms === 0) break;
-    await new Promise((r) => setTimeout(r, 100));
+  // Nothing tracked, and no media work unfinished: no stream, no run being fetched, no request to Google, nobody waiting.
+  const idle = { rooms: 0, streams: 0, runs: 0, upstream: 0, queued: 0 };
+  // 50 clients send the request and are gone before the first byte. Google holds back its answers (the fake stops
+  // waiting when the server hangs up), so no upstream request they cause can finish while they come and go: an idle
+  // server afterwards means it cancelled each one.
+  // How many requests to Google a burst costs is not asserted: it depends on timing, not on a bug. Clients waiting at the
+  // same time share one request, but the server cancels it when the last of them has gone, and a client whose request
+  // the server reads only after that (a busy machine can read a socket long after the client wrote to it) starts a new
+  // one. Sharing among clients that stay is checked by "concurrent identical range requests cost one upstream fetch".
+  const burst = async (label) => {
+    await Promise.all(Array.from({ length: 50 }, (_, i) => new Promise((resolve) => {
+      const sock = net.connect(PORT, '127.0.0.1', () => {
+        sock.write(request);
+        setTimeout(() => sock.destroy(), i % 5); // some right away, some a little later
+      });
+      sock.on('error', () => {});
+      sock.on('close', resolve);
+    })));
+    let left;
+    for (let i = 0; i < 50; i++) {
+      left = await registry();
+      if (Object.values(left).every((n) => n === 0)) break;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    assert.deepStrictEqual(left, idle, `${label}: no stream stays registered, and every upstream request was cancelled`);
+  };
+  google.mode.slowMs = 30_000;
+  try {
+    // The server has not checked this file with Google yet: most clients are gone while it does.
+    await burst('file not checked yet');
+    // Now it knows the file (a HEAD asks the same questions), so the clients get as far as their download, which waits
+    // for Google, and go away during it.
+    assert.strictEqual((await api(files('leak-room', FILE), token, { method: 'HEAD' })).status, 200);
+    await burst('file known');
+  } finally {
+    google.mode.slowMs = 0;
   }
-  assert.deepStrictEqual(left, { rooms: 0, streams: 0 }, 'no stream stays registered');
-  assert(mediaCalls(FILE).length <= 1, 'one shared upstream fetch at most, not one per client: ' + mediaCalls(FILE).length);
   // The room still works: an admin change and a normal download.
   assert.strictEqual((await json('PUT', '/api/admin/rooms/leak-room', { password: 'pw2' })).status, 200);
   const fresh = (await m.ws.next()).drive.token;
   assert((await (await api(files('leak-room', FILE), fresh)).arrayBuffer()).byteLength === 3 * MiB);
-  assert.deepStrictEqual(await registry(), { rooms: 0, streams: 0 });
+  assert.deepStrictEqual(await registry(), idle);
   m.ws.close();
 });
 
