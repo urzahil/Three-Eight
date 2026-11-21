@@ -228,6 +228,34 @@ async function waitFor(page, fn, arg, timeout = 15000) {
   assert(a.paused && b.paused, 'paused again');
   console.log('keyboard: Space on a button and Caps Lock shortcuts ok');
 
+  // ↑ / ↓ change Bob's movie volume (only his, remembered, shown over the picture); j / l seek the room like ← / →;
+  // "?" lists the shortcuts.
+  const vol = (p) => p.evaluate(() => ({ v: document.getElementById('movie').volume, slider: Number(document.getElementById('m-volume').value), saved: JSON.parse(localStorage.getItem('te.movieVolume')) }));
+  await bob.keyboard.press('ArrowDown');
+  await bob.keyboard.press('ArrowDown');
+  assert.deepStrictEqual(await vol(bob), { v: 0.9, slider: 0.9, saved: 0.9 });
+  assert.strictEqual(await bob.textContent('#m-note'), 'Volume 90%');
+  assert(await bob.isVisible('#m-note'), 'the volume is shown over the picture');
+  await bob.keyboard.press('ArrowUp');
+  assert.deepStrictEqual(await vol(bob), { v: 0.95, slider: 0.95, saved: 0.95 });
+  assert.strictEqual((await vol(alice)).v, 1, 'Alice keeps her volume');
+  const before = (await state(alice)).time;
+  await bob.keyboard.press('l');
+  await waitFor(alice, (t) => Math.abs(document.getElementById('movie').currentTime - (t + 10)) < 0.3, before);
+  await bob.keyboard.press('j');
+  await waitFor(alice, (t) => Math.abs(document.getElementById('movie').currentTime - t) < 0.3, before);
+  await bob.keyboard.press('?');
+  await bob.waitForSelector('#keys-dialog[open]');
+  const rows = await bob.evaluate(() => [...document.querySelectorAll('#keys-list tr')].map((tr) => tr.textContent));
+  assert(rows.some((r) => /↑ \/ ↓/.test(r) && /volume/i.test(r)) && rows.some((r) => /Back \/ forward 10 s/.test(r)), `shortcut list: ${rows.join(' | ')}`);
+  await bob.keyboard.press('k');
+  await sleep(800);
+  assert((await state(alice)).paused, 'with the list open, the keys do nothing else');
+  await bob.keyboard.press('Escape');
+  await waitFor(bob, () => !document.getElementById('keys-dialog').open);
+  await bob.keyboard.press('ArrowUp'); // back to full volume for the rest of the test
+  console.log('keyboard: ↑ / ↓ volume, j / l seek, ? lists the shortcuts');
+
   // Clicks on the picture: a click plays (after a moment: it waits for a second click), a double-click only goes full
   // screen, and a tap (touch) only shows or hides the controls. None of the last two may change the room's playback.
   const seqOf = (p) => p.evaluate(() => room.sync.state.seq);

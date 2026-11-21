@@ -475,6 +475,25 @@ export class Movie {
     $('m-volume').value = v.muted ? 0 : v.volume;
   }
 
+  /** ↑ / ↓: the movie's volume, only for us (like the slider), shown over the picture for a moment. Up also unmutes. */
+  _stepMovieVolume(delta) {
+    const v = this.player.video;
+    v.volume = Math.round(Math.max(0, Math.min(1, v.volume + delta)) * 100) / 100;
+    if (delta > 0) v.muted = false;
+    store.set('movieVolume', v.volume);
+    this._refreshVolume();
+    this._flashMovieNote(v.muted ? `Muted (volume ${Math.round(v.volume * 100)}%)` : `Volume ${Math.round(v.volume * 100)}%`);
+  }
+
+  /** A short note over the picture (also in full screen and in the floating window, which hold the movie box). */
+  _flashMovieNote(text) {
+    const el = $('m-note');
+    el.textContent = text;
+    el.hidden = false;
+    clearTimeout(this._movieNoteTimer);
+    this._movieNoteTimer = setTimeout(() => { el.hidden = true; }, 1200);
+  }
+
   _renderTime() {
     if ($('stage').hidden || this._dragging) return;
     const d = this.sync.state.movie?.duration || this.player.duration || 0;

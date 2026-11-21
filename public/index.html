@@ -125,6 +125,7 @@
             <video id="movie" playsinline disableremoteplayback></video>
             <div id="subs-layer" class="subs-layer"></div>
             <div id="movie-overlay" class="movie-overlay" hidden></div>
+            <div id="m-note" class="movie-note" role="status" hidden></div>
             <div id="movie-controls" class="movie-controls">
               <div class="seek-row">
                 <span id="m-time" class="time">0:00</span>
@@ -137,10 +138,10 @@
               </div>
               <div class="ctrl-row">
                 <button id="m-play" class="icon-btn" title="Play / pause (space)"><svg><use href="#i-play"/></svg></button>
-                <button id="m-back" class="icon-btn" title="Back 10 s (←)"><svg><use href="#i-back"/></svg></button>
-                <button id="m-fwd" class="icon-btn" title="Forward 10 s (→)"><svg><use href="#i-fwd"/></svg></button>
+                <button id="m-back" class="icon-btn" title="Back 10 s (← or j)"><svg><use href="#i-back"/></svg></button>
+                <button id="m-fwd" class="icon-btn" title="Forward 10 s (→ or l)"><svg><use href="#i-fwd"/></svg></button>
                 <div class="vol">
-                  <button id="m-mute" class="icon-btn" title="Movie volume (only for you)"><svg><use href="#i-volume"/></svg></button>
+                  <button id="m-mute" class="icon-btn" title="Mute the movie, only for you (volume: ↑ / ↓)"><svg><use href="#i-volume"/></svg></button>
                   <input id="m-volume" type="range" min="0" max="1" step="0.01" value="1" aria-label="Movie volume">
                 </div>
                 <div id="m-ready" class="ready-pill"></div>
@@ -276,6 +277,15 @@
         <select id="set-subenc"></select>
       </label>
       <button class="btn primary" value="save">Done</button>
+    </form>
+  </dialog>
+
+  <dialog id="keys-dialog" class="dialog" aria-labelledby="keys-title">
+    <form method="dialog" class="stack">
+      <h2 id="keys-title" tabindex="-1" autofocus>Keyboard shortcuts</h2>
+      <table class="keys"><tbody id="keys-list"></tbody></table>
+      <p class="muted small">* Only while you have joined the movie that is playing. Shortcuts are ignored while you type in a text field, and when Ctrl, Alt or ⌘ is held. They also work in the picture-in-picture window (all but ?).</p>
+      <button class="btn primary" value="close">Close</button>
     </form>
   </dialog>
 
