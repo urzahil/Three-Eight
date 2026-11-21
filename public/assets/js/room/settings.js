@@ -3,6 +3,7 @@
 
 import { $, store, setIcon, toast } from './util.js';
 import { SUBTITLE_ENCODINGS } from '../player/subtitles.js';
+import { AudioOutput, outputOptions } from '../media.js';
 
 const MAX_SUB_DELAY = 600; // seconds either way
 const SUB_DELAY_MOVIES = 50; // movies whose subtitle delay is remembered
@@ -45,6 +46,7 @@ export class Settings {
     };
     this.media.addEventListener('devices', refill);
     this.media.addEventListener('change', refill);
+    this._initAudioOutput();
     $('set-audio-dev').onchange = (e) => this._changeDevice('audio', e.target.value);
     $('set-video-dev').onchange = (e) => this._changeDevice('video', e.target.value);
     $('set-noise').onchange = (e) => {
@@ -138,7 +140,7 @@ export class Settings {
     store.set('media', { ...store.get('media', {}), [kind === 'audio' ? 'audioDevice' : 'videoDevice']: this.media.deviceIds[kind] });
   }
 
-  /** The microphone and camera lists, with the devices in use selected. */
+  /** The microphone, camera and speaker lists, with the devices in use selected. */
   async _fillDeviceLists() {
     const d = await this.media.devices();
     for (const kind of ['audio', 'video']) {
@@ -146,6 +148,73 @@ export class Settings {
       sel.replaceChildren(...d[kind].map((dev, i) => new Option(dev.label || `${kind === 'audio' ? 'Microphone' : 'Camera'} ${i + 1}`, dev.deviceId)));
       sel.value = this.media.currentDeviceId(kind);
     }
+    if (this.output) this._fillOutputList(outputOptions(d.output));
+  }
+
+  /**
+   * Speakers / headphones: where call audio and the movie play (browsers with setSinkId; Safari has no choice). The
+   * choice is kept on this device; if it is not there at the start, the default plays and a toast says so, once.
+   * After a device change the choice is used again as soon as the browser lists it.
+   */
+  _initAudioOutput() {
+    this.output = null;
+    $('set-output-wrap').hidden = !AudioOutput.supported;
+    if (!AudioOutput.supported) return;
+    const out = new AudioOutput(store.get('audioOutput', ''));
+    this.output = out;
+    out.attach(this.player.video); // the floating PiP window moves this element: its output goes along
+    for (const [id, t] of this.tiles) if (id !== this.id) out.attach(t.video); // later tiles: _makeTile
+    out.addEventListener('fallback', () => {
+      if (this._outputWarned || !out.wanted) return;
+      this._outputWarned = true;
+      toast('The speakers or headphones chosen in Settings are not available: sound plays through the default output.', 'warn');
+    });
+    out.addEventListener('change', () => {
+      if ($('settings-dialog').open) $('set-output-dev').value = out.id;
+    });
+    this.media.addEventListener('devices', () => this._refreshOutput());
+    this._refreshOutput(); // the saved choice, if it is there
+    $('set-output-dev').onchange = (e) => this._chooseOutput(e.target.value);
+    // Firefox lists no outputs until one is picked in its own chooser (which needs a click).
+    $('set-output-choose').hidden = !AudioOutput.canChoose;
+    $('set-output-choose').onclick = async () => {
+      let device;
+      try {
+        device = await navigator.mediaDevices.selectAudioOutput();
+      } catch (err) {
+        if (err.name !== 'NotAllowedError' && err.name !== 'AbortError') toast('Could not list the outputs.', 'warn');
+        return; // closed without a choice
+      }
+      await this._chooseOutput(device.deviceId, device);
+    };
+  }
+
+  async _refreshOutput() {
+    if (!this.output || this.left) return;
+    const options = outputOptions((await this.media.devices()).output);
+    await this.output.refresh(options);
+    if ($('settings-dialog').open) this._fillOutputList(options);
+  }
+
+  /** `device`: one picked in the browser's chooser, which the browser may not list yet. */
+  async _chooseOutput(id, device = null) {
+    store.set('audioOutput', id || null);
+    this._outputWarned = true; // a choice that fails gets the toast below, not the one for a missing saved choice
+    if (!(await this.output.choose(id))) toast('Could not play through that output: using the default one.', 'warn');
+    const options = outputOptions((await this.media.devices()).output);
+    if (device && !options.some((o) => o.id === device.deviceId)) options.push({ id: device.deviceId, label: device.label || 'Chosen output' });
+    this._fillOutputList(options);
+  }
+
+  _fillOutputList(options) {
+    const sel = $('set-output-dev');
+    // The choice in use stays in the list even when the browser does not list it (Firefox, after its chooser).
+    if (this.output.id && !options.some((o) => o.id === this.output.id)) {
+      const kept = [...sel.options].find((o) => o.value === this.output.id);
+      options = [...options, { id: this.output.id, label: kept?.textContent || 'Chosen output' }];
+    }
+    sel.replaceChildren(...options.map((o) => new Option(o.label, o.id)));
+    sel.value = this.output.id;
   }
 
   async openSettings() {

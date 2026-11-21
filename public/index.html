@@ -245,6 +245,13 @@
       <label>Interface style <select id="set-ui" data-theme-select></select></label>
       <label>Microphone <select id="set-audio-dev"></select></label>
       <label>Camera <select id="set-video-dev"></select></label>
+      <div id="set-output-wrap" class="field" hidden>
+        <label for="set-output-dev">Speakers or headphones (call and movie)</label>
+        <div class="select-row">
+          <select id="set-output-dev"></select>
+          <button id="set-output-choose" class="btn" type="button" title="Pick from the browser’s list of outputs" hidden>Choose…</button>
+        </div>
+      </div>
       <label class="check"><input id="set-noise" type="checkbox" checked> Noise suppression &amp; echo cancellation</label>
       <label class="check"><input id="set-lowband" type="checkbox"> Low-bandwidth video (recommended on slow connections)</label>
       <label class="check"><input id="set-share" type="checkbox" checked> Share my movie file with the room (friends can stream it from my copy)</label>

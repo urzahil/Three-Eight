@@ -252,9 +252,10 @@ export class LocalMedia extends EventTarget {
       return {
         audio: list.filter((d) => d.kind === 'audioinput'),
         video: list.filter((d) => d.kind === 'videoinput'),
+        output: list.filter((d) => d.kind === 'audiooutput'),
       };
     } catch {
-      return { audio: [], video: [] };
+      return { audio: [], video: [], output: [] };
     }
   }
 
@@ -271,6 +272,130 @@ export class LocalMedia extends EventTarget {
     this.videoTrack?.stop();
     this.audioTrack = null;
     this.videoTrack = null;
+  }
+}
+
+// ---- Speakers / headphones -----------------------------------------------------
+// Where call audio and the movie play. Chrome, Edge and Firefox can choose (setSinkId); Safari plays through the
+// system's output. Chrome lists the outputs once the microphone is allowed; Firefox lists only those picked in its own
+// chooser (navigator.mediaDevices.selectAudioOutput, from a click).
+
+/** Can this browser send a media element's sound to a chosen output? */
+export function outputSupported(proto = globalThis.HTMLMediaElement?.prototype) {
+  return !!proto && 'setSinkId' in proto;
+}
+
+/**
+ * The outputs the browser lists (MediaDeviceInfo of kind 'audiooutput') as choices [{ id, label }], the system's
+ * default first. The default is '' (setSinkId('') follows the system), labelled as the browser names it ("Default -
+ * Speakers") when it lists one. Entries without an id (listed before any permission) are left out.
+ */
+export function outputOptions(outputs) {
+  const def = outputs.find((d) => d.deviceId === 'default');
+  const list = [{ id: '', label: def?.label || 'System default' }];
+  for (const d of outputs) if (d.deviceId && d.deviceId !== 'default') list.push({ id: d.deviceId, label: d.label || `Speakers ${list.length}` });
+  return list;
+}
+
+/**
+ * Which output to use for the choice `wanted`, given the choices the browser lists (outputOptions): { id, missing }.
+ * The choice itself when it is listed, or when nothing is listed to compare with (Firefox before its chooser was
+ * used: setSinkId then says whether it exists); the default when it is not in the list (unplugged), with `missing`.
+ */
+export function pickOutput(wanted, options) {
+  if (!wanted) return { id: '', missing: false };
+  const ids = options.map((o) => o.id).filter(Boolean);
+  if (!ids.length || ids.includes(wanted)) return { id: wanted, missing: false };
+  return { id: '', missing: true };
+}
+
+/**
+ * The output that attached media elements play through. `wanted` is the choice (from Settings), `id` the output in
+ * use: the choice, or the default ('') while the choice cannot be used. Events: 'change' (id changed), 'fallback'
+ * (the choice could not be used, the default plays instead). Changes run one after another.
+ */
+export class AudioOutput extends EventTarget {
+  constructor(wanted = '') {
+    super();
+    this.wanted = typeof wanted === 'string' ? wanted : '';
+    this.id = '';
+    this.elements = new Set();
+    this._queue = Promise.resolve();
+  }
+
+  static get supported() {
+    return outputSupported();
+  }
+
+  /** Firefox: the browser's own chooser lists the outputs. */
+  static get canChoose() {
+    return !!navigator.mediaDevices?.selectAudioOutput;
+  }
+
+  _run(fn) {
+    const done = this._queue.then(fn, fn);
+    this._queue = done.catch(() => {});
+    return done;
+  }
+
+  /** Play `el` through the output in use, now and after every change. */
+  attach(el) {
+    if (this.elements.has(el)) return this._queue;
+    this.elements.add(el);
+    return this._run(async () => {
+      if (!this.id || !this.elements.has(el)) return;
+      try {
+        await el.setSinkId(this.id);
+      } catch (err) {
+        await this._fallBack(err);
+      }
+    });
+  }
+
+  detach(el) {
+    this.elements.delete(el);
+  }
+
+  /** The choice from Settings ('' = the system's default). Resolves to true if it is in use. */
+  choose(id) {
+    const wanted = typeof id === 'string' ? id : '';
+    this.wanted = wanted;
+    return this._run(() => this._use(wanted));
+  }
+
+  /** At start and after a device change: use the choice if the browser lists it (again), else the default. */
+  refresh(options) {
+    return this._run(() => {
+      const { id, missing } = pickOutput(this.wanted, options);
+      return missing ? this._fallBack(null) : this._use(id);
+    });
+  }
+
+  async _use(id) {
+    if (id === this.id) return true;
+    try {
+      await Promise.all([...this.elements].map((el) => el.setSinkId(id)));
+    } catch (err) {
+      if (!id) {
+        console.warn('the default audio output was refused:', err.name || err); // nothing to fall back to
+        return false;
+      }
+      return this._fallBack(err);
+    }
+    this.id = id;
+    this.dispatchEvent(new CustomEvent('change'));
+    return true;
+  }
+
+  /** The choice cannot be used (NotFoundError: unplugged; NotAllowedError: not exposed to this page): the default. */
+  async _fallBack(err) {
+    if (err) console.warn('audio output not available:', err.name || err);
+    await Promise.allSettled([...this.elements].map((el) => el.setSinkId('')));
+    const changed = this.id !== '';
+    this.id = '';
+    if (changed) this.dispatchEvent(new CustomEvent('change'));
+    this.dispatchEvent(new CustomEvent('fallback'));
+    return false;
   }
 }
 

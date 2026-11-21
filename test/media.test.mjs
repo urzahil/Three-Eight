@@ -3,7 +3,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import './browser-globals.mjs';
-import { LocalMedia } from '../public/assets/js/media.js';
+import { LocalMedia, AudioOutput, outputSupported, outputOptions, pickOutput } from '../public/assets/js/media.js';
 
 function fakeTrack(kind, deviceId = `default-${kind}`) {
   const ended = [];
@@ -371,3 +371,115 @@ function fakeStream(kind) {
   const t = fakeTrack(kind);
   return { getTracks: () => [t], getAudioTracks: () => (kind === 'audio' ? [t] : []), getVideoTracks: () => (kind === 'video' ? [t] : []) };
 }
+
+// ---- Speakers / headphones ---------------------------------------------------------------------------------
+
+test('an output can be chosen only where media elements have setSinkId (not Safari)', () => {
+  assert.equal(outputSupported({ setSinkId() {} }), true);
+  assert.equal(outputSupported({}), false);
+  assert.equal(outputSupported(undefined), false);
+  assert.equal(outputSupported(), false, 'Node has no HTMLMediaElement');
+});
+
+const out = (deviceId, label = '') => ({ kind: 'audiooutput', deviceId, label });
+
+test('output choices: the default first (as the browser names it), entries without an id left out', () => {
+  assert.deepEqual(outputOptions([]), [{ id: '', label: 'System default' }]);
+  // Chrome: a "default" entry, then the devices
+  assert.deepEqual(outputOptions([out('default', 'Default - Speakers'), out('a1', 'Speakers'), out('b2', 'Headphones')]), [
+    { id: '', label: 'Default - Speakers' }, { id: 'a1', label: 'Speakers' }, { id: 'b2', label: 'Headphones' },
+  ]);
+  // Before any permission, browsers list one entry without id or label: nothing to choose
+  assert.deepEqual(outputOptions([out('')]), [{ id: '', label: 'System default' }]);
+  assert.deepEqual(outputOptions([out('x9')]), [{ id: '', label: 'System default' }, { id: 'x9', label: 'Speakers 1' }]);
+});
+
+test('which output to use: the choice when listed (or when nothing is listed), else the default', () => {
+  const listed = outputOptions([out('default', 'Default'), out('a1', 'Speakers'), out('b2', 'Headphones')]);
+  assert.deepEqual(pickOutput('', listed), { id: '', missing: false });
+  assert.deepEqual(pickOutput('b2', listed), { id: 'b2', missing: false });
+  assert.deepEqual(pickOutput('gone', listed), { id: '', missing: true }, 'unplugged');
+  // Firefox before its chooser: no list to compare with, so try it (setSinkId says whether it exists)
+  assert.deepEqual(pickOutput('ff1', outputOptions([])), { id: 'ff1', missing: false });
+});
+
+/** A media element whose setSinkId knows the devices in `present` ('' is always there). */
+function fakeElement(present) {
+  return {
+    sinkId: '',
+    calls: [],
+    async setSinkId(id) {
+      this.calls.push(id);
+      if (id && !present.has(id)) throw err('NotFoundError');
+      this.sinkId = id;
+    },
+  };
+}
+
+test('AudioOutput: a choice applies to every element, also to those attached later', async () => {
+  const present = new Set(['hp']);
+  const o = new AudioOutput('');
+  const movie = fakeElement(present);
+  await o.attach(movie);
+  assert.deepEqual(movie.calls, [], 'the default needs no call');
+  assert.equal(await o.choose('hp'), true);
+  const tile = fakeElement(present);
+  await o.attach(tile);
+  assert.equal(movie.sinkId, 'hp');
+  assert.equal(tile.sinkId, 'hp');
+  assert.equal(o.id, 'hp');
+  o.detach(tile);
+  assert.equal(await o.choose(''), true, 'choosing the default calls setSinkId(\'\') without errors');
+  assert.equal(movie.sinkId, '');
+  assert.equal(tile.sinkId, 'hp', 'a detached element is left alone');
+});
+
+test('AudioOutput: a saved choice that is gone at start falls back to the default, and says so', async () => {
+  const present = new Set();
+  const o = new AudioOutput('hp');
+  let fallbacks = 0;
+  o.addEventListener('fallback', () => fallbacks++);
+  const movie = fakeElement(present);
+  await o.attach(movie);
+  // Not in the browser's list
+  assert.equal(await o.refresh(outputOptions([out('default'), out('spk')])), false);
+  assert.equal(o.id, '');
+  assert.equal(o.wanted, 'hp', 'the choice is kept for when it comes back');
+  assert.equal(fallbacks, 1);
+  // Nothing listed (Firefox): setSinkId is tried and refuses
+  assert.equal(await o.refresh(outputOptions([])), false);
+  assert.deepEqual(movie.calls.filter(Boolean), ['hp']);
+  assert.equal(movie.sinkId, '');
+  assert.equal(fallbacks, 2, 'the room shows its toast only once (room/settings.js)');
+});
+
+test('AudioOutput: after a device change the choice is used again as soon as it is listed', async () => {
+  const present = new Set(['hp']);
+  const o = new AudioOutput('hp');
+  const movie = fakeElement(present);
+  await o.attach(movie);
+  let changes = 0;
+  o.addEventListener('change', () => changes++);
+  await o.refresh(outputOptions([out('hp', 'Headphones')]));
+  assert.equal(movie.sinkId, 'hp');
+  present.delete('hp'); // unplugged: the browser plays through the default by itself; the list says it is gone
+  await o.refresh(outputOptions([out('spk', 'Speakers')]));
+  assert.equal(o.id, '');
+  assert.equal(movie.sinkId, '');
+  present.add('hp'); // plugged in again
+  await o.refresh(outputOptions([out('spk', 'Speakers'), out('hp', 'Headphones')]));
+  assert.equal(movie.sinkId, 'hp');
+  assert.equal(changes, 3);
+});
+
+test('AudioOutput: changes run one after another (the last choice wins)', async () => {
+  const present = new Set(['a', 'b']);
+  const o = new AudioOutput('');
+  const el = fakeElement(present);
+  await o.attach(el);
+  assert.deepEqual(await Promise.all([o.choose('a'), o.choose('b'), o.choose('missing')]), [true, true, false]);
+  assert.equal(o.id, '');
+  assert.equal(el.sinkId, '');
+  assert.equal(await o.choose('b'), true);
+  assert.equal(el.sinkId, 'b');
+});

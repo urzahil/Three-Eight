@@ -95,7 +95,7 @@
 [data-ui="align"] select { background: var(--bg-2); box-shadow: 0 1px 2px rgba(10, 13, 20, 0.3); }
 [data-ui="align"] input:hover, [data-ui="align"] select:hover { background: var(--bg-3); }
 [data-ui="align"] input:focus, [data-ui="align"] select:focus { border-color: var(--line); box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px rgba(153, 160, 174, 0.3); }
-[data-ui="align"] label { color: var(--text); font-weight: 500; font-size: 14px; }
+[data-ui="align"] label, [data-ui="align"] .field { color: var(--text); font-weight: 500; font-size: 14px; }
 [data-ui="align"] .tool { border-radius: 12px; color: var(--muted); }
 [data-ui="align"] .tool:hover { color: var(--text); }
 [data-ui="align"] .tool.active { color: var(--text); background: var(--bg-3); box-shadow: inset 0 0 0 1px var(--line); }
@@ -254,7 +254,7 @@
 [data-ui="ant"] select { background: var(--bg-2); padding: 6px 11px; min-height: 36px; transition: all 0.2s; }
 [data-ui="ant"] input:hover, [data-ui="ant"] select:hover { border-color: #3c89e8; }
 [data-ui="ant"] input:focus, [data-ui="ant"] select:focus { border-color: #3c89e8; box-shadow: 0 0 0 2px rgba(0, 60, 180, 0.15); }
-[data-ui="ant"] label { color: var(--text); font-size: 14px; }
+[data-ui="ant"] label, [data-ui="ant"] .field { color: var(--text); font-size: 14px; }
 [data-ui="ant"] button:focus-visible, [data-ui="ant"] .seek:focus-visible { outline: 4px solid #153450; outline-offset: 1px; }
 [data-ui="ant"] .tool { border-radius: 6px; }
 [data-ui="ant"] .tool.active { background: #111a2c; color: #3c89e8; }

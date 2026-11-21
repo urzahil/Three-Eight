@@ -8,7 +8,7 @@ test it. They are not ordered by priority; the table says what each costs and wh
 | # | Feature | Size | Touches the server | Notes |
 |---|---|---|---|---|
 | 1 | [Per-person volume and mute](#1-per-person-volume-and-mute) | S | no | Purely local |
-| 2 | [Speaker / headphone picker](#2-speaker--headphone-picker) | S | no | Chrome, Edge, Firefox |
+| 2 | [Speaker / headphone picker](#2-speaker--headphone-picker) | S | no | **Done** · Chrome, Edge, Firefox |
 | 3 | [Devices plugged in or removed mid-call](#3-devices-plugged-in-or-removed-mid-call) | S | no | **Done** |
 | 4 | [Resume where you left off](#4-resume-where-you-left-off) | S | no | |
 | 5 | [Next episode from the Drive folder](#5-next-episode-from-the-drive-folder) | M | no | |
@@ -67,6 +67,13 @@ reading it back) and keep only mute.
 **Tests.** Browser check in `test/e2e.js`: Bob mutes Alice, Alice's tile video on Bob is `muted`, Alice is not affected.
 
 ## 2. Speaker / headphone picker
+
+**Done.** `AudioOutput` in `media.js` (with the pure helpers `outputOptions` and `pickOutput`), set up by
+`_initAudioOutput` in `room/settings.js`; remote tiles attach in `_makeTile`. The movie element and every remote tile
+play through the choice; Firefox gets a **Choose…** button. A saved choice that is not there at the start, or that a
+device change removes, falls back to the default (the toast appears once per session) and is used again as soon as the
+browser lists it. The setting is in a `.field` block (a label for a select and a button). Tests: `test/media.test.mjs`
+and the Settings part of `test/e2e.js`.
 
 **Goal.** Choose where call audio and the movie play (headphones while the laptop speakers stay silent).
 
