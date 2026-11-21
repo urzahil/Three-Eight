@@ -36,6 +36,45 @@ function driveCacheMb(env, def) {
   return mb;
 }
 
+// ---- STUN / TURN ------------------------------------------------------------------------------------------------
+// Browsers refuse to create any RTCPeerConnection when one of its ICE servers is malformed (a URL without its
+// "stun:" scheme, or a TURN server without credentials), so one typo here would break every call in every room.
+// Hence: checked at startup, like the other settings.
+const DEFAULT_STUN = 'stun:stun.l.google.com:19302,stun:stun.cloudflare.com:3478';
+// RFC 7064 / 7065: scheme:host[:port], TURN also ?transport=udp|tcp. Host: a name, an IPv4 address or [IPv6].
+const ICE_HOST = String.raw`(?:[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)*|\[[0-9A-Fa-f:.]+\])`;
+const STUN_URL_RE = new RegExp(String.raw`^stuns?:${ICE_HOST}(?::(\d{1,5}))?$`);
+const TURN_URL_RE = new RegExp(String.raw`^turns?:${ICE_HOST}(?::(\d{1,5}))?(?:\?transport=(?:udp|tcp))?$`);
+
+/** A comma-separated list of ICE server URLs, each checked against `re` (with a port in 1..65535, if any). */
+function iceUrls(raw, name, re, example) {
+  const urls = String(raw).split(',').map((s) => s.trim()).filter(Boolean);
+  for (const url of urls) {
+    const m = re.exec(url);
+    const port = m && m[1] !== undefined ? Number(m[1]) : 1;
+    if (!m || port < 1 || port > 65535) throw new ConfigError(`${name}: "${shown(url)}" is not a valid URL (expected e.g. ${example}).`);
+  }
+  return urls;
+}
+
+/**
+ * STUN and TURN settings: { stun: [urls], turn: [urls], secret, username, password }. STUN_URLS unset means the
+ * built-in servers, set but empty means none. TURN_URLS needs either TURN_SECRET (coturn use-auth-secret) or both
+ * TURN_USERNAME and TURN_PASSWORD.
+ */
+function iceSettings(env) {
+  const stun = iceUrls(env.STUN_URLS ?? DEFAULT_STUN, 'STUN_URLS', STUN_URL_RE, 'stun:stun.example.com:3478');
+  const turn = iceUrls(env.TURN_URLS ?? '', 'TURN_URLS', TURN_URL_RE, 'turn:turn.example.com:3478?transport=udp');
+  const secret = String(env.TURN_SECRET ?? '');
+  const username = String(env.TURN_USERNAME ?? '');
+  const password = String(env.TURN_PASSWORD ?? '');
+  if (turn.length && !secret && (!username || !password)) {
+    const missing = username || password ? (username ? 'TURN_PASSWORD' : 'TURN_USERNAME') : 'TURN_SECRET (or TURN_USERNAME and TURN_PASSWORD)';
+    throw new ConfigError(`TURN_URLS is set but ${missing} is not. Browsers refuse a TURN server without credentials, which would break every call.`);
+  }
+  return { stun, turn, secret, username, password };
+}
+
 const MIN_ADMIN_PASSWORD = 9;
 // Example values from .env.example and the documentation: a copy that was never edited must not become the password.
 const EXAMPLE_PASSWORDS = new Set([
@@ -64,4 +103,4 @@ function adminPassword(env) {
   return raw;
 }
 
-module.exports = { ConfigError, intSetting, trustedHops, driveCacheMb, adminPassword, MIN_ADMIN_PASSWORD };
+module.exports = { ConfigError, intSetting, trustedHops, driveCacheMb, adminPassword, iceSettings, MIN_ADMIN_PASSWORD };

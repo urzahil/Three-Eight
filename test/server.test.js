@@ -942,6 +942,34 @@ test('RoomStore: an unparseable rooms.json is moved aside, not overwritten', asy
   }
 });
 
+test('RoomStore: each save keeps the version before it as rooms.json.bak, and an unreadable rooms.json starts from it', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'three-eight-store-'));
+  const origError = console.error;
+  const logged = [];
+  try {
+    const store = new RoomStore(dir);
+    await store.create('first', '');
+    assert(!fs.existsSync(path.join(dir, 'rooms.json.bak')), 'nothing to keep before the first save');
+    await store.create('second', 'pw');
+    const bak = JSON.parse(fs.readFileSync(path.join(dir, 'rooms.json.bak'), 'utf8'));
+    assert.deepStrictEqual(Object.keys(bak.rooms), ['first'], 'the version before the last save');
+    assert.strictEqual(fs.statSync(path.join(dir, 'rooms.json.bak')).mode & 0o777, 0o600, 'as private as rooms.json');
+    assert(!fs.existsSync(path.join(dir, 'rooms.json.tmp')));
+    // A disk that lost its last writes: rooms.json is cut short.
+    fs.writeFileSync(path.join(dir, 'rooms.json'), '{ "version": 1, "rooms": {');
+    console.error = (...a) => logged.push(a.join(' '));
+    const restored = new RoomStore(dir);
+    console.error = origError;
+    assert(restored.get('first'), 'the rooms come back from the backup');
+    assert(logged.some((l) => /could not be parsed/.test(l) && /rooms\.json\.bak/.test(l)), 'says so');
+    assert.strictEqual(fs.readdirSync(dir).filter((f) => f.startsWith('rooms.json.corrupt-')).length, 1, 'the broken file is kept aside');
+    assert(new RoomStore(dir).get('first'), 'and rooms.json is written again at once');
+  } finally {
+    console.error = origError;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('RoomStore: damaged room records are checked one by one, and a broken password never opens a room', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'three-eight-store-'));
   const origError = console.error;
@@ -1704,6 +1732,31 @@ test('config: settings are parsed strictly (unit)', () => {
   for (const bad of ['lots', '-1', 'Infinity', '1e3', '99999999']) assert.throws(() => driveCacheMb({ DRIVE_CACHE_MB: bad }, 256), ConfigError, bad);
 });
 
+test('config: STUN and TURN servers are checked, so a typo cannot make every browser refuse every call (unit)', () => {
+  const { ConfigError, iceSettings } = require('../server/config');
+  const def = iceSettings({});
+  assert.deepStrictEqual(def.stun, ['stun:stun.l.google.com:19302', 'stun:stun.cloudflare.com:3478'], 'built-in STUN servers by default');
+  assert.deepStrictEqual(def.turn, []);
+  assert.deepStrictEqual(iceSettings({ STUN_URLS: '' }).stun, [], 'set but empty: no STUN');
+  assert.deepStrictEqual(iceSettings({ STUN_URLS: ' stun:a.example.com , stuns:[2001:db8::1]:5349,stun:10.0.0.1:3478 ' }).stun,
+    ['stun:a.example.com', 'stuns:[2001:db8::1]:5349', 'stun:10.0.0.1:3478']);
+  for (const bad of ['stun.l.google.com:19302', 'turn:t.example.com', 'stun:', 'stun:a.example.com:0', 'stun:a.example.com:70000',
+    'stun:a.example.com?transport=udp', 'stun:a b.example.com', 'http://stun.example.com', 'stun:-a.example.com']) {
+    assert.throws(() => iceSettings({ STUN_URLS: bad }), ConfigError, bad);
+  }
+  const turn = 'turn:t.example.com:3478?transport=udp,turn:t.example.com:3478?transport=tcp,turns:t.example.com:5349?transport=tcp';
+  assert.strictEqual(iceSettings({ TURN_URLS: turn, TURN_SECRET: 's' }).turn.length, 3);
+  assert.strictEqual(iceSettings({ TURN_URLS: turn, TURN_USERNAME: 'u', TURN_PASSWORD: 'p' }).username, 'u');
+  for (const bad of ['stun:t.example.com', 'turn:t.example.com?transport=sctp', 't.example.com:3478']) {
+    assert.throws(() => iceSettings({ TURN_URLS: bad, TURN_SECRET: 's' }), ConfigError, bad);
+  }
+  // As docker-compose passes them when only TURN_URLS was filled in: empty strings.
+  assert.throws(() => iceSettings({ TURN_URLS: turn, TURN_SECRET: '', TURN_USERNAME: '', TURN_PASSWORD: '' }), /TURN_SECRET/);
+  assert.throws(() => iceSettings({ TURN_URLS: turn, TURN_USERNAME: 'u' }), /TURN_PASSWORD is not/);
+  assert.throws(() => iceSettings({ TURN_URLS: turn, TURN_PASSWORD: 'p' }), /TURN_USERNAME is not/);
+  assert.deepStrictEqual(iceSettings({ TURN_SECRET: 's' }).turn, [], 'a secret without TURN_URLS is harmless');
+});
+
 test('config: an unusable setting stops the server with a message naming it', async () => {
   for (const [env, re] of [
     [{ MAX_ROOM_SIZE: 'invalid' }, /MAX_ROOM_SIZE=invalid is not a whole number/],
@@ -1712,6 +1765,8 @@ test('config: an unusable setting stops the server with a message naming it', as
     [{ PORT: '70000' }, /PORT=70000 is out of range/],
     [{ TRUST_PROXY: 'on' }, /TRUST_PROXY=on is not valid/],
     [{ DRIVE_CACHE_MB: 'lots' }, /DRIVE_CACHE_MB=lots is not a number/],
+    [{ STUN_URLS: 'stun.l.google.com:19302' }, /STUN_URLS: "stun.l.google.com:19302" is not a valid URL/],
+    [{ TURN_URLS: 'turn:turn.example.com:3478', TURN_SECRET: '', TURN_USERNAME: '', TURN_PASSWORD: '' }, /TURN_URLS is set but TURN_SECRET/],
   ]) {
     assert.match(await failedStart(env), re);
   }
@@ -2324,10 +2379,20 @@ test('TURN credentials: not in the public config, in the welcome after the passw
   const turn = turnOf(welcome.iceServers);
   assert(turn, 'the welcome carries the TURN server');
   assert.strictEqual(turn.credential, crypto.createHmac('sha1', secret).update(turn.username).digest('base64'), 'coturn use-auth-secret credential');
+  assert.match(turn.username, /^\d+:turnmem001$/, 'a login of its own: coturn counts its quota per member');
   // Renewed while connected (here after 400 ms instead of 10 h).
   const renewed = await nextMatching(ws, (m) => m.type === 'ice', 5000);
   assert.strictEqual(renewed.type, 'ice');
   assert(Number(turnOf(renewed.iceServers).username.split(':')[0]) >= Number(turn.username.split(':')[0]));
+  assert.match(turnOf(renewed.iceServers).username, /:turnmem001$/);
+  // Another member renewed in the same tick still gets its own login.
+  const other = await wsAt(s.base);
+  other.sendJson({ type: 'join', room: 'turn-room', id: 'turnmem002', name: 'N', password: 'tp' });
+  const welcome2 = await nextMatching(other, (m) => m.type === 'welcome');
+  assert.match(turnOf(welcome2.iceServers).username, /:turnmem002$/);
+  const renewed2 = await nextMatching(other, (m) => m.type === 'ice', 5000);
+  assert.match(turnOf(renewed2.iceServers).username, /:turnmem002$/);
+  other.close();
   ws.close();
   s.stop();
 });

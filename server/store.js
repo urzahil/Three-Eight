@@ -110,9 +110,23 @@ function loadRoom(key, room) {
   return r;
 }
 
+/** Flush a directory entry (a rename) to disk. Not every system can open a directory for that: then the rename has to do. */
+function fsyncDir(dir) {
+  let fd;
+  try {
+    fd = fs.openSync(dir, 'r');
+    fs.fsyncSync(fd);
+  } catch { /* e.g. Windows */ } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+}
+
 class RoomStore {
   constructor(dataDir) {
     this.file = path.join(dataDir, 'rooms.json');
+    // The version before the last save. If rooms.json is ever unreadable (a disk that lost its last writes), the
+    // server starts from it instead of with no rooms.
+    this.backup = this.file + '.bak';
     fs.mkdirSync(dataDir, { recursive: true });
     // No prototype: lookups like get('constructor') or get('__proto__') must not find inherited properties.
     /** @type {Record<string, {passwordHash: string, createdAt: number, updatedAt: number}>} */
@@ -125,35 +139,73 @@ class RoomStore {
       if (err.code !== 'ENOENT') throw new Error(`Cannot read ${this.file}: ${err.message}. Fix the file's permissions or move it away, then start again.`);
     }
     if (text !== null) {
-      let parsed = null;
-      try {
-        parsed = JSON.parse(text);
-      } catch { /* handled below */ }
-      if (parsed && typeof parsed.rooms === 'object' && parsed.rooms !== null && !Array.isArray(parsed.rooms)) {
-        for (const [key, room] of Object.entries(parsed.rooms)) {
-          const r = loadRoom(key, room);
-          if (!r) continue;
-          const k = RoomStore.key(r.name);
-          if (this.rooms[k]) {
-            console.error(`${this.file}: room "${r.name}" appears twice; the first one is kept.`);
-            continue;
-          }
-          this.rooms[k] = r;
-        }
-      } else {
+      const rooms = this._parse(text, this.file);
+      if (rooms) this.rooms = rooms;
+      else {
         // Keep the unreadable file for the operator instead of overwriting it with the next save.
         const aside = `${this.file}.corrupt-${Date.now()}`;
         fs.renameSync(this.file, aside);
-        console.error(`${this.file} could not be parsed. It was moved to ${aside} and the server starts with no rooms.`);
+        const saved = this._readBackup();
+        if (saved) {
+          console.error(`${this.file} could not be parsed. It was moved to ${aside}; the server starts from ${this.backup} (the version before the last change).`);
+          this.rooms = saved;
+          this._save(); // rooms.json again, so the next start does not depend on the backup
+        } else {
+          console.error(`${this.file} could not be parsed. It was moved to ${aside} and the server starts with no rooms.`);
+        }
       }
     }
   }
 
-  // Writes `rooms` (default: the current state) to disk.
+  /** The rooms in the text of a rooms.json (checked one by one, see loadRoom), or null when it is not one. */
+  _parse(text, file) {
+    let parsed = null;
+    try {
+      parsed = JSON.parse(text);
+    } catch { /* null below */ }
+    if (!parsed || typeof parsed.rooms !== 'object' || parsed.rooms === null || Array.isArray(parsed.rooms)) return null;
+    const rooms = Object.create(null);
+    for (const [key, room] of Object.entries(parsed.rooms)) {
+      const r = loadRoom(key, room);
+      if (!r) continue;
+      const k = RoomStore.key(r.name);
+      if (rooms[k]) {
+        console.error(`${file}: room "${r.name}" appears twice; the first one is kept.`);
+        continue;
+      }
+      rooms[k] = r;
+    }
+    return rooms;
+  }
+
+  _readBackup() {
+    try {
+      return this._parse(fs.readFileSync(this.backup, 'utf8'), this.backup);
+    } catch {
+      return null;
+    }
+  }
+
+  // Writes `rooms` (default: the current state) to disk: a new file, flushed, then renamed over the old one, so a crash
+  // or power cut leaves either the old version or the new one, never an empty or half-written file. The old version
+  // is kept as rooms.json.bak.
   _save(rooms = this.rooms) {
     const tmp = this.file + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify({ version: 1, rooms }, null, 2), { mode: 0o600 });
+    const fd = fs.openSync(tmp, 'w', 0o600);
+    try {
+      fs.writeFileSync(fd, JSON.stringify({ version: 1, rooms }, null, 2));
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    try {
+      fs.copyFileSync(this.file, this.backup);
+      fs.chmodSync(this.backup, 0o600);
+    } catch (err) {
+      if (err.code !== 'ENOENT') console.error(`Could not keep a backup of ${this.file}: ${err.message}`);
+    }
     fs.renameSync(tmp, this.file);
+    fsyncDir(path.dirname(this.file));
   }
 
   // A copy of the registry to change. Nothing is visible until _commit() has saved it, so a failed write leaves the store as it was.

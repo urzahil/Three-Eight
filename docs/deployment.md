@@ -129,7 +129,7 @@ With Docker Compose, `.env` is only used to fill in the values `docker-compose.y
 | `DRIVE_CACHE_MB` | `256` | Drive stream cache in memory; minimum 32 MB |
 | `TLS_CERT` / `TLS_KEY` | — | Certificate and key for serving TLS directly instead of using a proxy |
 
-Invalid values for supported settings cause startup to fail with an error rather than silently changing the setting.
+Invalid values for supported settings cause startup to fail with an error rather than silently changing the setting. That includes `STUN_URLS` and `TURN_URLS` (each entry must look like `stun:host[:port]` or `turn:host[:port][?transport=udp|tcp]`, `stuns:`/`turns:` for TLS) and TURN without credentials: browsers refuse every connection when one ICE server is malformed, so a typo there would otherwise break every call. `TURN_URLS` needs `TURN_SECRET`, or both `TURN_USERNAME` and `TURN_PASSWORD`.
 
 ### Proxy trust notes
 
@@ -154,7 +154,7 @@ If exposing port `4567` directly without a reverse proxy, edit `docker-compose.y
 
 Usually, no. STUN is enough for many home connections. TURN can help a participant whose network or carrier NAT prevents peer-to-peer media connections. That participant may see a connection failure while others work. TURN relays that participant's traffic and consumes bandwidth on the TURN host.
 
-Three-Eight's Compose file includes a commented coturn service with step-by-step instructions. To use it, uncomment it and set `TURN_SECRET`, `TURN_REALM` (the TURN host name) and `TURN_URLS` in `.env` (see `.env.example`). For a separate coturn server, configure it with `use-auth-secret` and `static-auth-secret`, then set `TURN_URLS` and `TURN_SECRET` in Three-Eight. TURN credentials are handed out only to room members, after the password check, and are renewed while they stay connected; the public `/api/config` lists STUN servers only. The commented coturn service also caps relay bandwidth per link (`--max-bps`) and in total (`--bps-capacity`, in bytes per second): set the total to a little below what your server's connection carries. See the coturn documentation for firewall and relay-port requirements. Avoid enabling TURN unless needed, because relay traffic can be substantial.
+Three-Eight's Compose file includes a commented coturn service with step-by-step instructions. To use it, uncomment it and set `TURN_SECRET`, `TURN_REALM` (the TURN host name) and `TURN_URLS` in `.env` (see `.env.example`). For a separate coturn server, configure it with `use-auth-secret` and `static-auth-secret`, then set `TURN_URLS` and `TURN_SECRET` in Three-Eight. TURN credentials are handed out only to room members, after the password check, and are renewed while they stay connected; the public `/api/config` lists STUN servers only. With `TURN_SECRET`, every member gets a login of its own (`<expiry>:<member id>`), so coturn's per-login quota (`--user-quota`) counts one person's relays: a browser asks for a relay on each TURN URL for each friend it is linked to (33 with the three URLs of `.env.example` in a full room of 12). The commented coturn service also caps relay bandwidth per link (`--max-bps`) and in total (`--bps-capacity`, in bytes per second): set the total to a little below what your server's connection carries. See the coturn documentation for firewall and relay-port requirements. Avoid enabling TURN unless needed, because relay traffic can be substantial.
 
 ## Updating
 
@@ -166,3 +166,5 @@ docker compose up -d --build
 ```
 
 Room data is stored in the persistent volume, so the container can be rebuilt without deleting rooms. Back up the volume or its contents before maintenance.
+
+The rooms are in `rooms.json` in the data directory. Each change is written to a new file that is flushed to disk before it replaces the old one, and the previous version is kept as `rooms.json.bak`. If `rooms.json` is ever unreadable, the server moves it aside (`rooms.json.corrupt-<time>`) and starts from the backup, which lacks only the last change.

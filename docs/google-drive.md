@@ -51,6 +51,8 @@ Each room is associated with its own Drive folder. The service account may have 
 ## Limits and troubleshooting
 
 - Folder listings support up to 5,000 items; large folders display a notice.
+- Films in formats browsers can't play (AVI, WMV, FLV, MPEG, MPEG-TS...) are listed as "format not supported" instead of being offered for playback. Put an MP4 or MKV copy in the folder.
+- A file replaced in Drive by a new version keeps its ID: the server's cache tells the versions apart by size and content checksum, and viewers only trade pieces of the same version.
 - A room can have at most 3 × `MAX_ROOM_SIZE` Drive streams open at once, and one member at most 8. At most 64 requests wait for a free connection to Google before the server answers "busy, try again shortly".
 - The server makes at most 10 metadata calls to Google per second (listings, file details, folder checks) for all rooms together, with bursts of up to 100. This keeps one member from using up the service account's API quota, which every room shares.
 - Requests for files that are not in the room's folder are limited to 60 per address in 10 minutes. Past that, the address gets "too many requests" for every Drive request until the window ends. The app only asks for files a listing showed, so people using it normally don't reach the limit.
