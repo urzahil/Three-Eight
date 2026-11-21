@@ -1,6 +1,6 @@
 {
   "name": "three-eight",
-  "version": "3.4.3",
+  "version": "3.5.0",
   "description": "Peer-to-peer video meetups with synchronized movie watching, running entirely in the browser.",
   "main": "server/server.js",
   "private": true,
