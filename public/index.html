@@ -89,6 +89,13 @@
           <summary>Devices</summary>
           <label>Microphone <select id="lobby-audio-dev"></select></label>
           <label>Camera <select id="lobby-video-dev"></select></label>
+          <div id="lobby-output-wrap" class="field" hidden>
+            <label for="lobby-output-dev">Speakers or headphones (call and movie)</label>
+            <div class="select-row">
+              <select id="lobby-output-dev"></select>
+              <button id="lobby-output-choose" class="btn" type="button" title="Pick from the browser’s list of outputs" hidden>Choose…</button>
+            </div>
+          </div>
         </details>
         <details class="devices">
           <summary>Appearance</summary>

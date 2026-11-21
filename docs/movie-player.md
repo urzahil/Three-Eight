@@ -2,7 +2,7 @@
 
 Playback controls are synchronized for the room: play/pause, seeking, audio track and subtitle selection. Each browser corrects playback drift using shared state and timestamps. The film always plays at normal speed.
 
-The movie's volume is your own (the slider in the controls), and the movie plays through the speakers or headphones chosen in **Settings → Speakers or headphones**, like the call. That choice exists in Chrome, Edge and Firefox (Safari plays through the system's output); in Firefox, **Choose…** opens the browser's list of outputs. If the chosen output is not connected, the default one plays instead, until it is back.
+The movie's volume is your own (the slider in the controls), and the movie plays through the speakers or headphones chosen under **Speakers or headphones** (in the lobby's **Devices**, or in **Settings** during the call), like the call. That choice exists in Chrome, Edge and Firefox (Safari plays through the system's output); in Firefox, **Choose…** opens the browser's list of outputs. If the chosen output is not connected, the default one plays instead, until it is back.
 
 A click on the picture plays or pauses for everyone, and a double-click shows it full screen (without pausing anyone). On a phone or tablet a tap only shows or hides the controls: use the play button to play or pause, so a tap meant to find the controls never pauses the film for the room.
 
