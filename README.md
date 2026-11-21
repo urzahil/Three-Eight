@@ -133,7 +133,7 @@ See [Google Drive integration](docs/google-drive.md) for the full Docker mount e
 | `ALLOWED_ORIGINS` | — | Additional allowed WebSocket origins |
 | `MAX_ROOM_SIZE` | `12` | Room capacity (1–50); large rooms use more bandwidth |
 | `STUN_URLS` | Built-in STUN servers | STUN server list |
-| `TURN_URLS` | — | Optional TURN server URLs for difficult network connections |
+| `TURN_URLS` | — | Optional TURN server URLs for difficult network connections (needs `TURN_SECRET` or the static pair; checked at startup) |
 | `TURN_SECRET` | — | TURN shared secret for coturn's secret-based authentication |
 | `TURN_USERNAME` / `TURN_PASSWORD` | — | Alternative static TURN credentials |
 | `GOOGLE_SERVICE_ACCOUNT` | — | Service-account JSON key path for Drive integration |
@@ -149,6 +149,7 @@ With Docker Compose, only `ADMIN_PASSWORD`, `MAX_ROOM_SIZE`, the `TURN_*` variab
 - [Google Drive integration](docs/google-drive.md): service account setup, access model, limits.
 - [Customization](docs/customization.md): interface styles, colors, installing as an app.
 - [Development](docs/development.md): running locally and the test suites.
+- [Feature plans](docs/feature-plans.md): implementation notes for features that are not built yet.
 
 ## Troubleshooting
 
