@@ -2,7 +2,7 @@
 
 Video calls and synchronized movie nights with friends, directly in your browser. No app installation is required.
 
-- Video calls with camera, microphone, device selection, speaking indicators, and chat. A headset plugged in during a call shows up in the device lists at once, and an unplugged microphone or camera is replaced by the default one.
+- Video calls with camera, microphone, device selection, speaking indicators, and chat. A headset plugged in during a call shows up in the device lists at once, and an unplugged microphone or camera is replaced by the default one. In Chrome, Edge and Firefox, **Settings → Speakers or headphones** chooses where the call and the movie play.
 - Watch movies together with synchronized playback, seeking, audio tracks, and subtitles.
 - Share a movie from your device, stream it from a friend's copy, or use a room's Google Drive folder.
 - Screen sharing and picture-in-picture (browser support varies).

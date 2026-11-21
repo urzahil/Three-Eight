@@ -119,6 +119,24 @@ async function waitFor(page, fn, arg, timeout = 15000) {
   await waitFor(bob, () => [...document.querySelectorAll('.msg .body')].some((b) => b.textContent.includes('hello bob')));
   console.log('chat delivered');
 
+  // Speakers / headphones (Chromium has setSinkId): choosing the default plays the call and the movie there, without
+  // errors; an output that does not exist falls back to the default.
+  await bob.click('#t-settings');
+  await bob.waitForSelector('#settings-dialog[open]');
+  assert(await bob.isVisible('#set-output-dev'), 'the output picker is shown');
+  const outputs = await bob.evaluate(() => [...document.getElementById('set-output-dev').options].map((o) => [o.value, o.textContent]));
+  console.log('outputs listed:', JSON.stringify(outputs));
+  assert.strictEqual(outputs[0][0], '', 'the default comes first');
+  await bob.selectOption('#set-output-dev', '');
+  await waitFor(bob, () => room.output.id === '' && room.player.video.sinkId === '' && [...document.querySelectorAll('.tile:not(.self) video')].every((v) => v.sinkId === ''));
+  assert.strictEqual(await bob.evaluate(() => localStorage.getItem('te.audioOutput')), null);
+  assert(!/output/.test(await bob.textContent('#toasts')), 'no warning');
+  await bob.click('#settings-dialog button[value="save"]');
+  assert.strictEqual(await bob.evaluate(() => room.output.choose('no-such-output')), false);
+  assert.strictEqual(await bob.evaluate(() => room.player.video.sinkId), '');
+  await bob.evaluate(() => room.output.choose(''));
+  console.log('speaker picker: default chosen, a missing output falls back');
+
   // --- movie
   await alice.setInputFiles('#movie-file', MOVIE);
   await waitFor(alice, () => !document.getElementById('stage').hidden && document.getElementById('movie').readyState >= 2, null, 20000);

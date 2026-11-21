@@ -88,6 +88,10 @@ h2 { font-size: 20px; }
 /* ---- Forms & buttons ---- */
 label { display: flex; flex-direction: column; gap: 6px; font-size: 13px; color: var(--muted); }
 label.check { flex-direction: row; align-items: center; gap: 8px; color: var(--text); font-size: 14px; }
+.field { display: flex; flex-direction: column; gap: 6px; font-size: 13px; } /* like a label, for more than one control */
+.select-row { display: flex; gap: 8px; }
+.select-row select { flex: 1; min-width: 0; }
+.select-row .btn { flex: none; padding: 8px 12px; }
 input:not([type=checkbox]):not([type=range]):not([type=file]), select {
   font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line);
   border-radius: var(--r-control); padding: 10px 12px; width: 100%; outline: none;

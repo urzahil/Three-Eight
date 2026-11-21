@@ -51,6 +51,7 @@ export class Tiles {
         return;
       }
       t?.stopLevel?.();
+      if (t) this.output?.detach(t.video);
       t?.el.remove();
       this.tiles.delete(peer.id);
       const prof = this.profiles.get(peer.id);
@@ -126,6 +127,7 @@ export class Tiles {
     }
     el.append(video, avatar, label, state);
     $('grid').appendChild(el);
+    if (!self) this.output?.attach(video); // the speakers or headphones chosen in Settings (see room/settings.js)
     const tile = { el, video, avatar, nameEl, micIcon, state };
     this.tiles.set(id, tile);
     this._layout();
