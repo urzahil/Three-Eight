@@ -57,6 +57,12 @@ if ('serviceWorker' in navigator && window.isSecureContext) {
   navigator.serviceWorker.register('/sw.js').catch((err) => console.warn('service worker not registered:', err));
 }
 
+// Leaving the page closes the room's connections (Room.leave on 'pagehide'), which lets the browser keep the page in
+// its back/forward cache. Coming back with Back must not show that dead room (or a lobby whose devices are gone).
+window.addEventListener('pageshow', (e) => {
+  if (e.persisted && roomName) location.reload();
+});
+
 // Interface style pickers (start page, lobby, settings); a PiP window follows the change too.
 for (const select of document.querySelectorAll('select[data-theme-select]')) bindThemeSelect(select, () => [pipState.document]);
 
@@ -157,7 +163,9 @@ async function startLobby(room) {
   };
   $('lobby-audio-dev').onchange = (e) => changeDevice('audio', e.target.value);
   $('lobby-video-dev').onchange = (e) => changeDevice('video', e.target.value);
-  $('lobby-mic').onclick = () => media.setMic(!media.micOn);
+  $('lobby-mic').onclick = async () => {
+    if (!(await media.toggleMic())) toast('Could not access a microphone.', 'warn');
+  };
   $('lobby-cam').onclick = async () => {
     const ok = await media.setCam(!media.camOn);
     if (!ok) toast('Could not start the camera.', 'warn');
@@ -189,7 +197,7 @@ async function startLobby(room) {
         signaling?.close();
         signaling = new Signaling(`${proto}//${location.host}/ws`);
         signaling.addEventListener('retrying', (ev) => {
-          $('lobby-join').textContent = `Can’t reach the server, retrying (${ev.detail.attempt})…`;
+          $('lobby-join').textContent = ev.detail.busy ? 'The server is busy, retrying…' : `Can’t reach the server, retrying (${ev.detail.attempt})…`;
         });
         return signaling.join({ room: info.name, id: me.id, secret: me.secret, name, password });
       };
@@ -324,16 +332,26 @@ class Room {
     signaling.addEventListener('ice', (e) => this.mesh.setIceServers(e.detail)); // renewed before the old ones expire
     signaling.addEventListener('drive', (e) => this._setDrive(e.detail));
     signaling.addEventListener('fatal', (e) => {
+      const { code } = e.detail;
       // A reload must not come back with an id that somebody else holds.
-      if (e.detail.code === 'id-taken') resetSession();
+      if (code === 'id-taken') resetSession();
       this.leave(false);
-      showMessage('Disconnected', e.detail.message || 'You were disconnected from the room.');
+      if (code === 'bad-password') {
+        // Changed by the admin while we were reconnecting: the remembered one no longer opens the room.
+        store.set('pw.' + roomName.toLowerCase(), null);
+        showMessage('The room password changed', 'The room password was changed while you were disconnected. Rejoin with the new password.');
+      } else {
+        showMessage('Disconnected', e.detail.message || 'You were disconnected from the room.');
+      }
+      // Removed by the admin, or the room is gone: rejoining is not the way on.
+      if (code !== 'kicked' && code !== 'room-deleted' && code !== 'no-room') this._offerRejoin();
     });
     // This tab's id joined again elsewhere (a duplicated tab shares it): that connection took over, this one is done.
     signaling.addEventListener('replaced', () => {
       // The other tab uses the same Drive cookie: leave it in place.
       this.leave(false, { keepDriveSession: true });
-      showMessage('Opened in another tab', 'You joined this room again in another tab or window, so this one was disconnected. Reload to join here instead.');
+      showMessage('Opened in another tab', 'You joined this room again in another tab or window, so this one was disconnected. Rejoin to use this one instead.');
+      this._offerRejoin();
     });
     window.addEventListener('pagehide', () => this.leave(false));
     this._wakeLock();

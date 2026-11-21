@@ -1,7 +1,7 @@
 // Unit tests for the browser-side subtitle parsers and fMP4 writer (pure functions).
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { parseSrt, parseVtt, parseAss, normalizeEmbeddedCue, activeCues, cueToVtt, closeGaps } from '../public/assets/js/player/subtitles.js';
+import { parseSrt, parseVtt, parseAss, normalizeEmbeddedCue, activeCues, cueToVtt, closeGaps, NativeCaptions, decodeSubtitleBytes } from '../public/assets/js/player/subtitles.js';
 import { fragment, initSegment } from '../public/assets/js/player/fmp4.js';
 import { avcCodecString, aacCodecString, makeAsc, mp4TrackFromMatroska, dOpsFromOpusHead } from '../public/assets/js/player/codecs.js';
 
@@ -267,4 +267,81 @@ test('MKV: a SeekHead that points to a second SeekHead (which lists the Cues) is
   await d._followSeeks(seeks, heads, new Set(), new Set([100]));
   assert.deepStrictEqual(reads, [5000, 9000], 'the second SeekHead, then the Cues it lists; nothing twice');
   assert.deepStrictEqual(handled, [SEEKHEAD, CUES]);
+});
+
+test('NativeCaptions: the caption track shows in iPhone full screen (the system player), and hides again after', () => {
+  const hadDocument = 'document' in globalThis;
+  const hadCue = 'VTTCue' in globalThis;
+  globalThis.document ??= { pictureInPictureElement: null };
+  globalThis.VTTCue ??= class { constructor(start, end, text) { Object.assign(this, { start, end, text }); } };
+  try {
+    const video = new EventTarget();
+    video.addTextTrack = () => ({ mode: 'disabled', cues: [], addCue(c) { this.cues.push(c); }, removeCue(c) { this.cues.splice(this.cues.indexOf(c), 1); } });
+    const nc = new NativeCaptions(video);
+    nc.set([{ start: 1, end: 2, text: 'Hi' }], 0, true);
+    assert.strictEqual(nc.track.mode, 'hidden', 'in the page our own overlay draws the lines');
+    video.dispatchEvent(new Event('webkitbeginfullscreen'));
+    assert.strictEqual(nc.track.mode, 'showing');
+    video.dispatchEvent(new Event('webkitendfullscreen'));
+    assert.strictEqual(nc.track.mode, 'hidden');
+  } finally {
+    if (!hadDocument) delete globalThis.document;
+    if (!hadCue) delete globalThis.VTTCue;
+  }
+});
+
+// ---- subtitle file encodings -------------------------------------------------------------------------------------
+
+/** Text in a one-byte code page (what older subtitle files are). */
+function legacyBytes(text, enc) {
+  const map = new Map();
+  for (let i = 0; i < 256; i++) {
+    const c = new TextDecoder(enc).decode(new Uint8Array([i]));
+    if (c !== '�' && !map.has(c)) map.set(c, i);
+  }
+  return new Uint8Array([...text].map((c) => map.get(c)));
+}
+const srtOf = (line) => `1\r\n00:00:01,000 --> 00:00:03,000\r\n${line}\r\n\r\n2\r\n00:00:04,000 --> 00:00:06,000\r\n${line}\r\n`;
+
+test('subtitle encodings: UTF-8 and UTF-16, with or without a byte-order mark', () => {
+  const text = srtOf('Ciao è così — Привет — 你好');
+  assert.strictEqual(decodeSubtitleBytes(new TextEncoder().encode(text)).text, text);
+  assert.strictEqual(decodeSubtitleBytes(new Uint8Array([0xef, 0xbb, 0xbf, ...new TextEncoder().encode(text)])).text, text, 'the BOM is dropped');
+  const le = Buffer.from(text, 'utf16le');
+  const be = Buffer.from(le).swap16();
+  for (const [bytes, enc] of [[Buffer.concat([Buffer.from([0xff, 0xfe]), le]), 'utf-16le'], [Buffer.concat([Buffer.from([0xfe, 0xff]), be]), 'utf-16be'], [le, 'utf-16le'], [be, 'utf-16be']]) {
+    const r = decodeSubtitleBytes(new Uint8Array(bytes));
+    assert.strictEqual(r.encoding, enc);
+    assert.strictEqual(r.text, text);
+    assert.strictEqual(parseSrt(r.text).length, 2, `${enc}: its cues are read`);
+  }
+});
+
+test('subtitle encodings: an old code page is recognised by its script, whatever the browser language', () => {
+  for (const [enc, line] of [
+    ['windows-1252', 'Ciao, è così bello vederti qui. Perché non resti un po\' in città?'],
+    ['windows-1252', '¿Dónde está el niño? ¡Llegó tarde otra vez, señor!'],
+    ['windows-1251', 'Привет, как дела? Я не знаю, что сказать тебе сегодня вечером.'],
+    ['windows-1253', 'Καλημέρα, τι κάνεις; Είμαι πολύ καλά, ευχαριστώ πολύ.'],
+    ['windows-1254', 'Günaydın, nasılsın? Bugün çok güzel bir gün, değil mi? Şimdi gidiyorum.'],
+    ['windows-1255', 'שלום, מה שלומך היום? אני מאוד שמח לראות אותך.'],
+    ['windows-1256', 'مرحبا، كيف حالك اليوم؟ أنا سعيد جدا برؤيتك.'],
+    ['windows-1250', 'Zażółć gęślą jaźń. Dzień dobry, jak się masz?'],
+  ]) {
+    for (const lang of ['', 'en-US', 'it-IT', 'ru-RU']) {
+      const r = decodeSubtitleBytes(legacyBytes(srtOf(line), enc), { lang });
+      assert.strictEqual(r.encoding, enc, `${line.slice(0, 20)} (${lang || 'no language'})`);
+      assert(r.text.includes(line));
+    }
+  }
+});
+
+test('subtitle encodings: the browser language and the setting decide what the text cannot', () => {
+  const czech = srtOf('Dobrý den, jak se máš? Příliš žluťoučký kůň úpěl ďábelské ódy.');
+  assert.strictEqual(decodeSubtitleBytes(legacyBytes(czech, 'windows-1250'), { lang: 'cs-CZ' }).encoding, 'windows-1250');
+  const hu = srtOf('Árvíztűrő tükörfúrógép.');
+  assert.strictEqual(decodeSubtitleBytes(legacyBytes(hu, 'windows-1250'), { lang: 'it-IT', encoding: 'windows-1250' }).encoding, 'windows-1250', 'the setting');
+  assert(decodeSubtitleBytes(legacyBytes(hu, 'windows-1250'), { encoding: 'windows-1250' }).text.includes('Árvíztűrő'));
+  const utf8 = new TextEncoder().encode(srtOf('è così'));
+  assert.strictEqual(decodeSubtitleBytes(utf8, { encoding: 'windows-1251' }).encoding, 'utf-8', 'the setting is only for files that are not Unicode');
 });

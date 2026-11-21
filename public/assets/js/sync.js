@@ -9,9 +9,11 @@
 
 const DRIFT_SEEK = 1.0; // seconds off → hard seek
 const DRIFT_NUDGE = 0.06; // seconds off → adjust playback speed
+const NATIVE_SEEK_SETTLE_MS = 400; // a seek made with the browser's own controls is shared once it has settled
 
 export function emptyState() {
-  return { seq: 0, by: '', movie: null, paused: true, pos: 0, at: 0, rate: 1, audio: 0, sub: null, subFiles: [] };
+  // The film always plays at normal speed: there is no rate. (A `rate` from an older client is ignored.)
+  return { seq: 0, by: '', movie: null, paused: true, pos: 0, at: 0, audio: 0, sub: null, subFiles: [] };
 }
 
 function newer(a, b) {
@@ -85,7 +87,6 @@ export function cleanState(s) {
     paused: s.paused,
     pos: s.pos,
     at: s.at,
-    rate: isNum(s.rate) ? Math.min(4, Math.max(0.25, s.rate)) : 1,
     audio: Number.isSafeInteger(s.audio) ? Math.min(64, Math.max(0, s.audio)) : 0,
     sub: typeof s.sub === 'string' && s.sub ? short(s.sub, 100) : null,
     subFiles,
@@ -148,7 +149,23 @@ export class MovieSync extends EventTarget {
     player.addEventListener('play', () => this._onMediaEvent('play'));
     player.addEventListener('pause', () => this._onMediaEvent('pause'));
     player.addEventListener('reloading', () => this.expectMediaChange(3000));
+    // The browser's own controls (system PiP, iPhone full screen) can seek too: share it, or drift correction undoes it.
+    player.addEventListener('seeking', () => this._onNativeSeek());
     this._timer = setInterval(() => this._tick(), 500);
+  }
+
+  /** A seek that our code did not ask for, made with the browser's own controls: becomes a seek for the room. */
+  _onNativeSeek() {
+    const p = this.player;
+    if (!p.loaded || !this.fileMatches || !p.systemControls || p.atOwnSeek()) return;
+    // Scrubbing is a run of seeks: share where it ends. Until then, drift correction leaves the position alone.
+    clearTimeout(this._nativeSeekTimer);
+    this._nativeSeekTimer = setTimeout(() => {
+      this._nativeSeekTimer = 0;
+      if (!p.loaded || !this.fileMatches || p.atOwnSeek()) return;
+      const t = p.time;
+      if (Math.abs(t - this.expectedPosition()) > DRIFT_SEEK) this.seek(t);
+    }, NATIVE_SEEK_SETTLE_MS);
   }
 
   /** Call right before code that makes the <video> play, pause, seek or move. */
@@ -180,7 +197,7 @@ export class MovieSync extends EventTarget {
   /** Where the movie should be right now according to the shared state. */
   expectedPosition(s = this.state) {
     if (s.paused) return s.pos;
-    const t = s.pos + ((this.now() - s.at) / 1000) * (s.rate || 1);
+    const t = s.pos + (this.now() - s.at) / 1000;
     const d = s.movie?.duration;
     return d ? Math.min(t, d) : t;
   }
@@ -271,7 +288,9 @@ export class MovieSync extends EventTarget {
   }
 
   seek(pos) {
-    this._commit({ pos: Math.max(0, pos), at: this.now() });
+    // Never past the end (skipping forward near the end, or a key held down): the position would run on beyond it.
+    const d = this.state.movie?.duration || this.player.duration || 0;
+    this._commit({ pos: Math.max(0, d > 0 ? Math.min(pos, d) : pos), at: this.now() });
   }
 
   setAudio(index) {
@@ -433,7 +452,7 @@ export class MovieSync extends EventTarget {
   _tick() {
     const s = this.state;
     const p = this.player;
-    if (!this.fileMatches || !p.loaded) return;
+    if (!this.fileMatches || !p.loaded || this._nativeSeekTimer) return;
     if (s.paused || p.paused || p.video.seeking || p.video.readyState < 3) {
       if (!s.paused && p.paused && !this.blocked) this._apply(false);
       if (p.playbackRate !== 1) p.playbackRate = 1;
@@ -536,6 +555,7 @@ export class MovieSync extends EventTarget {
 
   destroy() {
     clearInterval(this._timer);
+    clearTimeout(this._nativeSeekTimer);
     if (this._onSeeked) this.player.removeEventListener('seeked', this._onSeeked);
     this._onSeeked = null;
   }

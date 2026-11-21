@@ -4,24 +4,34 @@
 import { subtitleMatches } from '../drive.js';
 import { $, icon, fmtSize } from './util.js';
 
+// The menu buttons of the movie controls and their menus.
+const MENUS = [['m-audio', 'm-audio-menu'], ['m-subs', 'm-subs-menu']];
+
 export class MovieMenus {
   _initMenus() {
-    const pairs = [['m-audio', 'm-audio-menu'], ['m-subs', 'm-subs-menu']];
-    for (const [btn, menu] of pairs) {
+    for (const [btn, menu] of MENUS) {
+      $(btn).setAttribute('aria-haspopup', 'true');
+      $(btn).setAttribute('aria-controls', menu);
+      $(btn).setAttribute('aria-expanded', 'false');
       $(btn).onclick = (e) => {
         e.stopPropagation();
-        const m = $(menu);
-        const open = m.hidden;
-        for (const [, other] of pairs) $(other).hidden = true;
-        m.hidden = !open;
+        this._openMenu($(menu).hidden ? menu : null);
         this._renderMenus();
       };
     }
     // Also attached to the Picture-in-Picture document while it is open.
     this._onDocClick = (e) => {
-      if (!e.target.closest('.menu')) for (const [, m] of pairs) $(m).hidden = true;
+      if (!e.target.closest('.menu')) this._openMenu(null);
     };
     document.addEventListener('click', this._onDocClick);
+  }
+
+  /** Show one of the movie menus (by id), or none; their buttons say which is open (aria-expanded). */
+  _openMenu(id) {
+    for (const [btn, menu] of MENUS) {
+      $(menu).hidden = menu !== id;
+      $(btn).setAttribute('aria-expanded', String(menu === id));
+    }
   }
 
   _menuItem(label, on, onClick, note, disabled) {
@@ -42,7 +52,7 @@ export class MovieMenus {
     b.onclick = (e) => {
       e.stopPropagation();
       onClick();
-      for (const id of ['m-audio-menu', 'm-subs-menu']) $(id).hidden = true;
+      this._openMenu(null);
     };
     return b;
   }
@@ -124,7 +134,7 @@ export class MovieMenus {
     b.append(icon('folder'), document.createTextNode(label));
     b.onclick = (e) => {
       e.stopPropagation();
-      $('m-subs-menu').hidden = true;
+      this._openMenu(null);
       $(inputId).click();
     };
     return b;

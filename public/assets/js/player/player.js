@@ -54,6 +54,30 @@ async function openDemuxer(file) {
   return null;
 }
 
+/**
+ * Containers that no browser plays, recognised by their first bytes: a message saying so (and how to convert the film)
+ * instead of the browser's own "cannot play" error after it tried.
+ */
+async function unsupportedContainer(file) {
+  let b;
+  try {
+    b = new Uint8Array(await file.slice(0, 192).arrayBuffer());
+  } catch (err) {
+    if (err?.remote) throw err;
+    return '';
+  }
+  const ascii = (from, to) => String.fromCharCode(...b.subarray(from, to));
+  let format = '';
+  if (ascii(0, 4) === 'RIFF' && ascii(8, 12) === 'AVI ') format = 'AVI';
+  else if (b[0] === 0x30 && b[1] === 0x26 && b[2] === 0xb2 && b[3] === 0x75) format = 'WMV';
+  else if (ascii(0, 3) === 'FLV') format = 'FLV';
+  else if (b[0] === 0 && b[1] === 0 && b[2] === 1 && b[3] === 0xba) format = 'MPEG';
+  else if (ascii(0, 4) === '.RMF') format = 'RealMedia';
+  else if (b.length > 188 && b[0] === 0x47 && b[188] === 0x47) format = 'MPEG-TS';
+  if (!format) return '';
+  return `${format} files can't be played in a browser. Convert the film to MP4 or MKV (H.264 video, AAC audio), for example with HandBrake or ffmpeg, and open that copy.`;
+}
+
 function nativeContainerSupport(file, demux) {
   const v = document.createElement('video');
   const name = file.name.toLowerCase();
@@ -182,7 +206,24 @@ export class MoviePlayer extends EventTarget {
   seek(t) {
     const d = this.duration;
     const clamped = Math.max(0, d ? Math.min(t, d - 0.05) : t);
+    this._ownSeek = clamped;
     this.video.currentTime = this.mode === 'mse' ? clamped + SHIFT : clamped;
+  }
+
+  /**
+   * Is the element at the position our own code last asked for (a seek, or where a (re)start began)? A 'seeking'
+   * event elsewhere came from the browser's own controls (system PiP, iPhone full screen, Firefox's PiP window).
+   */
+  atOwnSeek() {
+    return this._ownSeek != null && Math.abs(this.time - this._ownSeek) < 0.3;
+  }
+
+  /** Are the browser's own controls in front of the user (where they can seek without us)? */
+  get systemControls() {
+    const v = this.video;
+    if (typeof document === 'undefined') return false;
+    // Firefox has no PiP API for pages, but its own PiP window has a seek bar.
+    return document.pictureInPictureElement === v || this.nativeCaptions.systemFullscreen || !('pictureInPictureEnabled' in document);
   }
 
   set playbackRate(r) {
@@ -241,6 +282,11 @@ export class MoviePlayer extends EventTarget {
     this._emit('status', { text: file.peerOnly ? 'Connecting to your friend…' : file.remote ? 'Connecting to Google Drive…' : 'Reading file…' });
     const demux = await openDemuxer(file);
     if (token !== this._loadToken) return;
+    if (!demux) {
+      const why = await unsupportedContainer(file);
+      if (token !== this._loadToken) return;
+      if (why) throw Object.assign(new Error(why), { userMessage: why, permanent: true });
+    }
     this.demux = demux;
     this.videoTrack = demux?.tracks.find((t) => t.type === 'video' && t.codecString) || null;
     const audio = demux ? demux.tracks.filter((t) => t.type === 'audio') : [];
@@ -324,6 +370,7 @@ export class MoviePlayer extends EventTarget {
       this.objectUrl = null;
     }
     this.mode = mode;
+    this._ownSeek = startTime || 0; // the element starts there: not a seek by the user
     this.triedModes = this.triedModes || new Set();
     this.triedModes.add(mode);
     if (mode === 'native' && this.file.remote && this.file.prepareNative) {

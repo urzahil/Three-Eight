@@ -3,17 +3,20 @@
 
 import { audioContext } from '../media.js';
 import { sameMovie } from '../sync.js';
+import { decodeSubtitleBytes, SUBTITLE_ENCODINGS } from '../player/subtitles.js';
 import { $, store, toast, setIcon, fmtTime, fmtSize, randomId, hashText, pipState } from './util.js';
 
-/** Subtitle file bytes as text: UTF-8, or Windows-1252 / Latin-1 (most older files) when it isn't UTF-8. */
+// How long a click on the picture waits for a second click before it plays or pauses (see _initVideoClicks).
+const DOUBLE_CLICK_MS = 300;
+
+/**
+ * Subtitle file bytes as { text, note }: Unicode as such, an older code page as set in Settings or, by default,
+ * recognised (see decodeSubtitleBytes). `note` names that code page for the toast, so a wrong guess can be fixed.
+ */
 function decodeSubtitle(bytes) {
-  const text = new TextDecoder().decode(bytes);
-  if (!text.includes('\uFFFD')) return text;
-  try {
-    return new TextDecoder('windows-1252').decode(bytes);
-  } catch {
-    return text;
-  }
+  const { text, encoding } = decodeSubtitleBytes(bytes, { encoding: store.get('subEncoding', 'auto'), lang: navigator.language });
+  const label = /^utf-/.test(encoding) ? '' : SUBTITLE_ENCODINGS.find(([id]) => id === encoding)?.[1] || encoding;
+  return { text, note: label ? ` Read as ${label}: if the text looks wrong, choose the file's encoding in Settings and load it again.` : '' };
 }
 
 export class Movie {
@@ -51,18 +54,17 @@ export class Movie {
       e.target.value = '';
       if (!f) return;
       if (f.size > 5 * 1024 * 1024) return toast('Subtitle file is too large.', 'warn');
-      const text = decodeSubtitle(new Uint8Array(await f.arrayBuffer()));
+      const { text, note } = decodeSubtitle(new Uint8Array(await f.arrayBuffer()));
       // 'p' ids never match a shared file's 'x' id, so the room sharing the same file later can't remove ours.
       this.sync.addMySubtitleFile({ id: 'p' + (await hashText(text)), name: f.name, text });
-      toast(`Subtitles “${f.name}” loaded just for you.`);
+      toast(`Subtitles “${f.name}” loaded just for you.${note}`, '', note ? 8000 : 0);
     });
 
     // Controls
     $('m-play').onclick = () => this._userAction(() => sync.toggle());
     $('m-back').onclick = () => this._userAction(() => sync.seek(Math.max(0, this._pos() - this.seekStep)));
     $('m-fwd').onclick = () => this._userAction(() => sync.seek(this._pos() + this.seekStep));
-    box.querySelector('video').addEventListener('click', () => this._userAction(() => sync.toggle()));
-    box.querySelector('video').addEventListener('dblclick', () => this.toggleFullscreen());
+    this._initVideoClicks(box);
     $('m-volume').value = p.video.volume;
     $('m-volume').oninput = (e) => {
       p.video.volume = Number(e.target.value);
@@ -87,13 +89,16 @@ export class Movie {
 
     // Hide controls when idle.
     let idleTimer = 0;
+    const hide = () => {
+      clearTimeout(idleTimer);
+      if (!p.paused && !box.querySelector('.menu:not([hidden])')) box.classList.add('idle');
+    };
     const wake = () => {
       box.classList.remove('idle');
       clearTimeout(idleTimer);
-      idleTimer = setTimeout(() => {
-        if (!p.paused && !box.querySelector('.menu:not([hidden])')) box.classList.add('idle');
-      }, 3000);
+      idleTimer = setTimeout(hide, 3000);
     };
+    this._hideMovieControls = hide;
     box.addEventListener('pointermove', wake);
     box.addEventListener('pointerdown', wake);
     p.addEventListener('pause', wake);
@@ -142,12 +147,44 @@ export class Movie {
     fn();
   }
 
+  /**
+   * Clicks on the picture. Play/pause is the whole room's, so a click must mean it:
+   *  - mouse: a single click toggles, a double-click goes full screen only. The toggle waits DOUBLE_CLICK_MS for a
+   *    second click (otherwise a double-click would pause and resume the film for everyone).
+   *  - touch: a tap shows the hidden controls, or hides them when they are showing. It never plays or pauses: a
+   *    tap meant to find the controls must not pause the film for everyone (the play button is right there).
+   */
+  _initVideoClicks(box) {
+    const video = box.querySelector('video');
+    let pointer = 'mouse';
+    let wasIdle = false;
+    let clickTimer = 0;
+    // The video's own listener runs before the box's (which shows the controls): it sees whether they were hidden.
+    video.addEventListener('pointerdown', (e) => {
+      pointer = e.pointerType || 'mouse';
+      wasIdle = box.classList.contains('idle');
+    });
+    video.addEventListener('click', (e) => {
+      clearTimeout(clickTimer);
+      if (pointer === 'touch') {
+        if (!wasIdle) this._hideMovieControls?.();
+        return;
+      }
+      if (e.detail > 1) return; // the second click of a double-click: 'dblclick' handles it
+      clickTimer = setTimeout(() => this._userAction(() => this.sync.toggle()), DOUBLE_CLICK_MS);
+    });
+    video.addEventListener('dblclick', () => {
+      clearTimeout(clickTimer);
+      this.toggleFullscreen();
+    });
+  }
+
   /** Decode subtitle bytes and share them with the room (from a local file or Google Drive). */
   async _shareSubtitle(name, bytes, message) {
-    const text = decodeSubtitle(bytes);
+    const { text, note } = decodeSubtitle(bytes);
     const id = 'x' + (await hashText(text));
     this.sync.addSubtitleFile({ id, name, text });
-    toast(message || `Subtitles “${name}” shared with everyone.`);
+    toast((message || `Subtitles “${name}” shared with everyone.`) + note, '', note ? 8000 : 0);
   }
 
   openMovieDialog() {
@@ -155,7 +192,12 @@ export class Movie {
     if (!this.sync.state.movie && !this.sync.localFile && !this._screenAllowsMovie()) return;
     this._renderMovieDialog();
     this._renderDriveSection();
-    $('movie-dialog').showModal();
+    const d = $('movie-dialog');
+    // The close handler acts on returnValue, and closing with Esc (or a phone's back gesture) leaves it as it was
+    // (HTML spec; Firefox and Safari follow it): without this, Esc would repeat the last choice, e.g. "Close the
+    // movie for everyone".
+    d.returnValue = '';
+    d.showModal();
   }
 
   _renderMovieDialog() {
@@ -299,7 +341,11 @@ export class Movie {
     }
     this.sync.setLocalFile(info, asRoom);
     if (asRoom && file.drive?.folder) this._autoDriveSubtitle(file); // in the background: never holds up playback
-    if (asRoom) this.mesh.broadcast({ type: 'chat', msg: { id: randomId(), from: this.id, name: this.name, text: `🎬 Started a movie: ${file.name}`, ts: this.signaling.now() } });
+    if (asRoom) {
+      const msg = { id: randomId(), from: this.id, name: this.name, text: `🎬 Started a movie: ${file.name}`, ts: this.signaling.now() };
+      this._addChat(msg); // in our own log too, like everything else we say
+      this.mesh.broadcast({ type: 'chat', msg });
+    }
     this._renderStage();
     this._renderMenus();
   }
@@ -445,6 +491,16 @@ export class Movie {
   _showTimes(t, d) {
     $('m-time').textContent = fmtTime(t);
     $('m-duration').textContent = this._showRemaining ? `\u2212${fmtTime(Math.ceil(Math.max(0, d - t)))}` : fmtTime(d);
+    // The seek bar is a slider for assistive technology too: its value, in whole seconds (no chatter in between).
+    const now = Math.floor(t);
+    const max = Math.floor(d);
+    if (now === this._ariaSeek?.now && max === this._ariaSeek?.max) return;
+    this._ariaSeek = { now, max };
+    const bar = $('m-seek');
+    bar.setAttribute('aria-valuemin', '0');
+    bar.setAttribute('aria-valuemax', String(max));
+    bar.setAttribute('aria-valuenow', String(Math.min(now, max || now)));
+    bar.setAttribute('aria-valuetext', max ? `${fmtTime(t)} of ${fmtTime(d)}` : fmtTime(t));
   }
 
   _initSeekBar() {

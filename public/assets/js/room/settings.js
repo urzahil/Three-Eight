@@ -2,6 +2,10 @@
 // Methods of the Room (installed on its prototype by app.js); `this` is the Room.
 
 import { $, store, setIcon, toast } from './util.js';
+import { SUBTITLE_ENCODINGS } from '../player/subtitles.js';
+
+const MAX_SUB_DELAY = 600; // seconds either way
+const SUB_DELAY_MOVIES = 50; // movies whose subtitle delay is remembered
 
 export class Settings {
   _updateSeekTitles() {
@@ -61,9 +65,21 @@ export class Settings {
       store.set('pipStyle', e.target.value);
       this.closePip(); // the next click uses the new style
     };
+    // Older subtitle files are in a code page; "Automatic" recognises the common ones (see decodeSubtitleBytes).
+    const enc = $('set-subenc');
+    enc.replaceChildren(...SUBTITLE_ENCODINGS.map(([id, label]) => new Option(label, id)));
+    const savedEnc = store.get('subEncoding', 'auto');
+    enc.value = SUBTITLE_ENCODINGS.some(([id]) => id === savedEnc) ? savedEnc : 'auto';
+    enc.onchange = (e) => store.set('subEncoding', e.target.value === 'auto' ? null : e.target.value);
     $('set-subdelay').oninput = (e) => {
-      this.player.subtitleDelay = Number(e.target.value) || 0;
+      const v = Number(e.target.value);
+      const delay = Number.isFinite(v) ? Math.max(-MAX_SUB_DELAY, Math.min(MAX_SUB_DELAY, v)) : 0;
+      this.player.subtitleDelay = delay;
+      this._saveSubDelay(delay);
     };
+    // A delay belongs to one movie (one file's subtitles): another movie starts with its own, or none.
+    this.sync.addEventListener('state', () => this._restoreSubDelay());
+    this._restoreSubDelay();
     $('settings-dialog').addEventListener('close', () => {
       const name = $('set-name').value.trim().slice(0, 40);
       if (name && name !== this.name) {
@@ -75,6 +91,38 @@ export class Settings {
         this._renderPeople();
       }
     });
+  }
+
+  /** Which movie a subtitle delay is kept for: its fingerprint, its Drive file, or its name and size. '' without one. */
+  _subDelayKey() {
+    const m = this.sync.state.movie;
+    if (!m) return '';
+    return m.fp || (m.drive?.id ? `d:${m.drive.id}` : `${m.name}:${m.size}`);
+  }
+
+  _savedSubDelays() {
+    const list = store.get('subDelays', []);
+    return Array.isArray(list) ? list.filter((e) => Array.isArray(e) && typeof e[0] === 'string' && Number.isFinite(e[1])) : [];
+  }
+
+  /** The room's movie changed (or closed): use the delay this browser kept for it, else none. */
+  _restoreSubDelay() {
+    const key = this._subDelayKey();
+    if (key === this._subDelayFor) return;
+    this._subDelayFor = key;
+    const saved = key ? this._savedSubDelays().find((e) => e[0] === key)?.[1] : 0;
+    const delay = Number.isFinite(saved) ? saved : 0;
+    this.player.subtitleDelay = delay;
+    $('set-subdelay').value = String(delay);
+  }
+
+  /** Keep the delay for the current movie (the most recent SUB_DELAY_MOVIES movies). */
+  _saveSubDelay(delay) {
+    const key = this._subDelayKey();
+    if (!key) return;
+    const list = this._savedSubDelays().filter((e) => e[0] !== key);
+    if (delay) list.push([key, delay]);
+    store.set('subDelays', list.length ? list.slice(-SUB_DELAY_MOVIES) : null);
   }
 
   async _changeDevice(kind, deviceId) {

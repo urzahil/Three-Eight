@@ -547,6 +547,29 @@ class Peer {
   }
 }
 
+/**
+ * The ICE servers this browser accepts. A browser refuses to create any RTCPeerConnection when one server in the
+ * list is unusable to it (a malformed URL, a TURN server without credentials): every call would fail. The server
+ * checks its settings at startup, but a browser can be stricter, so the servers are tried here too and the refused
+ * ones left out (direct connections still work on most networks).
+ */
+export function usableIceServers(servers) {
+  if (!Array.isArray(servers)) return [];
+  if (!servers.length || typeof RTCPeerConnection !== 'function') return servers;
+  const accepts = (list) => {
+    try {
+      new RTCPeerConnection({ iceServers: list, bundlePolicy: 'max-bundle' }).close();
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  if (accepts(servers)) return servers;
+  const ok = servers.filter((s) => accepts([s]));
+  console.warn(`This browser refused ${servers.length - ok.length} of ${servers.length} ICE servers; using the others.`);
+  return ok;
+}
+
 /** Set the upload limit of a sender (and how it degrades), if it changed. */
 function capSender(sender, maxBitrate, degradation) {
   try {
@@ -574,7 +597,7 @@ export class Mesh extends EventTarget {
     super();
     this.signaling = signaling;
     this.selfId = selfId;
-    this.iceServers = iceServers;
+    this.iceServers = usableIceServers(iceServers);
     this.peers = new Map();
     this.tracks = { audio: null, video: null, screen: null };
     this.outStream = new MediaStream(); // camera and microphone
@@ -796,7 +819,8 @@ export class Mesh extends EventTarget {
    * New ICE servers (renewed TURN credentials): new links use them, and existing ones for their next ICE restart
    * (a TURN allocation made with expired credentials cannot be renewed).
    */
-  setIceServers(iceServers) {
+  setIceServers(list) {
+    const iceServers = usableIceServers(list);
     this.iceServers = iceServers;
     for (const p of this.peers.values()) {
       try {

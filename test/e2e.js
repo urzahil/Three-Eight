@@ -155,6 +155,45 @@ async function waitFor(page, fn, arg, timeout = 15000) {
   assert(a.paused && b.paused, 'paused again');
   console.log('keyboard: Space on a button and Caps Lock shortcuts ok');
 
+  // Clicks on the picture: a click plays (after a moment: it waits for a second click), a double-click only goes full
+  // screen, and a tap (touch) only shows or hides the controls. None of the last two may change the room's playback.
+  const seqOf = (p) => p.evaluate(() => room.sync.state.seq);
+  const pic = await alice.locator('#movie').boundingBox();
+  let seq = await seqOf(bob);
+  await alice.mouse.dblclick(pic.x + pic.width / 2, pic.y + pic.height / 2);
+  await sleep(1200);
+  a = await state(alice);
+  assert(a.paused && (await seqOf(bob)) === seq, 'a double-click on the picture does not pause and resume the room');
+  await alice.evaluate(() => document.fullscreenElement && document.exitFullscreen());
+  await bob.evaluate(() => {
+    const v = document.getElementById('movie');
+    v.dispatchEvent(new PointerEvent('pointerdown', { pointerType: 'touch', bubbles: true }));
+    v.dispatchEvent(new MouseEvent('click', { bubbles: true, detail: 1 }));
+  });
+  await sleep(1000);
+  a = await state(alice);
+  assert(a.paused && (await seqOf(alice)) === seq, 'a tap on the picture does not play the room');
+  await alice.mouse.click(pic.x + pic.width / 2, pic.y + pic.height / 2);
+  await sleep(1500);
+  a = await state(alice); b = await state(bob);
+  assert(!a.paused && !b.paused, 'a single click plays for everyone');
+  await ctl(alice, '#m-play');
+  await sleep(800);
+  a = await state(alice); b = await state(bob);
+  assert(a.paused && b.paused, 'paused again');
+  console.log('clicks on the picture: click plays, double-click and tap leave the room alone');
+
+  // The movie dialog acts on its returnValue when it closes. A close without one (Esc, per the HTML spec, which
+  // Firefox and Safari follow) must not repeat the choice made the last time, here "Close the movie for everyone".
+  await bob.evaluate(() => { document.getElementById('movie-dialog').returnValue = 'close'; });
+  await bob.click('#t-movie');
+  await bob.waitForSelector('#movie-dialog[open]');
+  await bob.evaluate(() => document.getElementById('movie-dialog').close());
+  await sleep(800);
+  assert(await alice.evaluate(() => !!room.sync.state.movie), 'the movie is still open for the room');
+  assert(await bob.evaluate(() => !!room.sync.localFile && room.player.loaded), 'and Bob still has his copy open');
+  console.log('movie dialog: closing without a choice does nothing');
+
   // Bob seeks to 19.5s via keyboard-free API (seek bar click)
   await ctl(bob, '#m-time');
   const box = await bob.locator('#m-seek').boundingBox();

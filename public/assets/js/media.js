@@ -126,6 +126,20 @@ export class LocalMedia extends EventTarget {
     }
   }
 
+  /** The microphone is on and has a track: what the buttons show as "on". */
+  get micActive() {
+    return this.micOn && !!this.audioTrack;
+  }
+
+  /**
+   * Mute or unmute, from what the buttons show. Toggling `micOn` itself would be wrong when it is on without a
+   * track (access was blocked, or the device was unplugged): the button says "Unmute", and the first press would
+   * only switch the preference off.
+   */
+  toggleMic() {
+    return this.setMic(!this.micActive);
+  }
+
   async setMic(on) {
     this.micOn = on;
     if (on && !this.audioTrack) await this._acquire('audio');
