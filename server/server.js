@@ -1014,11 +1014,12 @@ async function handleApi(req, res, url) {
     return sendJson(res, 200, { iceServers: stunServers(), maxRoomSize: MAX_ROOM_SIZE });
   }
 
-  // Tests only (needs DRIVE_DEBUG=1): how many Drive file responses the server still tracks.
+  // Tests only (needs DRIVE_DEBUG=1): how many Drive file responses the server still tracks, and the media work it has
+  // not finished (GoogleDrive.inFlight).
   if (DRIVE_DEBUG && parts[1] === 'debug' && parts[2] === 'drive-streams' && req.method === 'GET') {
     let streams = 0;
     for (const set of driveStreams.values()) streams += set.size;
-    return sendJson(res, 200, { rooms: driveStreams.size, streams });
+    return sendJson(res, 200, { rooms: driveStreams.size, streams, ...driveApi?.inFlight() });
   }
 
   if (parts[1] !== 'admin') return sendJson(res, 404, { error: 'Not found' });
