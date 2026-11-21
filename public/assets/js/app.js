@@ -151,6 +151,7 @@ async function startLobby(room) {
   });
   const fillDevices = async () => {
     const d = await media.devices();
+    if (!inLobby) return; // joined meanwhile: the room's Settings have their own lists
     for (const kind of ['audio', 'video']) {
       const sel = $(`lobby-${kind}-dev`);
       sel.replaceChildren(...d[kind].map((dev, i) => new Option(dev.label || `${kind === 'audio' ? 'Microphone' : 'Camera'} ${i + 1}`, dev.deviceId)));
@@ -161,6 +162,9 @@ async function startLobby(room) {
     if (!(await media.setDevice(kind, deviceId))) toast(`Could not start that ${kind === 'audio' ? 'microphone' : 'camera'}.`, 'warn');
     fillDevices(); // shows the device actually in use
   };
+  // A headset plugged in or removed shows up in the lists at once, and so does the device that replaced an unplugged one.
+  media.addEventListener('devices', fillDevices);
+  media.addEventListener('change', fillDevices);
   $('lobby-audio-dev').onchange = (e) => changeDevice('audio', e.target.value);
   $('lobby-video-dev').onchange = (e) => changeDevice('video', e.target.value);
   $('lobby-mic').onclick = async () => {
@@ -217,6 +221,8 @@ async function startLobby(room) {
       inLobby = false;
       stopMeter();
       media.removeEventListener('change', refreshPreview);
+      media.removeEventListener('devices', fillDevices);
+      media.removeEventListener('change', fillDevices);
       preview.srcObject = null;
       // If the devices are still pending, the Room picks them up from the media 'change' events when they come.
       // ICE servers (with TURN credentials, when the server has TURN) come with the welcome: only members get them.

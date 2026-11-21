@@ -2,7 +2,7 @@
 
 Video calls and synchronized movie nights with friends, directly in your browser. No app installation is required.
 
-- Video calls with camera, microphone, device selection, speaking indicators, and chat.
+- Video calls with camera, microphone, device selection, speaking indicators, and chat. A headset plugged in during a call shows up in the device lists at once, and an unplugged microphone or camera is replaced by the default one.
 - Watch movies together with synchronized playback, seeking, audio tracks, and subtitles.
 - Share a movie from your device, stream it from a friend's copy, or use a room's Google Drive folder.
 - Screen sharing and picture-in-picture (browser support varies).
@@ -149,7 +149,7 @@ With Docker Compose, only `ADMIN_PASSWORD`, `MAX_ROOM_SIZE`, the `TURN_*` variab
 - [Google Drive integration](docs/google-drive.md): service account setup, access model, limits.
 - [Customization](docs/customization.md): interface styles, colors, installing as an app.
 - [Development](docs/development.md): running locally and the test suites.
-- [Feature plans](docs/feature-plans.md): implementation notes for features that are not built yet.
+- [Feature plans](docs/feature-plans.md): implementation notes for planned features, and which of them are done.
 
 ## Troubleshooting
 

@@ -89,6 +89,21 @@ async function waitFor(page, fn, arg, timeout = 15000) {
   }
   console.log('remote video flowing both ways');
 
+  // Alice's microphone is unplugged (the browser ends its track): the default one replaces it, the call sends the new
+  // track, and a toast says so.
+  const oldMic = await alice.evaluate(() => {
+    const t = room.media.audioTrack;
+    t.dispatchEvent(new Event('ended')); // what the browser does when the device goes away
+    return t.id;
+  });
+  await waitFor(alice, (old) => {
+    const t = room.media.audioTrack;
+    const sent = [...room.mesh.peers.values()][0]?.pc.getSenders().map((s) => s.track?.id);
+    return t && t.id !== old && t.readyState === 'live' && sent.includes(t.id);
+  }, oldMic);
+  assert.match(await alice.textContent('#toasts'), /microphone was disconnected/);
+  console.log('unplugged microphone replaced, and sent to the call');
+
   // mute state propagates
   await alice.click('#t-mic');
   await waitFor(bob, () => [...document.querySelectorAll('.tile:not(.self) .label svg')].some((s) => s.style.display !== 'none'));
