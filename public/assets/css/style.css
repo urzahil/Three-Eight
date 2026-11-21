@@ -178,6 +178,18 @@ button:focus-visible, .seek:focus-visible { outline: 2px solid var(--accent); ou
 .tile .label span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tile .label svg { width: 14px; height: 14px; color: var(--danger-text); }
 .tile .state { position: absolute; right: 8px; top: 8px; font-size: 11px; padding: 2px 8px; border-radius: var(--r-sm); background: var(--label-bg); color: var(--muted); }
+/* Someone's volume, just for you: on hover or keyboard focus, after a long press on touch screens, and (the button
+   alone) while they are muted for you. */
+.tile:not(.self) { -webkit-touch-callout: none; }
+.tile-vol { position: absolute; left: 8px; top: 8px; display: flex; align-items: center; gap: 2px; padding: 2px 8px 2px 2px; border-radius: var(--r-sm); background: var(--label-bg); opacity: 0; pointer-events: none; transition: opacity 120ms; }
+.tile-vol .icon-btn { width: 28px; height: 28px; }
+.tile-vol svg { width: 16px; height: 16px; }
+.tile-vol input { width: 80px; accent-color: var(--accent); }
+.tile:focus-within .tile-vol, .tile.vol-open .tile-vol, .tile.muted-for-me .tile-vol { opacity: 1; pointer-events: auto; }
+@media (hover: hover) { .tile:hover .tile-vol { opacity: 1; pointer-events: auto; } }
+.tile.muted-for-me:not(:hover):not(:focus-within):not(.vol-open) .tile-vol { padding-right: 2px; }
+.tile.muted-for-me:not(:hover):not(:focus-within):not(.vol-open) .tile-vol input { display: none; }
+.tile.muted-for-me .tile-vol svg { color: var(--danger-text); }
 
 .main.watching .grid { flex: none; width: 220px; grid-template-columns: 1fr !important; grid-auto-rows: auto; align-content: start; overflow-y: auto; }
 .main.watching .tile .avatar { width: 48px; height: 48px; font-size: 20px; }
@@ -261,7 +273,7 @@ button:focus-visible, .seek:focus-visible { outline: 2px solid var(--accent); ou
 .people .avatar { width: 32px; height: 32px; font-size: 14px; }
 .people .who { flex: 1; min-width: 0; }
 .people .who div { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.people .who small { color: var(--muted); }
+.people .who small { display: block; color: var(--muted); }
 .people svg { width: 16px; height: 16px; color: var(--muted); }
 .people svg.bad { color: var(--danger-text); }
 .people svg.good { color: var(--ok); }

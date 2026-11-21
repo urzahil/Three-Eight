@@ -112,6 +112,46 @@ async function waitFor(page, fn, arg, timeout = 15000) {
   await waitFor(bob, () => document.querySelector('.tile:not(.self)').classList.contains('no-video'));
   console.log('camera off propagated');
 
+  // Bob mutes Alice and turns her down, just for himself: her tile's <video> on Bob's side, nothing on Alice's.
+  const aliceTile = '.tile:not(.self)';
+  const tileAudio = (p) => p.evaluate(() => {
+    const v = document.querySelector('.tile:not(.self) video');
+    return { muted: v.muted, volume: v.volume, saved: JSON.parse(localStorage.getItem('te.peerVolume')) };
+  });
+  await bob.hover(aliceTile);
+  await bob.click(`${aliceTile} .tile-vol button`);
+  assert.deepStrictEqual(await tileAudio(bob), { muted: true, volume: 1, saved: [['Alice', 1, true]] });
+  assert.strictEqual((await tileAudio(alice)).muted, false, 'Alice still hears Bob');
+  await bob.click('#t-chat');
+  await bob.click('.tab[data-tab="people"]');
+  assert.match(await bob.textContent('#people'), /muted for you/);
+  await bob.hover(aliceTile);
+  await bob.evaluate(() => {
+    const r = document.querySelector('.tile:not(.self) .tile-vol input');
+    r.value = '0.5';
+    r.dispatchEvent(new Event('input', { bubbles: true }));
+  });
+  assert.deepStrictEqual(await tileAudio(bob), { muted: false, volume: 0.5, saved: [['Alice', 0.5, false]] });
+  assert.match(await bob.textContent('#people'), /volume 50% for you/);
+  // Remembered by name: a new tile for Alice (another tab, a rejoin) gets it back.
+  assert.strictEqual(await bob.evaluate(() => {
+    const [id, t] = [...room.tiles].find(([k]) => k !== room.id);
+    t.video.volume = 1;
+    room._restorePeerVolume(id);
+    return t.video.volume;
+  }), 0.5);
+  await bob.click(`${aliceTile} .tile-vol button`); // mute
+  await bob.click(`${aliceTile} .tile-vol button`); // and unmute: the volume is still 0.5
+  assert.deepStrictEqual(await tileAudio(bob), { muted: false, volume: 0.5, saved: [['Alice', 0.5, false]] });
+  await bob.evaluate(() => {
+    const r = document.querySelector('.tile:not(.self) .tile-vol input');
+    r.value = '1';
+    r.dispatchEvent(new Event('input', { bubbles: true }));
+  });
+  assert.deepStrictEqual(await tileAudio(bob), { muted: false, volume: 1, saved: null }, 'back to normal: nothing to remember');
+  await bob.click('#sidebar-close');
+  console.log('per-person volume and mute: only on Bob\'s side, remembered by name');
+
   // chat
   await alice.click('#t-chat');
   await alice.fill('#chat-input', 'hello bob https://example.com');

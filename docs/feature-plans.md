@@ -7,7 +7,7 @@ test it. They are not ordered by priority; the table says what each costs and wh
 
 | # | Feature | Size | Touches the server | Notes |
 |---|---|---|---|---|
-| 1 | [Per-person volume and mute](#1-per-person-volume-and-mute) | S | no | Purely local |
+| 1 | [Per-person volume and mute](#1-per-person-volume-and-mute) | S | no | **Done** · Purely local |
 | 2 | [Speaker / headphone picker](#2-speaker--headphone-picker) | S | no | **Done** · Chrome, Edge, Firefox |
 | 3 | [Devices plugged in or removed mid-call](#3-devices-plugged-in-or-removed-mid-call) | S | no | **Done** |
 | 4 | [Resume where you left off](#4-resume-where-you-left-off) | S | no | |
@@ -44,6 +44,13 @@ test it. They are not ordered by priority; the table says what each costs and wh
 ---
 
 ## 1. Per-person volume and mute
+
+**Done.** In `room/tiles.js` (`_makeTileVolume`, `_setPeerVolume`, `_restorePeerVolume`), as described below. The
+`peerVolume` store key is a list of `[name, volume, muted]` (like `subDelays`, so a name such as `__proto__` is only
+data), kept for the 100 most recent names and only for people set to something else than full volume. While someone
+is muted for you, the tile keeps showing the (red) button, so it is visible and undone with one click; the people list
+says "muted for you" or "volume 40% for you". A long press is also recognised from Android's `contextmenu`, which then
+shows the control instead of the browser's menu for the video. Tests: the per-person volume part of `test/e2e.js`.
 
 **Goal.** Turn one person down (a loud microphone, someone eating) or mute them, only for yourself.
 
