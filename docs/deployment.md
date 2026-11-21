@@ -95,6 +95,27 @@ curl -6 -i -N \
 
 A successful WebSocket handshake returns `101 Switching Protocols`.
 
+### Without a reverse proxy (`TLS_CERT` / `TLS_KEY`)
+
+Three-Eight can serve HTTPS itself: set `TLS_CERT` to the certificate chain (Let's Encrypt's `fullchain.pem`) and `TLS_KEY` to its private key (`privkey.pem`). Without a proxy, `TRUST_PROXY` must be `false` (see [Proxy trust notes](#proxy-trust-notes)); with Docker Compose, also publish the port on the interface you want (the end of [Rate limits](#rate-limits) says how).
+
+A renewed certificate is picked up without a restart. The server reads both files again when it receives `SIGHUP`, and every 12 hours. If they changed, the key matches the certificate and the certificate is valid today, new connections get the new certificate (connections already open keep theirs). Otherwise the current certificate stays in use and the log says why. That covers a renewal still being written, files that do not parse, and an expired copy put back. The log shows the certificate's expiry date at startup and after each reload.
+
+To switch over right after a renewal, let certbot send the signal:
+
+```bash
+# Node.js started directly
+certbot renew --deploy-hook "pkill -HUP -f server/server.js"
+# Docker (the Compose service's container is called three-eight)
+certbot renew --deploy-hook "docker kill -s HUP three-eight"
+```
+
+The same command in an executable script in `/etc/letsencrypt/renewal-hooks/deploy/` also runs after certbot's scheduled renewals. Without a hook, the new certificate is in use within 12 hours; certbot renews 30 days before expiry.
+
+The files must stay readable by the user the server runs as (`node` in the Docker image). With Docker, mount the certificate directory read-only and add `TLS_CERT` and `TLS_KEY` to the `environment:` section of `docker-compose.yml`. The files in Let's Encrypt's `live/` directory are links into `archive/`, so mount the whole `/etc/letsencrypt` directory (for example at the same path) for the links to resolve.
+
+`SIGHUP` reloads the certificate only when `TLS_CERT` and `TLS_KEY` are set. Without them, it stops the server, as before.
+
 ## Running without Docker
 
 Install Node.js 22 or newer, then from the repository:
@@ -127,7 +148,7 @@ With Docker Compose, `.env` is only used to fill in the values `docker-compose.y
 | `TURN_USERNAME` / `TURN_PASSWORD` | — | Static TURN credentials (alternative to `TURN_SECRET`) |
 | `GOOGLE_SERVICE_ACCOUNT` | — | Path to service-account JSON for Drive integration |
 | `DRIVE_CACHE_MB` | `256` | Drive stream cache in memory; minimum 32 MB |
-| `TLS_CERT` / `TLS_KEY` | — | Certificate and key for serving TLS directly instead of using a proxy |
+| `TLS_CERT` / `TLS_KEY` | — | Certificate and key for serving TLS directly instead of using a proxy; read again on `SIGHUP` and every 12 hours (see [Without a reverse proxy](#without-a-reverse-proxy-tls_cert--tls_key)) |
 
 Invalid values for supported settings cause startup to fail with an error rather than silently changing the setting. That includes `STUN_URLS` and `TURN_URLS` (each entry must look like `stun:host[:port]` or `turn:host[:port][?transport=udp|tcp]`, `stuns:`/`turns:` for TLS) and TURN without credentials: browsers refuse every connection when one ICE server is malformed, so a typo there would otherwise break every call. `TURN_URLS` needs `TURN_SECRET`, or both `TURN_USERNAME` and `TURN_PASSWORD`.
 

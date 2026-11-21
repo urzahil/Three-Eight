@@ -138,7 +138,7 @@ See [Google Drive integration](docs/google-drive.md) for the full Docker mount e
 | `TURN_USERNAME` / `TURN_PASSWORD` | — | Alternative static TURN credentials |
 | `GOOGLE_SERVICE_ACCOUNT` | — | Service-account JSON key path for Drive integration |
 | `DRIVE_CACHE_MB` | `256` | Drive streaming cache size in memory |
-| `TLS_CERT` / `TLS_KEY` | — | Optional direct TLS certificate/key if not using a proxy |
+| `TLS_CERT` / `TLS_KEY` | — | Optional direct TLS certificate/key if not using a proxy; a renewed certificate is used without a restart (on `SIGHUP`, or within 12 hours: see [Deployment](docs/deployment.md#without-a-reverse-proxy-tls_cert--tls_key)) |
 
 With Docker Compose, only `ADMIN_PASSWORD`, `MAX_ROOM_SIZE`, the `TURN_*` variables, `GOOGLE_SERVICE_ACCOUNT` and `DRIVE_CACHE_MB` are read from `.env`. To change any other setting, add it to the `environment:` section of `docker-compose.yml`.
 
@@ -149,7 +149,7 @@ With Docker Compose, only `ADMIN_PASSWORD`, `MAX_ROOM_SIZE`, the `TURN_*` variab
 - [Google Drive integration](docs/google-drive.md): service account setup, access model, limits.
 - [Customization](docs/customization.md): interface styles, colors, installing as an app.
 - [Development](docs/development.md): running locally and the test suites.
-- [Feature plans](docs/feature-plans.md): implementation notes for features that are not built yet.
+- [Feature plans](docs/feature-plans.md): implementation notes for planned features, and which of them are done.
 
 ## Troubleshooting
 
