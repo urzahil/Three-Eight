@@ -87,8 +87,11 @@ services:
   #     - --denied-peer-ip=::1
   #     - --denied-peer-ip=fc00::-fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff
   #     - --denied-peer-ip=fe80::-febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff
-  #     - --user-quota=12                      # simultaneous relays per login
-  #     - --total-quota=100
+  #     # Simultaneous relays (allocations). Each member has its own login, and a browser asks for a relay on every
+  #     # TURN URL for every friend it is linked to: 3 URLs x (MAX_ROOM_SIZE - 1) = 33 for a full room of 12. The
+  #     # total covers about two full rooms; the bandwidth caps below are what protect this machine's connection.
+  #     - --user-quota=48
+  #     - --total-quota=800
   #     # Bandwidth, in BYTES per second (each direction counted separately). A session is one relayed link between
   #     # two friends (camera, screen and movie pieces): 2000000 = 16 Mbit/s, more than a 1080p film needs.
   #     # bps-capacity is the total for all sessions: set it a little below what this machine's connection carries

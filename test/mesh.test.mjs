@@ -2,7 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import './browser-globals.mjs';
-import { Reassembler, ChunkSender, MAX_QUEUED, routeVideo, screenBudget, Mesh, MAX_OFFERS_PER_PEER, OFFER_WINDOW_MS } from '../public/assets/js/mesh.js';
+import { Reassembler, ChunkSender, MAX_QUEUED, routeVideo, screenBudget, Mesh, MAX_OFFERS_PER_PEER, OFFER_WINDOW_MS, usableIceServers } from '../public/assets/js/mesh.js';
 
 const CHUNK = 12 * 1024;
 const chunk = (mid, i, n, d = 'x') => ({ type: '_chunk', mid, i, n, d });
@@ -412,4 +412,37 @@ test('ICE candidates meant for another connection of theirs are dropped; others 
   assert.deepEqual(log.map((l) => l.data.candidate.candidate), ['new', 'legacy']);
   signal(p.id, { candidate: { candidate: 'odd' }, conn: { not: 'a string' } }); // not a valid id: treated as none
   assert.equal(log.at(-1).data.conn, undefined);
+});
+
+// ---- ICE servers the browser refuses -------------------------------------------------------------------------
+
+test('usableIceServers: a server the browser refuses is left out, instead of every call failing', () => {
+  const realPc = globalThis.RTCPeerConnection;
+  const realWarn = console.warn;
+  let warned = 0;
+  console.warn = () => { warned++; };
+  // Like Chromium: a URL without its scheme, or a TURN server without credentials, fails the whole configuration.
+  globalThis.RTCPeerConnection = class {
+    constructor({ iceServers }) {
+      for (const s of iceServers) {
+        if (s.urls.some((u) => !/^(stuns?|turns?):/.test(u))) throw new SyntaxError('not a valid stun or turn URL');
+        if (s.urls.some((u) => u.startsWith('turn')) && (!s.username || !s.credential)) throw new DOMException('empty username', 'InvalidAccessError');
+      }
+    }
+    close() {}
+  };
+  try {
+    const stun = { urls: ['stun:stun.example.com:3478'] };
+    const good = [stun, { urls: ['turn:t.example.com'], username: 'u', credential: 'c' }];
+    assert.equal(usableIceServers(good), good, 'all accepted: the same list');
+    assert.equal(warned, 0);
+    assert.deepEqual(usableIceServers([stun, { urls: ['turn:t.example.com'], username: '', credential: '' }]), [stun]);
+    assert.deepEqual(usableIceServers([{ urls: ['stun.example.com:3478'] }, stun]), [stun]);
+    assert.equal(warned, 2);
+    assert.deepEqual(usableIceServers(null), [], 'not a list: none');
+    assert.deepEqual(usableIceServers([]), []);
+  } finally {
+    globalThis.RTCPeerConnection = realPc;
+    console.warn = realWarn;
+  }
 });

@@ -290,9 +290,19 @@ export class NativeCaptions {
     this.cues = [];
     this.offset = 0;
     this._timer = 0;
+    // iPhone full screen is the system's own video player: our overlay is not drawn there, the track has to show.
+    this.systemFullscreen = false;
     const update = () => this._applyMode();
     video.addEventListener('enterpictureinpicture', update);
     video.addEventListener('leavepictureinpicture', update);
+    video.addEventListener('webkitbeginfullscreen', () => {
+      this.systemFullscreen = true;
+      update();
+    });
+    video.addEventListener('webkitendfullscreen', () => {
+      this.systemFullscreen = false;
+      update();
+    });
   }
 
   /** 'hidden' keeps the track silent in the page; 'showing' always renders it. */
@@ -304,7 +314,7 @@ export class NativeCaptions {
   _applyMode() {
     if (!this.track) return;
     const inPip = document.pictureInPictureElement === this.video;
-    this.track.mode = inPip || this.baseMode === 'showing' ? 'showing' : 'hidden';
+    this.track.mode = inPip || this.systemFullscreen || this.baseMode === 'showing' ? 'showing' : 'hidden';
   }
 
   /** cues: our cue objects; offset: seconds added to each time (subtitle delay + media shift). */
@@ -336,4 +346,147 @@ export class NativeCaptions {
       this.track.addCue(cue);
     }
   }
+}
+
+// ---- decoding subtitle files -----------------------------------------------------------------------------------
+// A subtitle file is plain text in whatever encoding its author's tools used: UTF-8 today, UTF-16 from some Windows
+// tools, and an older one-byte (or East Asian) code page for many files from the 2000s. The bytes alone do not say
+// which, so: a byte-order mark decides; then valid UTF-8; then a code page, chosen by a small plausibility score
+// (the right one gives words of one script, in sensible case, without stray symbols), or as the user set it.
+
+/** The code pages a user can pick for subtitle files that are not Unicode (Settings). */
+export const SUBTITLE_ENCODINGS = [
+  ['auto', 'Automatic'],
+  ['windows-1252', 'Western (Windows-1252)'],
+  ['windows-1250', 'Central European (Windows-1250)'],
+  ['windows-1251', 'Cyrillic (Windows-1251)'],
+  ['windows-1253', 'Greek (Windows-1253)'],
+  ['windows-1254', 'Turkish (Windows-1254)'],
+  ['windows-1255', 'Hebrew (Windows-1255)'],
+  ['windows-1256', 'Arabic (Windows-1256)'],
+  ['windows-1257', 'Baltic (Windows-1257)'],
+  ['windows-1258', 'Vietnamese (Windows-1258)'],
+  ['windows-874', 'Thai (Windows-874)'],
+  ['gb18030', 'Chinese, simplified (GB18030)'],
+  ['big5', 'Chinese, traditional (Big5)'],
+  ['shift_jis', 'Japanese (Shift_JIS)'],
+  ['euc-kr', 'Korean (EUC-KR)'],
+];
+
+/** The code page older subtitle files in this language usually use (what browsers assume for that locale). */
+function legacyFor(lang) {
+  const [l, region = ''] = String(lang || '').toLowerCase().split(/[-_]/);
+  if (['ru', 'uk', 'be', 'bg', 'sr', 'mk', 'kk', 'ky', 'tg', 'mn'].includes(l)) return 'windows-1251';
+  if (['pl', 'cs', 'sk', 'hu', 'hr', 'sl', 'ro', 'bs', 'sq'].includes(l)) return 'windows-1250';
+  if (l === 'el') return 'windows-1253';
+  if (l === 'tr' || l === 'az') return 'windows-1254';
+  if (l === 'he' || l === 'iw' || l === 'yi') return 'windows-1255';
+  if (['ar', 'fa', 'ur'].includes(l)) return 'windows-1256';
+  if (['lt', 'lv', 'et'].includes(l)) return 'windows-1257';
+  if (l === 'vi') return 'windows-1258';
+  if (l === 'th') return 'windows-874';
+  if (l === 'ja') return 'shift_jis';
+  if (l === 'ko') return 'euc-kr';
+  if (l === 'zh') return ['tw', 'hk', 'mo', 'hant'].includes(region) ? 'big5' : 'gb18030';
+  return 'windows-1252';
+}
+
+const SCRIPTS = [['Latin', /\p{Script=Latin}/u], ['Cyrillic', /\p{Script=Cyrillic}/u], ['Greek', /\p{Script=Greek}/u],
+  ['Hebrew', /\p{Script=Hebrew}/u], ['Arabic', /\p{Script=Arabic}/u], ['Thai', /\p{Script=Thai}/u],
+  ['CJK', /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u]];
+const scriptOf = (ch) => SCRIPTS.find(([, re]) => re.test(ch))?.[0] || 'Other';
+// Letters only Icelandic and Faroese use: in other text they are Turkish ğ ş (or Baltic š ž) read as Western.
+const ICELANDIC = /[ðþÐÞ]/g;
+// A symbol wedged between two letters ("Za¿ó³æ" is Polish read as Western). Punctuation that sits inside words
+// (apostrophes, hyphens, dots of abbreviations...) does not count; ¡ ¿ superscripts and the like do.
+const WEDGED = /\p{L}[^\p{L}\p{M}\s0-9'’`´\-–—.,:;!?"“”„«»‹›()[\]{}/\\*&#@%+=<>_~|…]\p{L}/gu;
+const CYRILLIC_VOWELS = /[аеёиоуыэюяіїєѣАЕЁИОУЫЭЮЯІЇЄ]/;
+const GREEK_VOWELS = /[αεηιουωάέήίόύώϊϋΐΰΑΕΗΙΟΥΩΆΈΉΊΌΎΏΪΫ]/;
+
+/**
+ * How plausible `text` is as real writing (higher is better). Only what differs between code pages counts: ASCII
+ * reads the same in all of them. Each word with letters beyond ASCII scores +1, or a penalty when it looks like text
+ * of another script read with the wrong code page.
+ */
+export function textScore(text, lang = '') {
+  let score = 0;
+  score -= 10 * (text.match(/[�\u0080-\u009F]/g) || []).length; // bytes the code page does not define
+  score -= 3 * (text.match(WEDGED) || []).length;
+  if (!/^(is|fo)\b/i.test(lang)) score -= 2 * (text.match(ICELANDIC) || []).length;
+  for (const word of text.match(/\p{L}[\p{L}\p{M}]*/gu) || []) {
+    if (/^[\x00-\x7f]*$/.test(word)) continue;
+    const letters = [...word].filter((c) => /\p{L}/u.test(c));
+    const scripts = new Set(letters.map(scriptOf));
+    if (scripts.size > 1) score -= 5; // "cosм": Latin and Cyrillic in one word
+    else if (/\p{Ll}\p{Lu}/u.test(word)) score -= 3; // "КблзмЭсб", "гСНИЗЎ": Greek or Arabic read as Cyrillic
+    // "Ïðèâåò": a Latin word made (almost) only of accented letters is another script read as Western.
+    else if (scripts.has('Latin') && letters.length >= 3 && letters.filter((c) => c > '\x7f').length >= 0.8 * letters.length) score -= 3;
+    // Hebrew read as Cyrillic: words without a vowel ("щм"), or ending in a hard sign ("мшаеъ"), which no language
+    // written in Cyrillic has.
+    else if (scripts.has('Cyrillic') && ((letters.length >= 2 && !CYRILLIC_VOWELS.test(word)) || /[ъЪ]$/.test(word))) score -= 3;
+    // ... or as Greek: words without a vowel ("ξδ"), or with ΐ ΰ, which Greek hardly ever uses (Hebrew's alef reads so).
+    else if (scripts.has('Greek') && ((letters.length >= 2 && !GREEK_VOWELS.test(word)) || /[ΐΰ]/.test(word))) score -= 3;
+    else score += 1;
+  }
+  return score;
+}
+
+/** UTF-16 without a byte-order mark: ASCII characters leave a zero byte in every other position. */
+function sniffUtf16(bytes) {
+  const n = Math.min(bytes.length & ~1, 4096);
+  if (n < 8) return null;
+  let even = 0;
+  let odd = 0;
+  for (let i = 0; i < n; i += 2) {
+    if (bytes[i] === 0) even++;
+    if (bytes[i + 1] === 0) odd++;
+  }
+  const pairs = n / 2;
+  if (odd > pairs * 0.3 && even < pairs * 0.05) return 'utf-16le';
+  if (even > pairs * 0.3 && odd < pairs * 0.05) return 'utf-16be';
+  return null;
+}
+
+function decodeAs(encoding, bytes) {
+  try {
+    return new TextDecoder(encoding).decode(bytes);
+  } catch {
+    return null; // this browser does not know the encoding
+  }
+}
+
+/**
+ * Subtitle file bytes as text: { text, encoding }. `encoding` ('auto' or one of SUBTITLE_ENCODINGS) is the code page
+ * for files that are not Unicode; Unicode files (a byte-order mark, UTF-16, valid UTF-8) are always read as such.
+ * `lang` (the browser's language) decides between code pages that look equally plausible.
+ */
+export function decodeSubtitleBytes(bytes, { encoding = 'auto', lang = '' } = {}) {
+  const b = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  if (b[0] === 0xef && b[1] === 0xbb && b[2] === 0xbf) return { text: new TextDecoder('utf-8').decode(b), encoding: 'utf-8' };
+  if (b[0] === 0xff && b[1] === 0xfe) return { text: new TextDecoder('utf-16le').decode(b), encoding: 'utf-16le' };
+  if (b[0] === 0xfe && b[1] === 0xff) return { text: new TextDecoder('utf-16be').decode(b), encoding: 'utf-16be' };
+  const utf16 = sniffUtf16(b);
+  if (utf16) return { text: new TextDecoder(utf16).decode(b), encoding: utf16 };
+  try {
+    return { text: new TextDecoder('utf-8', { fatal: true }).decode(b), encoding: 'utf-8' };
+  } catch { /* not UTF-8: a code page */ }
+  if (encoding !== 'auto') {
+    const text = decodeAs(encoding, b);
+    if (text !== null) return { text, encoding };
+  }
+  // The language's own code page first (it wins a tie), then the ones a score tells apart. Western text reads as
+  // plausibly in Turkish and Central European, so those win only on evidence (ğ ş, ż ł ą...). Baltic, Vietnamese,
+  // Thai and East Asian ones are picked by the language, or in Settings.
+  const own = legacyFor(lang);
+  const candidates = [...new Set([own, 'windows-1252', 'windows-1254', 'windows-1250', 'windows-1251', 'windows-1253', 'windows-1255', 'windows-1256'])];
+  const sample = b.subarray(0, 64 * 1024); // plenty to judge by, and a large file is not scored seven times over
+  let best = null;
+  for (const enc of candidates) {
+    const text = decodeAs(enc, sample);
+    if (text === null) continue;
+    const score = textScore(text, lang);
+    if (!best || score > best.score) best = { encoding: enc, score };
+  }
+  if (!best) return { text: new TextDecoder().decode(b), encoding: 'utf-8' };
+  return { text: decodeAs(best.encoding, b), encoding: best.encoding };
 }

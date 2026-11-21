@@ -6,11 +6,12 @@
 // our server. The RemoteFile block cache is the piece store; pieces that arrive are injected into it, so
 // they can be served to other viewers too.
 //
-// Film identity ("key"): `d:<driveId>` for a film from the room's Drive folder, `s:<size>:<fingerprint>` for
+// Film identity ("key"): `d:<driveId>:<size>` for a film from the room's Drive folder (a file replaced in Drive keeps
+// its ID, and a viewer who opened the old version must not trade pieces with one who has the new), `s:<size>:<fingerprint>` for
 // a film that is a file on someone's device. The fingerprint is a SHA-256 over the size and three 64 KiB samples
 // (start, middle, end) of the file, so two different files of the same size do not pass for one film. A Drive
 // film computes the same fingerprint from the same byte ranges, fetched from our server once, lazily (when the
-// film is first read); from then on its keys are `d:<driveId>` and `s:<size>:<fingerprint>`, so local copies
+// film is first read); from then on its keys are `d:<driveId>:<size>` and `s:<size>:<fingerprint>`, so local copies
 // can serve a Drive film, but only when the fingerprints are equal. Until the fingerprint is known a Drive film
 // has no local holders and reads from our server. A local file is advertised only once its fingerprint is
 // computed (a few small reads). A film that is only streamed from friends gets the fingerprint from the room's
@@ -88,7 +89,8 @@ export const T = { WANT: 1, DATA: 2, DENY: 3, CANCEL: 4 };
 export const DENIED = { BUSY: 1, UNAVAILABLE: 2 };
 const MAX_PIECES = 1 << 22; // 4 TiB of film
 const PIECE_LIMIT = 64 * MiB; // no sane piece size is larger: offsets beyond it are garbage
-const KEY_RE = /^(d:[A-Za-z0-9_-]{10,200}|s:[0-9]{1,15}(:[0-9a-f]{32})?)$/;
+// (`d:<driveId>` without the size is what older clients send: accepted, it just never matches ours.)
+const KEY_RE = /^(d:[A-Za-z0-9_-]{10,200}(:[0-9]{1,15})?|s:[0-9]{1,15}(:[0-9a-f]{32})?)$/;
 export const FP_RE = /^[0-9a-f]{32}$/;
 const FP_SAMPLE = 64 * 1024; // bytes read at the start, the middle and the end of a file for its fingerprint
 const noop = () => {};
@@ -106,15 +108,15 @@ export function sizeKey(size, fp) {
   return fp ? `s:${size}:${fp}` : `s:${size}`;
 }
 
-/** The film's identity: `d:<driveId>` for a Drive film, otherwise its size key. */
+/** The film's identity: `d:<driveId>:<size>` for a Drive film, otherwise its size key. */
 export function filmKey({ drive, size, fp }) {
-  return drive?.id ? `d:${drive.id}` : sizeKey(size, fp);
+  return drive?.id ? `d:${drive.id}:${size}` : sizeKey(size, fp);
 }
 
 /** Keys that name the same film as this movie ({size, fp?, drive?}): its Drive key and its size key. */
 export function movieKeys(movie) {
   const keys = [];
-  if (movie?.drive?.id) keys.push(`d:${movie.drive.id}`);
+  if (movie?.drive?.id && movie.size > 0) keys.push(`d:${movie.drive.id}:${movie.size}`);
   if (movie?.size > 0) keys.push(sizeKey(movie.size, FP_RE.test(movie.fp || '') ? movie.fp : ''));
   return keys;
 }
@@ -320,7 +322,7 @@ class Film {
   /**
    * @param {Swarm} swarm
    * @param {object} o
-   * @param {string} o.key  `d:<id>` or `s:<size>[:<fingerprint>]`
+   * @param {string} o.key  `d:<id>:<size>` or `s:<size>[:<fingerprint>]`
    * @param {number} o.size
    * @param {string} [o.fp]  the content fingerprint, when already known
    * @param {Blob} [o.local]  the film as a file on this device (served to friends when sharing is on)

@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import './browser-globals.mjs';
 import { cleanState, emptyState, MovieSync, sameMovie } from '../public/assets/js/sync.js';
 
-const good = (over = {}) => ({ seq: 3, by: 'peer-aaaaaaaa', movie: { name: 'A.mkv', size: 100, duration: 60 }, paused: false, pos: 12.5, at: 1700000000000, rate: 1, audio: 1, sub: 'e0', subFiles: [{ id: 'x1', name: 'a.srt' }], ...over });
+const good = (over = {}) => ({ seq: 3, by: 'peer-aaaaaaaa', movie: { name: 'A.mkv', size: 100, duration: 60 }, paused: false, pos: 12.5, at: 1700000000000, audio: 1, sub: 'e0', subFiles: [{ id: 'x1', name: 'a.srt' }], ...over });
 
 test('a well-formed state passes through unchanged', () => {
   assert.deepEqual(cleanState(good()), good());
@@ -29,15 +29,24 @@ test('pos and at may reach their limits', () => {
 });
 
 test('the other fields are clamped', () => {
-  const s = cleanState(good({ rate: 1000, audio: -4, sub: 5, movie: { name: 'n'.repeat(1000), size: -1, duration: NaN, extra: 1 } }));
-  assert.equal(s.rate, 4);
+  const s = cleanState(good({ audio: -4, sub: 5, movie: { name: 'n'.repeat(1000), size: -1, duration: NaN, extra: 1 } }));
   assert.equal(s.audio, 0);
   assert.equal(s.sub, null);
   assert.deepEqual(s.movie, { name: 'n'.repeat(300), size: 0, duration: 0 });
-  assert.equal(cleanState(good({ rate: 'fast' })).rate, 1);
-  assert.equal(cleanState(good({ rate: 0 })).rate, 0.25);
   assert.equal(cleanState(good({ audio: 1e9 })).audio, 64);
   assert.equal(cleanState(good({ movie: null })).movie, null);
+});
+
+test('there is no playback speed: a rate from an older client is dropped, and the film runs at normal speed', () => {
+  for (const rate of [2, 0.5, 4, 'fast']) {
+    const s = cleanState(good({ rate }));
+    assert.equal('rate' in s, false, String(rate));
+  }
+  assert.equal('rate' in emptyState(), false);
+  const { sync } = makeSync(1700000010000);
+  const s = cleanState(good({ rate: 2, pos: 100, at: 1700000000000, paused: false, movie: { name: 'A.mkv', size: 100, duration: 0 } }));
+  assert.equal(sync.expectedPosition(s), 110, '10 s later the film is 10 s further, whatever rate was sent');
+  sync.destroy();
 });
 
 test('subtitle files: only {id, name} strings, bounded', () => {
@@ -156,7 +165,7 @@ test('local commits stay inside the ranges peers accept, even with bad inputs', 
 
 test('expectedPosition is finite for every accepted state', () => {
   const { sync } = makeSync(1e14);
-  const s = cleanState(good({ paused: false, pos: 1e7, at: 0, rate: 4, movie: null }));
+  const s = cleanState(good({ paused: false, pos: 1e7, at: 0, movie: null }));
   assert.ok(s);
   assert.ok(Number.isFinite(sync.expectedPosition(s)));
   sync.destroy();
@@ -413,4 +422,63 @@ test('atEnd: not before the end, and by the room clock without a copy of our own
   sync.localFile = null;
   sync.state = { ...sync.state, paused: true, pos: 59.8 };
   assert.equal(sync.atEnd(), true);
+});
+
+// ---- seeks made with the browser's own controls -----------------------------------------------------------------
+
+/** A MovieSync whose player has the room's film loaded and paused at `time`. */
+function seekSync({ systemControls = true } = {}) {
+  const { sync, sent } = makeSync(1700000000000);
+  const movie = { name: 'A.mkv', size: 100, duration: 600 };
+  const player = sync.player;
+  Object.assign(player, {
+    loaded: true, time: 50, paused: true, duration: 600, audioIndex: 0, audioTracks: [], subtitles: new Map(), subtitleId: null,
+    video: { seeking: false, readyState: 4, ended: false }, playbackRate: 1, systemControls, own: null,
+    atOwnSeek() { return this.own !== null && Math.abs(this.time - this.own) < 0.3; },
+    seek(t) { this.own = t; this.time = t; }, pause() {}, setSubtitle(id) { this.subtitleId = id; },
+  });
+  sync.state = { ...sync.state, seq: 1, by: 'peer-aaaaaaaa', movie, paused: true, pos: 50, at: 1700000000000 };
+  sync.localFile = movie;
+  return { sync, sent, player };
+}
+const settle = () => new Promise((r) => setTimeout(r, 450));
+
+test('a seek in the system player (PiP, iPhone full screen) becomes a seek for the room instead of being undone', async () => {
+  const { sync, sent, player } = seekSync();
+  player.time = 300; // scrubbed in the system's controls
+  player.dispatchEvent(new Event('seeking'));
+  sync._tick(); // drift correction holds off until the seek has settled
+  assert.equal(player.time, 300);
+  await settle();
+  assert.equal(sent.at(-1)?.state.pos, 300, 'shared with the room');
+  assert.equal(sync.state.by, 'me-me-me-me');
+  sync.destroy();
+});
+
+test('our own seeks, and seeks while the page controls are in charge, are not shared again', async () => {
+  const { sync, sent, player } = seekSync();
+  player.seek(120); // e.g. drift correction or another member's seek being applied
+  player.dispatchEvent(new Event('seeking'));
+  await settle();
+  assert.equal(sent.length, 0);
+  sync.destroy();
+  const page = seekSync({ systemControls: false });
+  page.player.time = 300;
+  page.player.dispatchEvent(new Event('seeking'));
+  await settle();
+  assert.equal(page.sent.length, 0, 'in the page every seek goes through our controls already');
+  page.sync.destroy();
+});
+
+test('a seek never goes past the end of the film', () => {
+  const { sync } = makeSync();
+  sync.state = { ...sync.state, movie: { name: 'A.mkv', size: 100, duration: 600 } };
+  sync.seek(590 + 30);
+  assert.equal(sync.state.pos, 600);
+  sync.seek(-10);
+  assert.equal(sync.state.pos, 0);
+  sync.state = { ...sync.state, movie: { name: 'B.mkv', size: 100, duration: 0 } }; // length not known: as asked
+  sync.seek(1234);
+  assert.equal(sync.state.pos, 1234);
+  sync.destroy();
 });

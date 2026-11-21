@@ -66,7 +66,7 @@ async function startFakeGoogle() {
     mimeType: f.mimeType,
     parents: f.parents,
     trashed: false,
-    ...(f.data ? { size: String(f.data.length) } : {}),
+    ...(f.data ? { size: String(f.data.length), md5Checksum: crypto.createHash('md5').update(f.data).digest('hex'), modifiedTime: f.modifiedTime || '2024-01-01T00:00:00.000Z' } : {}),
     ...(f.durationMillis ? { videoMediaMetadata: { durationMillis: String(f.durationMillis) } } : {}),
   });
 

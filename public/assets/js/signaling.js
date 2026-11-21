@@ -8,6 +8,29 @@ const localNow = () => performance.timeOrigin + performance.now();
 const ATTEMPT_MS = 10000;
 // The first join gives up (and tells the user) after this long without a welcome.
 const JOIN_GIVE_UP_MS = 45000;
+// Clock samples kept; the one with the shortest round trip gives the offset.
+const MAX_CLOCK_SAMPLES = 12;
+// How far two samples of an unchanged clock may disagree beyond their margins (drift over the minutes they span).
+const CLOCK_SLACK_MS = 50;
+
+/**
+ * The clock samples to keep after `sample` ({ rtt, offset } in ms) arrived. A sample bounds the true offset to
+ * offset ± rtt/2 (the server read its clock somewhere during the round trip), so two samples of the same clock
+ * always overlap. One that does not overlap a newer one was taken before our clock jumped: performance.now() stands
+ * still while the device sleeps on most systems, and an old sample with a short round trip would otherwise win for
+ * minutes and put playback (ours, and everyone's after we press play) off by the length of the sleep.
+ */
+export function addClockSample(samples, sample) {
+  const kept = samples.filter((x) => Math.abs(x.offset - sample.offset) <= (x.rtt + sample.rtt) / 2 + CLOCK_SLACK_MS);
+  kept.push(sample);
+  while (kept.length > MAX_CLOCK_SAMPLES) kept.shift();
+  return kept;
+}
+
+/** The offset of the sample with the shortest round trip (the tightest bound). */
+export function bestOffset(samples) {
+  return samples.reduce((a, b) => (b.rtt < a.rtt ? b : a)).offset;
+}
 
 export class Signaling extends EventTarget {
   constructor(url) {
@@ -21,6 +44,7 @@ export class Signaling extends EventTarget {
     this.samples = [];
     this.offset = 0; // serverTime - localTime (ms)
     this._timeTimer = null;
+    this._busy = 0; // join attempts the server answered "busy" since the last welcome
   }
 
   /** Estimated server clock (ms since epoch). Shared by every participant. */
@@ -69,11 +93,7 @@ export class Signaling extends EventTarget {
       return;
     }
     this.ws = ws;
-    clearTimeout(this._attemptTimer);
-    this._attemptTimer = setTimeout(() => {
-      // No welcome in time (stalled connect, or a socket that died silently): drop it and reconnect.
-      if (this.ws === ws && !this.joined) this._lost(ws);
-    }, ATTEMPT_MS);
+    this._armAttempt(ws);
     ws.onopen = () => {
       this._syncClock(6);
       ws.send(JSON.stringify({ type: 'join', ...this.joinInfo }));
@@ -103,6 +123,32 @@ export class Signaling extends EventTarget {
     };
   }
 
+  /** No welcome on `ws` within ATTEMPT_MS (stalled connect, or a socket that died silently): drop it and reconnect. */
+  _armAttempt(ws) {
+    clearTimeout(this._attemptTimer);
+    this._attemptTimer = setTimeout(() => {
+      if (this.ws === ws && !this.joined) this._lost(ws);
+    }, ATTEMPT_MS);
+  }
+
+  /**
+   * The server is busy checking other passwords (it says so instead of making us wait): ask again on the same
+   * connection shortly, a little later each time, instead of waiting for the attempt to time out.
+   */
+  _retryBusy() {
+    const ws = this.ws;
+    if (!ws || this.joined || this.closed || this._fatal) return;
+    clearTimeout(this._attemptTimer);
+    const delay = Math.min(10000, 1000 * 2 ** Math.min(this._busy++, 4)) * (0.75 + Math.random() * 0.5);
+    this._emit('retrying', { attempt: this._busy, delay, busy: true });
+    clearTimeout(this._busyTimer);
+    this._busyTimer = setTimeout(() => {
+      if (this.ws !== ws || this.joined || this.closed || ws.readyState !== WebSocket.OPEN) return;
+      this._armAttempt(ws);
+      ws.send(JSON.stringify({ type: 'join', ...this.joinInfo }));
+    }, delay);
+  }
+
   /** The connection ws is gone (or given up on): reconnect after a backoff. */
   _lost(ws) {
     if (this.ws !== ws || ws._lost) return;
@@ -127,17 +173,18 @@ export class Signaling extends EventTarget {
   _handle(msg) {
     switch (msg.type) {
       case 'time': {
+        if (typeof msg.c !== 'number' || typeof msg.s !== 'number') break;
         const t1 = localNow();
         const rtt = t1 - msg.c;
-        this.samples.push({ rtt, offset: msg.s - (msg.c + rtt / 2) });
-        if (this.samples.length > 12) this.samples.shift();
-        const best = this.samples.reduce((a, b) => (b.rtt < a.rtt ? b : a));
-        this.offset = best.offset;
+        if (!(rtt >= 0)) break; // not one of ours
+        this.samples = addClockSample(this.samples, { rtt, offset: msg.s - (msg.c + rtt / 2) });
+        this.offset = bestOffset(this.samples);
         break;
       }
       case 'welcome':
         this.joined = true;
         this.retry = 0;
+        this._busy = 0;
         clearTimeout(this._attemptTimer);
         this.id = msg.id;
         clearInterval(this._timeTimer);
@@ -148,6 +195,16 @@ export class Signaling extends EventTarget {
         } else this._emit('reconnected', msg);
         break;
       case 'error':
+        if (msg.code === 'busy' && !this.joined) {
+          this._retryBusy();
+          break;
+        }
+        if (msg.code === 'server-error' && !this._pending && !this.joined) {
+          // Rejoining after a lost connection failed on the server's side: not the user's to fix, so try again
+          // (with the usual backoff) rather than end the session. A first join reports it: the user can retry.
+          this._lost(this.ws);
+          break;
+        }
         if (['bad-password', 'no-room', 'room-full', 'rate-limited', 'room-deleted', 'kicked', 'bad-request', 'server-error', 'id-taken'].includes(msg.code)) {
           this._fatal = true;
           if (this._pending) {
@@ -206,6 +263,7 @@ export class Signaling extends EventTarget {
     this.closed = true;
     clearInterval(this._timeTimer);
     clearTimeout(this._attemptTimer);
+    clearTimeout(this._busyTimer);
     try {
       this.send({ type: 'leave' });
       this.ws?.close();

@@ -142,10 +142,13 @@ test('assignFetcher: streamers sorted by id, piece mod N, the same from every po
   assert.equal(assignFetcher(7, ['solo']), 'solo');
 });
 
-test('film keys: Drive id, or size; a Drive movie is also named by its size', () => {
-  assert.equal(filmKey({ drive: { id: 'ABC' }, size: 5 }), 'd:ABC');
+test('film keys: Drive id and size, or size; a Drive movie is also named by its size', () => {
+  assert.equal(filmKey({ drive: { id: 'ABC' }, size: 5 }), 'd:ABC:5');
+  assert.notEqual(filmKey({ drive: { id: 'ABC' }, size: 6 }), filmKey({ drive: { id: 'ABC' }, size: 5 }), 'a file replaced in Drive (same ID) is another film');
   assert.equal(filmKey({ size: 5 }), 's:5');
-  assert.deepEqual(movieKeys({ size: 5, drive: { id: 'ABCDEFGHIJ' } }), ['d:ABCDEFGHIJ', 's:5']);
+  assert.deepEqual(movieKeys({ size: 5, drive: { id: 'ABCDEFGHIJ' } }), ['d:ABCDEFGHIJ:5', 's:5']);
+  assert.equal(parseHave({ key: 'd:ABCDEFGHIJ:5', local: false, ranges: [] }).key, 'd:ABCDEFGHIJ:5');
+  assert.equal(parseHave({ key: 'd:ABCDEFGHIJ', local: false, ranges: [] }).key, 'd:ABCDEFGHIJ', 'an older client\'s key is read (it matches none of ours)');
   assert.deepEqual(movieKeys({ size: 5 }), ['s:5']);
   assert.notEqual(keyId('d:A'), keyId('d:B'));
 });
@@ -410,7 +413,7 @@ test('serving: from the cache when the whole piece is cached, otherwise one serv
   ff.inject(0, new Uint8Array(data.subarray(0, P))); // piece 0 is cached at f
   assert.equal(server.calls.length, 0);
   // r1 and r2 want pieces 0 and 1 from f (frames sent by hand, as a peer would)
-  const want = (from, piece, req, key = keyId('d:DRIVEFILE_0001')) => net.film(from, 'f', encodeFrame({ type: T.WANT, req, key, piece }));
+  const want = (from, piece, req, key = keyId(`d:DRIVEFILE_0001:${data.length}`)) => net.film(from, 'f', encodeFrame({ type: T.WANT, req, key, piece }));
   const got = new Map(); // `${to}:${piece}` -> bytes
   for (const n of [r1, r2]) {
     n.mesh.addEventListener('film', (e) => {
@@ -454,7 +457,7 @@ test('serving limits: at most maxPerPeer pieces in flight for a friend, then BUS
   const r = net.node('r');
   net.connect('f', 'r');
   driveFile(f.swarm, data, server).swarm.activate();
-  const key = keyId('d:DRIVEFILE_0001');
+  const key = keyId(`d:DRIVEFILE_0001:${data.length}`);
   const send = (type, piece, req, k = key) => net.film('r', 'f', encodeFrame({ type, req, key: k, piece }));
   send(T.WANT, 0, 1);
   send(T.WANT, 1, 2);
@@ -1169,8 +1172,8 @@ test('keys: the size key carries the fingerprint; a movie names itself with it',
   assert.equal(sizeKey(5, fp), `s:5:${fp}`);
   assert.equal(sizeKey(5, ''), 's:5');
   assert.equal(filmKey({ size: 5, fp }), `s:5:${fp}`);
-  assert.equal(filmKey({ drive: { id: 'ABC' }, size: 5, fp }), 'd:ABC');
-  assert.deepEqual(movieKeys({ size: 5, fp, drive: { id: 'ABCDEFGHIJ' } }), ['d:ABCDEFGHIJ', `s:5:${fp}`]);
+  assert.equal(filmKey({ drive: { id: 'ABC' }, size: 5, fp }), 'd:ABC:5');
+  assert.deepEqual(movieKeys({ size: 5, fp, drive: { id: 'ABCDEFGHIJ' } }), ['d:ABCDEFGHIJ:5', `s:5:${fp}`]);
   assert.deepEqual(movieKeys({ size: 5, fp: 'not a fingerprint' }), ['s:5']);
   assert.equal(parseHave({ key: `s:5:${fp}`, local: true, ranges: [[0, 1]] }).key, `s:5:${fp}`);
   for (const bad of [`s:5:${fp.toUpperCase()}`, 's:5:abc', `s:5:${fp}00`, `s:5:${fp}:1`]) assert.equal(parseHave({ key: bad, local: true, ranges: [] }), null, bad);
@@ -1227,11 +1230,11 @@ test('swarm: a Drive film is fingerprinted lazily, once, and a copy with the sam
   fa.swarm.activate();
   await sleep(20);
   assert.equal(server.fpCalls.length, 0, 'nobody has a copy: nothing to compare with, nothing fetched');
-  assert.deepEqual([...fa.swarm.keys], ['d:DRIVEFILE_0001']);
+  assert.deepEqual([...fa.swarm.keys], [`d:DRIVEFILE_0001:${data.length}`]);
   h.swarm.openLocal(new Blob([data])); // a renamed copy: only the bytes count
   await sleep(40);
   assert.equal(server.fpCalls.length, 3, 'a friend with a file of that size appeared: the film fingerprints itself');
-  assert.deepEqual([...fa.swarm.keys].sort(), ['d:DRIVEFILE_0001', keyOf(data)].sort());
+  assert.deepEqual([...fa.swarm.keys].sort(), [`d:DRIVEFILE_0001:${data.length}`, keyOf(data)].sort());
   assert.deepEqual(a.swarm.holders({ size: data.length, drive: { id: 'DRIVEFILE_0001' } }), ['h'], 'found through the open film\'s names');
   assert((await read(fa, 0, P)).equals(data.subarray(0, P)));
   assert.equal(a.mesh.out(T.WANT)[0].to, 'h', 'the copy was the origin');

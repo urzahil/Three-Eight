@@ -258,4 +258,33 @@ test('kindOf: a shortcut is never a video or subtitle, whatever its name', () =>
   assert.strictEqual(kindOf({ name: 'movie.srt', mimeType: SHORTCUT }), null);
   assert.strictEqual(kindOf({ name: 'movie.mkv', mimeType: 'application/octet-stream' }), 'video');
   assert.strictEqual(kindOf({ name: 'x', mimeType: 'application/vnd.google-apps.folder' }), 'folder');
+  // Formats no browser plays are listed as such, not offered as films.
+  assert.strictEqual(kindOf({ name: 'old.avi', mimeType: 'video/x-msvideo' }), 'unsupported');
+  assert.strictEqual(kindOf({ name: 'rec.ts', mimeType: 'video/mp2t' }), 'unsupported');
+  assert.strictEqual(kindOf({ name: 'clip', mimeType: 'video/x-ms-wmv' }), 'unsupported');
+  assert.strictEqual(kindOf({ name: 'film', mimeType: 'video/mp4' }), 'video', 'a playable type without an extension');
+  assert.strictEqual(kindOf({ name: 'film.MKV', mimeType: 'video/x-matroska' }), 'video');
+});
+
+test('a file replaced in Drive (same ID) is never served as a mix of the old and the new bytes', async () => {
+  const drive = makeDrive();
+  google.addFolder(id(950), 'Replaced folder');
+  const v1 = crypto.randomBytes(3 * MiB);
+  google.addFile(id(951), 'film.mkv', id(950), v1, 'video/x-matroska');
+  const m1 = await drive.fileMeta(id(951));
+  assert.match(m1.rev, /^[0-9a-f]{32}$/, 'the content revision is the MD5');
+  assert((await collect(drive.read(id(951), m1.size, 0, m1.size - 1, undefined, m1.rev))).equals(v1));
+  // Someone uploads a new version of the same size ("Manage versions" keeps the ID); the metadata is asked again later.
+  const v2 = crypto.randomBytes(3 * MiB);
+  google.files.get(id(951)).data = v2;
+  drive._metas.delete(id(951));
+  const m2 = await drive.fileMeta(id(951));
+  assert.notStrictEqual(m2.rev, m1.rev);
+  const before = google.entries('media', id(951)).length;
+  assert((await collect(drive.read(id(951), m2.size, 0, m2.size - 1, undefined, m2.rev))).equals(v2), 'the new bytes, none from the cache of the old');
+  assert(google.entries('media', id(951)).length > before, 'fetched again from Google');
+  // A shorter new version: its size alone is enough to tell it apart, even when Drive gives no revision.
+  const v3 = crypto.randomBytes(2 * MiB);
+  google.files.get(id(951)).data = v3;
+  assert((await collect(drive.read(id(951), v3.length, 0, v3.length - 1))).equals(v3));
 });

@@ -13,11 +13,7 @@ export class Toolbar {
     $('t-leave').onclick = () => {
       this.leave(true);
       showMessage('You left the room', 'Thanks for hanging out!');
-      const again = document.createElement('a');
-      again.className = 'btn primary';
-      again.href = location.pathname;
-      again.textContent = 'Rejoin';
-      $('message-text').after(again);
+      this._offerRejoin();
     };
     $('copy-link').onclick = async () => {
       const url = location.origin + '/' + encodeURIComponent(this.roomName);
@@ -31,6 +27,17 @@ export class Toolbar {
     $('sidebar-close').onclick = () => this.toggleSidebar(null);
     for (const tab of document.querySelectorAll('.tab')) tab.onclick = () => this._selectTab(tab.dataset.tab);
     this._refreshToolbar();
+  }
+
+  /** A "Rejoin" button on the message screen (the lobby of this room again). */
+  _offerRejoin() {
+    $('message-rejoin')?.remove();
+    const again = document.createElement('a');
+    again.id = 'message-rejoin';
+    again.className = 'btn primary';
+    again.href = location.pathname;
+    again.textContent = 'Rejoin';
+    $('message-text').after(again);
   }
 
   _refreshToolbar() {
@@ -47,7 +54,7 @@ export class Toolbar {
   }
 
   async toggleMic() {
-    const ok = await this.media.setMic(!this.media.micOn);
+    const ok = await this.media.toggleMic();
     if (!ok) toast('Could not access a microphone.', 'warn');
     store.set('media', { ...store.get('media', {}), mic: this.media.micOn });
   }

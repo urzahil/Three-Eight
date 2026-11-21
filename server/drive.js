@@ -24,7 +24,12 @@ const ID_RE = /^[A-Za-z0-9_-]{10,200}$/;
 const FOLDER = 'application/vnd.google-apps.folder';
 // A shortcut points at another file and has no content of its own: we don't resolve them, so they are never listed.
 const SHORTCUT = 'application/vnd.google-apps.shortcut';
-const VIDEO_EXT = new Set(['mkv', 'mp4', 'm4v', 'mov', 'webm', 'avi']);
+// Containers the player reads (it remuxes MKV/WebM and MP4/MOV, which browsers also play natively).
+const VIDEO_EXT = new Set(['mkv', 'mp4', 'm4v', 'mov', 'webm']);
+const VIDEO_MIME = new Set(['video/x-matroska', 'video/mp4', 'video/webm', 'video/quicktime', 'video/x-m4v']);
+// Video formats no browser can play (AVI, WMV, FLV, MPEG, TS...). Listed, so nobody wonders where their film went, but
+// as 'unsupported': the app says how to convert it instead of offering to play it.
+const OTHER_VIDEO_EXT = new Set(['avi', 'divx', 'wmv', 'asf', 'flv', 'mpg', 'mpeg', 'm2v', 'ts', 'mts', 'm2ts', 'vob', '3gp', '3g2', 'ogv', 'rm', 'rmvb']);
 const SUB_EXT = new Set(['srt', 'vtt', 'ass', 'ssa']);
 const SCOPE = 'https://www.googleapis.com/auth/drive.readonly';
 const DEFAULT_TOKEN_URI = 'https://oauth2.googleapis.com/token';
@@ -48,15 +53,29 @@ const MAX_LIST_ITEMS = 5000; // items of one folder listing
 const MAX_LIST_PAGES = 20; // pages of 1000 files read for one listing
 
 const noop = () => {};
+
+/** What names a file's content: its MD5 (binary files have one), else when it last changed. '' when Drive says neither. */
+function revOf(f) {
+  const md5 = typeof f.md5Checksum === 'string' && /^[0-9a-f]{32}$/i.test(f.md5Checksum) ? f.md5Checksum.toLowerCase() : '';
+  const modified = typeof f.modifiedTime === 'string' && f.modifiedTime.length <= 40 ? f.modifiedTime : '';
+  return md5 || modified;
+}
 const ext = (name) => (String(name).match(/\.([A-Za-z0-9]+)$/)?.[1] || '').toLowerCase();
 
-/** What a Drive entry is for us: 'folder', 'video', 'subtitle', or null (documents, images, shortcuts, ...). */
+/**
+ * What a Drive entry is for us: 'folder', 'video', 'subtitle', 'unsupported' (a video in a format browsers cannot
+ * play), or null (documents, images, shortcuts, ...).
+ */
 function kindOf(f) {
   if (f.mimeType === FOLDER) return 'folder';
   if (f.mimeType === SHORTCUT) return null; // even one named movie.mkv
   const e = ext(f.name);
-  if (String(f.mimeType).startsWith('video/') || VIDEO_EXT.has(e)) return 'video';
+  const mime = String(f.mimeType).toLowerCase();
+  if (VIDEO_EXT.has(e)) return 'video';
   if (SUB_EXT.has(e)) return 'subtitle';
+  if (OTHER_VIDEO_EXT.has(e)) return 'unsupported';
+  if (VIDEO_MIME.has(mime)) return 'video'; // a film without a known extension
+  if (mime.startsWith('video/')) return 'unsupported';
   return null;
 }
 
@@ -438,12 +457,15 @@ class GoogleDrive {
     });
   }
 
-  /** { id, name, mimeType, size, trashed } of any file. */
+  /**
+   * { id, name, mimeType, size, trashed, rev } of any file. `rev` names its content (see revOf): a file replaced in
+   * Drive keeps its ID, and the block cache must not mix the old bytes with the new.
+   */
   fileMeta(id) {
     const eid = GoogleDrive._id(id);
     return this._metas.run(id, async () => {
-      const f = await this._json(`files/${eid}?${new URLSearchParams({ fields: 'id,name,mimeType,size,trashed', supportsAllDrives: 'true' })}`);
-      return { id: f.id, name: String(f.name), mimeType: String(f.mimeType || ''), size: Number(f.size), trashed: !!f.trashed };
+      const f = await this._json(`files/${eid}?${new URLSearchParams({ fields: 'id,name,mimeType,size,trashed,md5Checksum,modifiedTime', supportsAllDrives: 'true' })}`);
+      return { id: f.id, name: String(f.name), mimeType: String(f.mimeType || ''), size: Number(f.size), trashed: !!f.trashed, rev: revOf(f) };
     });
   }
 
@@ -473,7 +495,7 @@ class GoogleDrive {
     do {
       const params = new URLSearchParams({
         q: `'${folderId}' in parents and trashed=false`,
-        fields: 'nextPageToken,files(id,name,mimeType,size,videoMediaMetadata(durationMillis),parents)',
+        fields: 'nextPageToken,files(id,name,mimeType,size,md5Checksum,modifiedTime,videoMediaMetadata(durationMillis),parents)',
         pageSize: '1000',
         supportsAllDrives: 'true',
         includeItemsFromAllDrives: 'true',
@@ -492,7 +514,7 @@ class GoogleDrive {
         const size = Number(f.size) || 0;
         out.push({ id: f.id, name: String(f.name), kind, size, durationMs: Number(f.videoMediaMetadata?.durationMillis) || 0 });
         // Lets a following request for this file skip the metadata call.
-        if (kind !== 'folder') this._metas.put(f.id, { id: f.id, name: String(f.name), mimeType: String(f.mimeType || ''), size: Number(f.size), trashed: false });
+        if (kind !== 'folder') this._metas.put(f.id, { id: f.id, name: String(f.name), mimeType: String(f.mimeType || ''), size: Number(f.size), trashed: false, rev: revOf(f) });
       }
       pageToken = truncated ? '' : data.nextPageToken || '';
       if (pageToken && pages >= this.maxListPages) {
@@ -608,26 +630,26 @@ class GoogleDrive {
    * Start fetching blocks a..b of a file with one upstream request. A "run" is shared by everyone who
    * wants any of its blocks; `refs` counts them, and the request is cancelled when nobody is left.
    */
-  _startRun(fileId, size, a, b) {
-    const run = { fileId, a, b, refs: 0, done: false, aborted: false, ctrl: new AbortController() };
+  _startRun(fk, fileId, size, a, b) {
+    const run = { fk, fileId, a, b, refs: 0, done: false, aborted: false, ctrl: new AbortController() };
     run.promise = this._fetchRun(run, size);
     const finish = () => {
       run.done = true;
       // A settled promise keeps its value alive: drop it, or a stream holding this run pins every block it fetched.
       run.promise = null;
       for (let i = run.a; i <= run.b; i++) {
-        const k = `${fileId}:${i}`;
+        const k = `${fk}:${i}`;
         if (this.pending.get(k)?.run === run) this.pending.delete(k);
       }
     };
     run.promise.then((blocks) => {
-      blocks.forEach((blk, k) => this._cacheSet(`${fileId}:${a + k}`, blk)); // cached before it stops being pending
+      blocks.forEach((blk, k) => this._cacheSet(`${fk}:${a + k}`, blk)); // cached before it stops being pending
       finish();
     }, finish);
     for (let i = a; i <= b; i++) {
       const promise = run.promise.then((blocks) => blocks[i - a]);
       promise.catch(noop); // a block nobody waits for any more must not be an unhandled rejection
-      this.pending.set(`${fileId}:${i}`, { run, promise });
+      this.pending.set(`${fk}:${i}`, { run, promise });
     }
     return run;
   }
@@ -639,7 +661,7 @@ class GoogleDrive {
     const i = this.queue.findIndex((w) => w.run === run);
     if (i >= 0) this.queue.splice(i, 1)[0].reject(new DriveError('Cancelled', 499, { aborted: true }));
     for (let i = run.a; i <= run.b; i++) {
-      const k = `${run.fileId}:${i}`;
+      const k = `${run.fk}:${i}`;
       if (this.pending.get(k)?.run === run) this.pending.delete(k);
     }
   }
@@ -695,12 +717,12 @@ class GoogleDrive {
   }
 
   /** Make sure blocks a..b are cached or being fetched. Returns the runs covering the ones that are not cached. */
-  _ensure(fileId, size, a, b) {
+  _ensure(fk, fileId, size, a, b) {
     const runs = [];
     const fresh = [];
     let cur = null;
     for (let i = a; i <= b; i++) {
-      const key = `${fileId}:${i}`;
+      const key = `${fk}:${i}`;
       if (this.blocks.has(key)) {
         cur = null;
         continue;
@@ -716,16 +738,19 @@ class GoogleDrive {
         fresh.push(cur);
       } else cur.b = i;
     }
-    for (const r of fresh) runs.push(this._startRun(fileId, size, r.a, r.b));
+    for (const r of fresh) runs.push(this._startRun(fk, fileId, size, r.a, r.b));
     return runs;
   }
 
   /**
    * Bytes start..end (inclusive) of a file, as an async generator of Buffers. Blocks come from the
    * cache, from a download another client already started, or from a new upstream request of up to
-   * 8 MiB. Stops upstream work nobody else needs when `signal` aborts or the consumer stops.
+   * 8 MiB. Stops upstream work nobody else needs when `signal` aborts or the consumer stops. `rev` (fileMeta) names
+   * the file's content: blocks are cached per size and revision, so a file replaced in Drive is never served as a mix
+   * of old and new bytes.
    */
-  async *read(fileId, size, start, end, signal) {
+  async *read(fileId, size, start, end, signal, rev = '') {
+    const fk = `${fileId}/${size}/${rev}`;
     const first = Math.floor(start / BLOCK);
     const last = Math.floor(end / BLOCK);
     const held = new Set();
@@ -750,7 +775,7 @@ class GoogleDrive {
     const request = (upto) => {
       const hi = Math.min(last, upto);
       if (hi <= requested) return;
-      hold(this._ensure(fileId, size, requested + 1, hi));
+      hold(this._ensure(fk, fileId, size, requested + 1, hi));
       requested = hi;
     };
     let onAbort;
@@ -765,13 +790,13 @@ class GoogleDrive {
       for (let i = first; i <= last; i++) {
         if (signal?.aborted) return;
         if (i > requested - 3) request(requested + MAX_RUN_BLOCKS); // keep about one window ahead
-        const key = `${fileId}:${i}`;
+        const key = `${fk}:${i}`;
         let buf = this._cacheGet(key);
         while (!buf) {
           let p = this.pending.get(key);
           if (!p) {
             // Cached when we asked, evicted since (or its download was cancelled): ask again.
-            hold(this._ensure(fileId, size, i, i));
+            hold(this._ensure(fk, fileId, size, i, i));
             p = this.pending.get(key);
           }
           buf = p ? await Promise.race([p.promise, aborted]) : this._cacheGet(key);

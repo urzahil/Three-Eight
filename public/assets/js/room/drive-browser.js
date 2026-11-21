@@ -163,16 +163,23 @@ export class DriveBrowser {
         meta.textContent = canSub ? 'subtitles' : 'pick a movie first';
         b.disabled = !canSub;
         b.onclick = () => this._shareDriveSubtitle(f, b);
-      } else {
+      } else if (f.kind === 'unsupported') {
+        // AVI, WMV, MPEG...: no browser plays them. Shown, so nobody wonders where the film went.
+        meta.textContent = [fmtSize(f.size), 'format not supported'].filter(Boolean).join(' · ');
+        b.title = `${f.name}: browsers can't play this format. Convert it to MP4 or MKV (H.264 video, AAC audio) and put that copy in the folder.`;
+        b.disabled = true;
+      } else if (f.kind === 'folder') {
         b.onclick = () => {
           this.driveTrail.push({ id: f.id, name: f.name });
           this._renderDriveCrumbs();
           this._loadDriveFolder();
         };
+      } else {
+        return null; // a kind this page does not know (a newer server)
       }
-      b.append(icon(f.kind === 'folder' ? 'folder' : f.kind === 'video' ? 'film' : 'cc'), name, meta);
+      b.append(icon(f.kind === 'folder' ? 'folder' : f.kind === 'subtitle' ? 'cc' : 'film'), name, meta);
       return b;
-    });
+    }).filter(Boolean);
     if (this._driveTruncated) {
       const p = document.createElement('p');
       p.className = 'muted';

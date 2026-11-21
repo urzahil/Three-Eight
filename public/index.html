@@ -216,7 +216,7 @@
         <nav id="drive-crumbs" class="crumbs" aria-label="Folder path"></nav>
         <div id="drive-list" class="drive-list" aria-live="polite"></div>
       </section>
-      <label class="btn primary file-btn"><svg><use href="#i-folder"/></svg> Choose movie file…<input id="movie-file" type="file" accept="video/*,.mkv,.mp4,.m4v,.mov,.webm,.avi"></label>
+      <label class="btn primary file-btn"><svg><use href="#i-folder"/></svg> Choose movie file…<input id="movie-file" type="file" accept="video/*,.mkv,.mp4,.m4v,.mov,.webm"></label>
       <div id="movie-dialog-current" hidden>
         <button id="movie-unload" class="btn" value="unload">Stop using my file</button>
         <button id="movie-close" class="btn danger" value="close">Close the movie for everyone</button>
@@ -235,13 +235,13 @@
     </form>
   </dialog>
 
-  <dialog id="settings-dialog" class="dialog">
+  <dialog id="settings-dialog" class="dialog" aria-labelledby="settings-title">
     <form method="dialog" class="stack">
       <div class="dialog-head">
-        <h2>Settings</h2>
+        <h2 id="settings-title" tabindex="-1" autofocus>Settings</h2>
         <p class="about"><span id="app-version" title="Three-Eight version">v3.4.3</span> · <a href="https://github.com/urzahil/Three-Eight" target="_blank" rel="noopener noreferrer">GitHub</a></p>
       </div>
-      <label>Your name <input id="set-name" maxlength="40" autofocus></label>
+      <label>Your name <input id="set-name" maxlength="40"></label>
       <label>Interface style <select id="set-ui" data-theme-select></select></label>
       <label>Microphone <select id="set-audio-dev"></select></label>
       <label>Camera <select id="set-video-dev"></select></label>
@@ -264,7 +264,10 @@
           <option value="compact">Compact video (no title bar, play/pause only)</option>
         </select>
       </label>
-      <label>Subtitle delay (only for you, seconds) <input id="set-subdelay" type="number" step="0.1" value="0"></label>
+      <label>Subtitle delay (only for you, seconds; kept for this movie) <input id="set-subdelay" type="number" step="0.1" min="-600" max="600" value="0"></label>
+      <label>Encoding of subtitle files that aren’t Unicode
+        <select id="set-subenc"></select>
+      </label>
       <button class="btn primary" value="save">Done</button>
     </form>
   </dialog>

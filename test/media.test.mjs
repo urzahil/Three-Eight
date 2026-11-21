@@ -230,3 +230,28 @@ test('switching microphones keeps mute; a microphone that fails leaves the previ
   assert.equal(m.audioTrack.enabled, false);
   assert.deepEqual(live(made, 'audio'), [m.audioTrack]);
 });
+
+test('unmute right after the microphone was blocked asks for it at once (not on a second press)', async () => {
+  fakeDevices({ fail: true });
+  const m = new LocalMedia({ mic: true, cam: false });
+  await m.init();
+  assert.equal(m.micOn, true, 'the preference stays on');
+  assert.equal(m.micActive, false, 'but there is no microphone: the button shows "Unmute"');
+  const { calls } = fakeDevices();
+  assert.equal(await m.toggleMic(), true);
+  assert.equal(calls.length, 1, 'the first press requests the microphone');
+  assert.equal(m.micActive, true);
+  await m.toggleMic();
+  assert.equal(m.micActive, false, 'and the next one mutes');
+});
+
+test('unmute after the microphone was unplugged opens one again at once', async () => {
+  fakeDevices();
+  const m = new LocalMedia({ mic: true, cam: false });
+  await m.init();
+  m.audioTrack.end(); // unplugged
+  assert.equal(m.audioTrack, null);
+  assert.equal(m.micActive, false);
+  await m.toggleMic();
+  assert.ok(m.audioTrack && m.audioTrack.enabled, 'a new track, enabled');
+});

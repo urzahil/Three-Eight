@@ -25,12 +25,14 @@ const { WebSocketServer } = require('ws');
 const { RoomStore, RoomError, parseDriveFolder } = require('./store');
 const { limiterKeys, forwardedAddress } = require('./ip');
 const { GoogleDrive, DriveError, ID_RE: DRIVE_ID_RE, FOLDER, kindOf, loadServiceAccount, parseRange, MiB } = require('./drive');
-const { ConfigError, intSetting, trustedHops, driveCacheMb, adminPassword } = require('./config');
+const { ConfigError, intSetting, trustedHops, driveCacheMb, adminPassword, iceSettings } = require('./config');
 
 // Settings that are set but unusable stop the server (see config.js) rather than silently change its behaviour.
-let PORT, MAX_ROOM_SIZE, TRUSTED_HOPS, DRIVE_CACHE_SETTING_MB, ADMIN_PASSWORD;
+let PORT, MAX_ROOM_SIZE, TRUSTED_HOPS, DRIVE_CACHE_SETTING_MB, ADMIN_PASSWORD, ICE;
 try {
   ADMIN_PASSWORD = adminPassword(process.env);
+  // STUN/TURN URLs and credentials: a malformed entry would make every browser refuse to set up any call.
+  ICE = iceSettings(process.env);
   PORT = intSetting(process.env, 'PORT', 4567, 1, 65535);
   // Each person sends video to everyone else, so the mesh gets heavy well before this upper bound. The bound also keeps
   // the relay limits below sound (see RELAY_FAIR_BYTES).
@@ -193,30 +195,30 @@ function stillValid(checked) {
 // TURN credentials let their holder relay traffic through the operator's TURN server: they are only handed to room
 // members, after the password check (in the welcome message, and again before they expire). The public /api/config
 // lists STUN only.
-const TURN_URLS = (process.env.TURN_URLS || '').split(',').map((s) => s.trim()).filter(Boolean);
 const TURN_TTL_S = 12 * 3600;
 // Members get fresh TURN credentials when theirs are this old (they expire after TURN_TTL_S). DRIVE_DEBUG=1 lets tests shorten it.
 const ICE_REFRESH_MS = (DRIVE_DEBUG && parseInt(process.env.ICE_REFRESH_MS, 10)) || 10 * 3600 * 1000;
 
 function stunServers() {
-  const stun = (process.env.STUN_URLS ?? 'stun:stun.l.google.com:19302,stun:stun.cloudflare.com:3478')
-    .split(',').map((s) => s.trim()).filter(Boolean);
-  return stun.length ? [{ urls: stun }] : [];
+  return ICE.stun.length ? [{ urls: ICE.stun }] : [];
 }
 
-/** STUN and, when configured, TURN with credentials. For room members only. */
-function iceServers() {
+/**
+ * STUN and, when configured, TURN with credentials. For room members only. With TURN_SECRET each member gets a
+ * login of its own (coturn "use-auth-secret": "<expiry>:<member id>"), so coturn's per-user quota counts one person's
+ * relays, not those of everyone who happened to get credentials in the same second.
+ */
+function iceServers(memberId) {
   const servers = stunServers();
-  const turn = TURN_URLS;
-  if (turn.length) {
-    if (process.env.TURN_SECRET) {
+  if (ICE.turn.length) {
+    if (ICE.secret) {
       // coturn "use-auth-secret" ephemeral credentials (valid 12 h).
       const expiry = Math.floor(Date.now() / 1000) + TURN_TTL_S;
-      const username = `${expiry}:three-eight`;
-      const credential = crypto.createHmac('sha1', process.env.TURN_SECRET).update(username).digest('base64');
-      servers.push({ urls: turn, username, credential });
+      const username = `${expiry}:${memberId}`;
+      const credential = crypto.createHmac('sha1', ICE.secret).update(username).digest('base64');
+      servers.push({ urls: ICE.turn, username, credential });
     } else {
-      servers.push({ urls: turn, username: process.env.TURN_USERNAME || '', credential: process.env.TURN_PASSWORD || '' });
+      servers.push({ urls: ICE.turn, username: ICE.username, credential: ICE.password });
     }
   }
   return servers;
@@ -969,7 +971,7 @@ async function serveFile(req, res, id, checked) {
     untrack();
     ctrl.abort();
   });
-  const gen = driveApi.read(id, size, start, end, ctrl.signal);
+  const gen = driveApi.read(id, size, start, end, ctrl.signal, meta.rev || '');
   try {
     // The first block is fetched before any header is sent, so a Google error still becomes a proper error response.
     let next = await gen.next();
@@ -1460,7 +1462,7 @@ async function handleJoin(ws, msg) {
   clearTimeout(ws.joinDeadline);
   try {
     // resumed: this join took over the live entry of the same participant (a reconnect).
-    const welcome = { type: 'welcome', id, room: room.name, peers, resumed: !!existing, iceServers: iceServers() };
+    const welcome = { type: 'welcome', id, room: room.name, peers, resumed: !!existing, iceServers: iceServers(id) };
     const drive = driveInfo(room, id);
     if (drive) {
       welcome.drive = drive;
@@ -1659,14 +1661,12 @@ wss.on('connection', (ws, req) => {
 
 /** Fresh TURN credentials for the members whose last ones are older than ICE_REFRESH_MS (they are valid 12 h). */
 function refreshIce() {
-  if (!TURN_URLS.length || !process.env.TURN_SECRET) return; // nothing that expires: STUN, or static TURN credentials
+  if (!ICE.turn.length || !ICE.secret) return; // nothing that expires: STUN, or static TURN credentials
   const now = Date.now();
-  let servers; // one set per tick
   for (const members of live.values()) {
-    for (const m of members.values()) {
+    for (const [id, m] of members) {
       if (now - m.iceAt < ICE_REFRESH_MS) continue;
-      servers ??= iceServers();
-      send(m.ws, { type: 'ice', iceServers: servers });
+      send(m.ws, { type: 'ice', iceServers: iceServers(id) });
       m.iceAt = now;
     }
   }
