@@ -98,15 +98,17 @@ For screen sharing, click **Share screen** and choose a screen, window, or brows
 | Key | Action |
 |---|---|
 | `Space` / `k` | Play / pause \* |
-| `←` / `→` | Back / forward 10 s \* (step adjustable in Settings: 5, 10, 15, 30 or 60 s) |
+| `←` / `→`, or `j` / `l` | Back / forward 10 s \* (step adjustable in Settings: 5, 10, 15, 30 or 60 s) |
+| `↑` / `↓` | Movie volume up / down, only for you \* |
 | `p` | Picture-in-picture on / off \* |
 | `f` | Full screen on / off |
 | `m` | Microphone on / off |
 | `v` | Camera on / off |
 | `s` | Share screen on / off (desktop browsers) |
 | `c` | Open / close chat |
+| `?` | Show the list of shortcuts |
 
-\* Only while you have joined the movie that is playing. Shortcuts are ignored while typing in a text field or a dialog, and when Ctrl, Alt or ⌘ is held. They also work in the picture-in-picture window.
+\* Only while you have joined the movie that is playing. Shortcuts are ignored while typing in a text field or a dialog, and when Ctrl, Alt or ⌘ is held. They also work in the picture-in-picture window (except `?`).
 
 ## Google Drive (optional)
 
@@ -149,7 +151,7 @@ With Docker Compose, only `ADMIN_PASSWORD`, `MAX_ROOM_SIZE`, the `TURN_*` variab
 - [Google Drive integration](docs/google-drive.md): service account setup, access model, limits.
 - [Customization](docs/customization.md): interface styles, colors, installing as an app.
 - [Development](docs/development.md): running locally and the test suites.
-- [Feature plans](docs/feature-plans.md): implementation notes for features that are not built yet.
+- [Feature plans](docs/feature-plans.md): implementation notes for planned features, and which of them are done.
 
 ## Troubleshooting
 

@@ -68,15 +68,17 @@ Media keys and supported system PiP controls use the Media Session API and contr
 | Key | Action |
 |---|---|
 | `Space` or `k` | Play / pause \* |
-| `←` / `→` | Seek backward / forward \* (default 10 seconds; configurable in Settings to 5, 10, 15, 30 or 60 seconds) |
+| `←` / `→`, or `j` / `l` | Seek backward / forward \* (default 10 seconds; configurable in Settings to 5, 10, 15, 30 or 60 seconds) |
+| `↑` / `↓` | Movie volume up / down by 5 %, only for you \* (shown over the picture for a moment; up also unmutes) |
 | `p` | Toggle picture-in-picture \* |
 | `f` | Toggle fullscreen |
 | `m` | Toggle microphone |
 | `v` | Toggle camera |
 | `s` | Toggle screen share where supported |
 | `c` | Toggle chat |
+| `?` | Show the list of shortcuts (those your browser supports, with your seek step) |
 
-\* Movie shortcuts (`Space`, `k`, the arrows and `p`) are active only when you have joined the movie that is playing; `p` also needs a picture-in-picture style your browser supports. All shortcuts are ignored while typing in text fields, while dialogs are open, or when Ctrl/Alt/Command is held. They also work in supported PiP windows.
+\* Movie shortcuts (`Space`, `k`, the four arrows, `j`, `l` and `p`) are active only when you have joined the movie that is playing; `p` also needs a picture-in-picture style your browser supports. Otherwise the arrows scroll the page as usual. All shortcuts are ignored while typing in text fields, while dialogs are open, or when Ctrl/Alt/Command is held. They also work in supported PiP windows, except `?`, whose list opens in the main window.
 
 ## Screen sharing
 

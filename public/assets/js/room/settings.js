@@ -9,8 +9,8 @@ const SUB_DELAY_MOVIES = 50; // movies whose subtitle delay is remembered
 
 export class Settings {
   _updateSeekTitles() {
-    $('m-back').title = `Back ${this.seekStep} s (←)`;
-    $('m-fwd').title = `Forward ${this.seekStep} s (→)`;
+    $('m-back').title = `Back ${this.seekStep} s (← or j)`;
+    $('m-fwd').title = `Forward ${this.seekStep} s (→ or l)`;
   }
 
   _initSettings() {

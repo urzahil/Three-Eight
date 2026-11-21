@@ -1,6 +1,7 @@
 # Feature plans
 
-Implementation notes for features that Three-Eight does not have yet. Each section is meant to be picked up on its own
+Implementation notes for features that Three-Eight did not have when they were written. Those built since are marked
+**Done** in the table, and their sections say what was built. Each section is meant to be picked up on its own
 (by a person or a Claude session): what to build, where it goes in the code, the edge cases that matter, and how to
 test it. They are not ordered by priority; the table says what each costs and what it is worth.
 
@@ -19,7 +20,7 @@ test it. They are not ordered by priority; the table says what each costs and wh
 | 11 | [Subtitle style](#11-subtitle-style) | S | no | |
 | 12 | [Connection quality indicator](#12-connection-quality-indicator) | M | no | |
 | 13 | [Chat notifications and reactions](#13-chat-notifications-and-reactions) | M | no | |
-| 14 | [More keyboard shortcuts and a shortcuts list](#14-more-keyboard-shortcuts-and-a-shortcuts-list) | S | no | |
+| 14 | [More keyboard shortcuts and a shortcuts list](#14-more-keyboard-shortcuts-and-a-shortcuts-list) | S | no | **Done** |
 | 15 | [Admin: rename, room size, last activity, backup](#15-admin-rename-room-size-last-activity-backup) | L | yes | Security-sensitive: needs an Opus review |
 | 16 | [Reload the TLS certificate without a restart](#16-reload-the-tls-certificate-without-a-restart) | S | yes | |
 | 17 | [Translations](#17-translations) | L | a little | |
@@ -342,6 +343,14 @@ picture as well (a setting, off by default).
 dropped.
 
 ## 14. More keyboard shortcuts and a shortcuts list
+
+**Done.** `SHORTCUTS` in `room/keyboard.js` is the one list: the `?` dialog (`openShortcuts`, leaving out what the
+browser lacks, such as `p` without picture-in-picture) is built from it, and `test/shortcuts.test.mjs` checks that the
+tables in `README.md` and `docs/movie-player.md` list exactly its keys and that the handler acts on each of them. `↑` /
+`↓` need the same as the other movie shortcuts (the movie you have joined), step by 5 %, unmute on the way up, and
+show the volume over the picture (`_stepMovieVolume` and `_flashMovieNote` in `room/movie.js`). `?` is ignored in the
+floating window, since its list would open in the main window. Tests: `test/shortcuts.test.mjs` and the keyboard part
+of `test/e2e.js`.
 
 **Goal.** `↑` / `↓` for the movie volume, `j` / `l` as alternatives to the arrows, and `?` to show all shortcuts.
 

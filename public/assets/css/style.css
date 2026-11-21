@@ -199,6 +199,8 @@ button:focus-visible, .seek:focus-visible { outline: 2px solid var(--accent); ou
 .subs span { display: inline; text-shadow: 0 0 3px var(--sub-outline), 0 0 3px var(--sub-outline), 1px 1px 2px var(--sub-outline), -1px -1px 2px var(--sub-outline), 1px -1px 2px var(--sub-outline), -1px 1px 2px var(--sub-outline); white-space: pre-wrap; }
 .movie-overlay { position: absolute; inset: 0; display: grid; place-items: center; text-align: center; padding: 24px; background: var(--movie-overlay); z-index: 2; }
 .movie-overlay .stack { max-width: 460px; align-items: center; }
+/* A short note over the picture, e.g. the volume after ↑ / ↓. */
+.movie-note { position: absolute; left: 50%; top: 16px; transform: translateX(-50%); padding: 6px 14px; border-radius: var(--r-btn); background: var(--label-bg); font-size: 14px; font-variant-numeric: tabular-nums; white-space: nowrap; pointer-events: none; z-index: 4; }
 .movie-controls { position: absolute; left: 0; right: 0; bottom: 0; padding: 30px 12px 8px; background: linear-gradient(transparent, var(--controls-scrim)); transition: opacity 200ms; z-index: 3; }
 .seek-row { display: flex; align-items: center; gap: 10px; }
 .time { font-size: 12px; font-variant-numeric: tabular-nums; color: var(--time-text); min-width: 44px; text-align: center; }
@@ -268,7 +270,12 @@ button:focus-visible, .seek:focus-visible { outline: 2px solid var(--accent); ou
 .dialog .stack > * { min-width: 0; }
 /* A dialog's title with small print on the right (the Settings dialog: the app version and the source link). */
 .dialog-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
-#settings-title:focus { outline: none; } /* focused on open (not the name field: that would pop up a phone keyboard) */
+#settings-title:focus, #keys-title:focus { outline: none; } /* focused on open (not the name field: that would pop up a phone keyboard) */
+/* The keyboard shortcuts list ("?"). */
+.keys { border-collapse: collapse; width: 100%; font-size: 14px; }
+.keys td { padding: 6px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
+.keys td:first-child { padding-right: 16px; white-space: nowrap; color: var(--muted); }
+kbd { display: inline-block; min-width: 1.6em; padding: 1px 6px; border: 1px solid var(--line); border-bottom-width: 2px; border-radius: var(--r-sm); background: var(--bg-3); color: var(--text); font: inherit; font-size: 13px; text-align: center; }
 .dialog-head .about { margin: 0; font-size: 12px; color: var(--muted); white-space: nowrap; }
 @media (max-width: 480px) { .dialog { padding: 18px 16px; } }
 
