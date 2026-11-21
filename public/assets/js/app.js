@@ -2,7 +2,7 @@ import { Signaling } from './signaling.js';
 import { Mesh } from './mesh.js';
 import { MovieSync } from './sync.js';
 import { MoviePlayer } from './player/player.js';
-import { LocalMedia, watchLevel, audioContext } from './media.js';
+import { LocalMedia, AudioOutput, outputOptions, watchLevel, audioContext } from './media.js';
 import { Swarm } from './player/swarm.js';
 import { $, store, show, showMessage, toast, setIcon, colorFor, initials, randomId, randomSecret, mixin, pipState } from './room/util.js';
 import { bindThemeSelect } from './theme.js';
@@ -149,6 +149,11 @@ async function startLobby(room) {
     refreshAvatar();
     audioContext(); // typing is a user gesture: lets a suspended meter's audio context resume
   });
+  // Speakers or headphones (browsers with setSinkId): only remembered here, since nothing plays in the lobby. The room
+  // plays the call and the movie through the choice, or the default if it is not there (see room/settings.js).
+  const outputs = AudioOutput.supported;
+  $('lobby-output-wrap').hidden = !outputs;
+  let chosenOutput = null; // { id, label } picked in Firefox's chooser, which the browser may not list yet
   const fillDevices = async () => {
     const d = await media.devices();
     if (!inLobby) return; // joined meanwhile: the room's Settings have their own lists
@@ -157,6 +162,31 @@ async function startLobby(room) {
       sel.replaceChildren(...d[kind].map((dev, i) => new Option(dev.label || `${kind === 'audio' ? 'Microphone' : 'Camera'} ${i + 1}`, dev.deviceId)));
       sel.value = media.currentDeviceId(kind);
     }
+    if (outputs) {
+      const options = outputOptions(d.output);
+      if (chosenOutput && !options.some((o) => o.id === chosenOutput.id)) options.push(chosenOutput);
+      const wanted = store.get('audioOutput', '');
+      $('lobby-output-dev').replaceChildren(...options.map((o) => new Option(o.label, o.id)));
+      // A saved choice that is not listed (unplugged) shows the default, which is what will play; it stays saved.
+      $('lobby-output-dev').value = options.some((o) => o.id === wanted) ? wanted : '';
+    }
+  };
+  const chooseOutput = (id) => store.set('audioOutput', id || null);
+  $('lobby-output-dev').onchange = (e) => chooseOutput(e.target.value);
+  // Firefox lists no outputs until one is picked in its own chooser (which needs a click). The choice it grants lasts
+  // for this page, so the room can use it after joining.
+  $('lobby-output-choose').hidden = !outputs || !AudioOutput.canChoose;
+  $('lobby-output-choose').onclick = async () => {
+    let device;
+    try {
+      device = await navigator.mediaDevices.selectAudioOutput();
+    } catch (err) {
+      if (err.name !== 'NotAllowedError' && err.name !== 'AbortError') toast('Could not list the outputs.', 'warn');
+      return; // closed without a choice
+    }
+    chosenOutput = { id: device.deviceId, label: device.label || 'Chosen output' };
+    chooseOutput(device.deviceId);
+    fillDevices();
   };
   const changeDevice = async (kind, deviceId) => {
     if (!(await media.setDevice(kind, deviceId))) toast(`Could not start that ${kind === 'audio' ? 'microphone' : 'camera'}.`, 'warn');
@@ -178,7 +208,7 @@ async function startLobby(room) {
   // The devices are requested below, and the browser may keep its permission prompt open for as long as it
   // likes (Firefox lets it be dismissed without an answer). The form works right away: until the prompt is
   // answered, the device controls wait, and joining goes ahead without camera and microphone.
-  const deviceControls = ['lobby-mic', 'lobby-cam', 'lobby-audio-dev', 'lobby-video-dev'];
+  const deviceControls = ['lobby-mic', 'lobby-cam', 'lobby-audio-dev', 'lobby-video-dev', 'lobby-output-dev', 'lobby-output-choose'];
   for (const id of deviceControls) $(id).disabled = true;
   refreshPreview();
   let inLobby = true; // false once the room has taken over

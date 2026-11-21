@@ -135,7 +135,8 @@ button:focus-visible, .seek:focus-visible { outline: 2px solid var(--accent); ou
 .meter { position: absolute; left: 12px; top: 12px; width: 6px; height: 60px; background: var(--meter-bg); border-radius: 3px; overflow: hidden; display: flex; align-items: flex-end; }
 .meter div { width: 100%; background: var(--ok); height: 0; transition: height 80ms linear; }
 .devices summary { cursor: pointer; color: var(--muted); font-size: 13px; }
-.devices label { margin-top: 10px; }
+.devices label, .devices .field { margin-top: 10px; }
+.devices .field label { margin-top: 0; }
 .ui-pick { margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--line); }
 @media (max-width: 760px) {
   .lobby-card { grid-template-columns: 1fr; padding: 18px; gap: 18px; }

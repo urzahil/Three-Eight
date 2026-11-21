@@ -60,6 +60,16 @@ async function waitFor(page, fn, arg, timeout = 15000) {
     page.on('console', (m) => { if (m.type() === 'error' || m.type() === 'warning') console.log(`[${name} console]`, m.text()); });
     await page.goto(`${BASE}/${ROOM}?debug`);
     await page.waitForSelector('#lobby:not([hidden])');
+    if (name === 'Alice') {
+      // Speakers or headphones in the lobby (Chromium has setSinkId): the choice is saved, and the room plays through it.
+      await page.click('#lobby summary:text-is("Devices")');
+      await waitFor(page, () => document.getElementById('lobby-output-dev').options.length > 1 && !document.getElementById('lobby-output-dev').disabled);
+      const outputs = await page.evaluate(() => [...document.getElementById('lobby-output-dev').options].map((o) => o.value));
+      assert.strictEqual(outputs[0], '', 'the default comes first');
+      await page.selectOption('#lobby-output-dev', outputs[1]);
+      assert.strictEqual(await page.evaluate(() => JSON.parse(localStorage.getItem('te.audioOutput'))), outputs[1]);
+      page.lobbyOutput = outputs[1];
+    }
     await page.fill('#lobby-name', name);
     await page.fill('#lobby-password', name === 'Bob' ? 'nope' : 'secret');
     await page.click('#lobby-join');
@@ -75,6 +85,8 @@ async function waitFor(page, fn, arg, timeout = 15000) {
   }
   const [alice, bob] = people.map((p) => p.page);
   console.log('both joined');
+  await waitFor(alice, (id) => room.output.id === id && room.player.video.sinkId === id, alice.lobbyOutput);
+  console.log('the output chosen in the lobby is used in the room');
 
   // remote video arrives P2P
   const dump = (p) => p.evaluate(() => [...room.mesh.peers.values()].map((x) => ({ polite: x.polite, conn: x.pc.connectionState, sig: x.pc.signalingState, ice: x.pc.iceConnectionState, tx: x.pc.getTransceivers().map((t) => `${t.mid}:${t.direction}/${t.currentDirection}:${t.sender.track?.kind}`), streamTracks: x.stream.getTracks().map((t) => t.kind + ':' + t.readyState + ':' + t.muted), dc: x.dc.readyState, vw: [...document.querySelectorAll('.tile:not(.self) video')].map((v) => v.videoWidth + 'x' + v.readyState + ':' + !!v.srcObject) })));

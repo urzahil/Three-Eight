@@ -167,7 +167,7 @@ export class Settings {
     out.addEventListener('fallback', () => {
       if (this._outputWarned || !out.wanted) return;
       this._outputWarned = true;
-      toast('The speakers or headphones chosen in Settings are not available: sound plays through the default output.', 'warn');
+      toast('The speakers or headphones you chose are not available: sound plays through the default output.', 'warn');
     });
     out.addEventListener('change', () => {
       if ($('settings-dialog').open) $('set-output-dev').value = out.id;

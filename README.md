@@ -2,7 +2,7 @@
 
 Video calls and synchronized movie nights with friends, directly in your browser. No app installation is required.
 
-- Video calls with camera, microphone, device selection, speaking indicators, and chat. A headset plugged in during a call shows up in the device lists at once, and an unplugged microphone or camera is replaced by the default one. In Chrome, Edge and Firefox, **Settings → Speakers or headphones** chooses where the call and the movie play.
+- Video calls with camera, microphone, device selection, speaking indicators, and chat. A headset plugged in during a call shows up in the device lists at once, and an unplugged microphone or camera is replaced by the default one. In Chrome, Edge and Firefox, **Speakers or headphones** (under **Devices** in the lobby, and in **Settings**) chooses where the call and the movie play.
 - Turn one person down, or mute them, just for yourself: point at their picture (long-press it on a phone or tablet). It is remembered by their name on that device.
 - Watch movies together with synchronized playback, seeking, audio tracks, and subtitles.
 - Share a movie from your device, stream it from a friend's copy, or use a room's Google Drive folder.
@@ -76,7 +76,7 @@ If you use another reverse proxy, configure it to forward WebSocket upgrades and
 2. Sign in using the `ADMIN_PASSWORD` configured in `.env`.
 3. Create a room and give it a password (leaving it empty creates a room anyone with the link can join).
 4. Share the room link and password with your friends. A room named `movienight` is available at `https://your-domain.example/movienight`.
-5. Participants enter a display name and the room password, choose their camera and microphone, and join. The name, and optionally the password, are remembered on that device. A camera or microphone switched off in the lobby is not requested from the browser until it is turned on.
+5. Participants enter a display name and the room password, choose their camera, microphone and (where the browser allows) speakers or headphones, and join. The name, and optionally the password, are remembered on that device. A camera or microphone switched off in the lobby is not requested from the browser until it is turned on.
 
 The admin page shows who is online in each room and lets you remove someone from a room, create and delete rooms, change room passwords (optionally disconnecting everyone currently in the room), and attach a Google Drive folder to a room (optional).
 

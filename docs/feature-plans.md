@@ -79,8 +79,10 @@ reading it back) and keep only mute.
 `_initAudioOutput` in `room/settings.js`; remote tiles attach in `_makeTile`. The movie element and every remote tile
 play through the choice; Firefox gets a **Choose…** button. A saved choice that is not there at the start, or that a
 device change removes, falls back to the default (the toast appears once per session) and is used again as soon as the
-browser lists it. The setting is in a `.field` block (a label for a select and a button). Tests: `test/media.test.mjs`
-and the Settings part of `test/e2e.js`.
+browser lists it. The setting is in a `.field` block (a label for a select and a button), in Settings and, added
+afterwards, under **Devices** in the lobby (`startLobby` in `app.js`), where the choice is only saved for the room to
+use; a device picked in Firefox's chooser there stays granted for the page, so the room can use it after joining.
+Tests: `test/media.test.mjs`, and the lobby and Settings parts of `test/e2e.js`.
 
 **Goal.** Choose where call audio and the movie play (headphones while the laptop speakers stay silent).
 
