@@ -22,7 +22,7 @@ test it. They are not ordered by priority; the table says what each costs and wh
 | 13 | [Chat notifications and reactions](#13-chat-notifications-and-reactions) | M | no | |
 | 14 | [More keyboard shortcuts and a shortcuts list](#14-more-keyboard-shortcuts-and-a-shortcuts-list) | S | no | **Done** |
 | 15 | [Admin: rename, room size, last activity, backup](#15-admin-rename-room-size-last-activity-backup) | L | yes | Security-sensitive: needs an Opus review |
-| 16 | [Reload the TLS certificate without a restart](#16-reload-the-tls-certificate-without-a-restart) | S | yes | |
+| 16 | [Reload the TLS certificate without a restart](#16-reload-the-tls-certificate-without-a-restart) | S | yes | **Done** |
 | 17 | [Translations](#17-translations) | L | a little | |
 
 ## Working on this repository
@@ -424,6 +424,14 @@ keys; rename disconnects members with the new name and keeps the password; `maxS
 `room-full`.
 
 ## 16. Reload the TLS certificate without a restart
+
+**Done.** `reloadTls()` in `server/server.js`, as described below. Unchanged files are left alone, and a certificate
+that has expired or is not valid yet is refused like one that does not parse (it would fail every browser; the current
+one may still work). The `SIGHUP` handler is installed only with TLS, so without it the signal still stops the server.
+The log gives the certificate's expiry date at startup and after each reload. Node.js cannot create a certificate by
+itself: `test/self-signed.js` builds a small self-signed one with `node:crypto` (DER by hand), so the test needs no
+`openssl` binary. The test in `test/server.test.js` also covers a key that does not match, files that do not parse, an
+expired certificate and a missing file. Documented in `docs/deployment.md` ("Without a reverse proxy").
 
 **Goal.** With `TLS_CERT` / `TLS_KEY` (no reverse proxy), a renewed certificate (Let's Encrypt every 60–90 days) is
 picked up without restarting the server.

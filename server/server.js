@@ -17,6 +17,7 @@
 
 const http = require('http');
 const https = require('https');
+const tls = require('tls');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
@@ -1247,9 +1248,67 @@ function route(req, res) {
   sendJson(res, 404, { error: 'Not found' });
 }
 
-const server = process.env.TLS_CERT && process.env.TLS_KEY
-  ? https.createServer({ cert: fs.readFileSync(process.env.TLS_CERT), key: fs.readFileSync(process.env.TLS_KEY) }, handleHttp)
-  : http.createServer(handleHttp);
+// ---- TLS (TLS_CERT / TLS_KEY: HTTPS without a reverse proxy) ---------------------
+const TLS_FILES = process.env.TLS_CERT && process.env.TLS_KEY ? { cert: process.env.TLS_CERT, key: process.env.TLS_KEY } : null;
+const TLS_RELOAD_MS = 12 * 3600 * 1000;
+const readTlsFiles = () => ({ cert: fs.readFileSync(TLS_FILES.cert), key: fs.readFileSync(TLS_FILES.key) });
+let tlsInUse = TLS_FILES ? readTlsFiles() : null; // the file contents the server answers with
+
+function certValidTo(cert) {
+  try {
+    return new crypto.X509Certificate(cert).validTo;
+  } catch {
+    return 'unknown';
+  }
+}
+
+/** Why browsers would refuse this certificate today (expired, not valid yet), or '' (the host name is not checked). */
+function certOutOfDate(cert) {
+  const x = new crypto.X509Certificate(cert); // the first certificate of the chain: the server's own
+  const now = Date.now();
+  if (now > new Date(x.validTo).getTime()) return `it expired on ${x.validTo}`;
+  if (now < new Date(x.validFrom).getTime()) return `it is not valid before ${x.validFrom}`;
+  return '';
+}
+
+const server = TLS_FILES ? https.createServer({ ...tlsInUse }, handleHttp) : http.createServer(handleHttp);
+
+/**
+ * Pick up a renewed certificate (Let's Encrypt renews every 60-90 days) without a restart: read both files again and,
+ * if they changed and make a usable pair, answer new TLS connections with them (open connections keep theirs). Files
+ * that cannot be read, do not parse, whose key does not match the certificate (a renewal caught half-way), or whose
+ * certificate has expired (an old copy put back) leave the current certificate in place, and the log says why. Runs on
+ * SIGHUP and every TLS_RELOAD_MS; never throws (it runs from a signal handler and a timer).
+ */
+function reloadTls(why) {
+  let next;
+  try {
+    next = readTlsFiles();
+  } catch (err) {
+    console.error(`TLS (${why}): cannot read the certificate files, keeping the current certificate: ${err.message}`);
+    return;
+  }
+  if (next.cert.equals(tlsInUse.cert) && next.key.equals(tlsInUse.key)) {
+    if (why === 'SIGHUP') console.log('TLS (SIGHUP): the certificate files have not changed');
+    return;
+  }
+  try {
+    tls.createSecureContext(next); // throws for a file that does not parse, or a key that is not the certificate's
+    const outOfDate = certOutOfDate(next.cert);
+    if (outOfDate) throw new Error(`the certificate is out of date: ${outOfDate}`);
+    server.setSecureContext(next);
+  } catch (err) {
+    console.error(`TLS (${why}): the new certificate files are not usable, keeping the current certificate: ${err.message}`);
+    return;
+  }
+  tlsInUse = next;
+  console.log(`TLS (${why}): certificate reloaded, valid until ${certValidTo(next.cert)}`);
+}
+if (TLS_FILES) {
+  // Only with TLS: otherwise SIGHUP keeps its usual meaning (the terminal is gone: stop).
+  process.on('SIGHUP', () => reloadTls('SIGHUP'));
+  setInterval(() => reloadTls('timer'), TLS_RELOAD_MS).unref();
+}
 
 // ---- Signaling -------------------------------------------------------------
 const ID_RE = /^[A-Za-z0-9_-]{8,64}$/;
@@ -1698,6 +1757,7 @@ wss.on('close', () => clearInterval(heartbeat));
 
 server.listen(PORT, HOST, () => {
   console.log(`Three-Eight listening on ${server instanceof https.Server ? 'https' : 'http'}://${HOST}:${PORT} (data: ${DATA_DIR})`);
+  if (TLS_FILES) console.log(`TLS certificate valid until ${certValidTo(tlsInUse.cert)}; it is read again on SIGHUP and every 12 hours.`);
 });
 
 function shutdown() {

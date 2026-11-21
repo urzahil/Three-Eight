@@ -9,10 +9,13 @@ const os = require('node:os');
 const path = require('node:path');
 const WebSocket = require('ws');
 const http = require('node:http');
+const https = require('node:https');
+const tls = require('node:tls');
 const net = require('node:net');
 const { RoomStore, parseDriveFolder, hashPassword, verifyPassword } = require('../server/store');
 const { limiterKey, limiterKeys } = require('../server/ip');
 const { startFakeGoogle } = require('./fake-google');
+const { selfSigned } = require('./self-signed');
 
 // Ports come from the OS (see freePort): a guessed number can already be taken, e.g. by an outgoing connection.
 let PORT = 0;
@@ -32,10 +35,20 @@ function freePort() {
   });
 }
 
+/** The status of a GET; over HTTPS the (self-signed test) certificate is not verified. */
+function getStatus(url) {
+  return new Promise((resolve, reject) => {
+    (url.startsWith('https:') ? https : http).get(url, { rejectUnauthorized: false }, (res) => {
+      res.resume();
+      resolve(res.statusCode);
+    }).on('error', reject);
+  });
+}
+
 async function waitUp(base) {
   for (let i = 0; i < 150; i++) { // up to 15 s: a loaded CI machine starts slowly
     try {
-      if ((await fetch(base + '/healthz')).ok) return;
+      if (base.startsWith('https:') ? (await getStatus(base + '/healthz')) === 200 : (await fetch(base + '/healthz')).ok) return;
     } catch { /* not up yet */ }
     await new Promise((r) => setTimeout(r, 100));
   }
@@ -53,7 +66,7 @@ async function spawnServer(env) {
   const out = { log: '' };
   child.stdout.on('data', (d) => { out.log += d; });
   child.stderr.on('data', (d) => { out.log += d; });
-  const base = `http://127.0.0.1:${port}`;
+  const base = `${env.TLS_CERT ? 'https' : 'http'}://127.0.0.1:${port}`;
   await waitUp(base);
   const stop = () => { child.kill(); fs.rmSync(dir, { recursive: true, force: true }); };
   extraProcs.push(stop);
@@ -2184,6 +2197,65 @@ test('container health check: exits 0 while the server answers, 1 when it is dow
   assert.strictEqual(await run({ PORT: String(await freePort()), HOST: '127.0.0.1' }), 1, 'nothing listening');
   // A plain HTTP server speaking to an HTTPS check (TLS_CERT set) fails rather than passing by accident.
   assert.strictEqual(await run({ PORT: String(PORT), HOST: '127.0.0.1', TLS_CERT: 'x', TLS_KEY: 'x' }), 1, 'TLS mismatch');
+});
+
+test('TLS: a renewed certificate is used after SIGHUP, without a restart; unusable files keep the current one', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'three-eight-tls-'));
+  const files = { cert: path.join(dir, 'fullchain.pem'), key: path.join(dir, 'privkey.pem') };
+  const install = ({ cert, key }) => {
+    fs.writeFileSync(files.cert, cert);
+    fs.writeFileSync(files.key, key);
+  };
+  const first = selfSigned('first.test');
+  install(first);
+  const s = await spawnServer({ TLS_CERT: files.cert, TLS_KEY: files.key });
+  try {
+    // The certificate a new TLS connection is answered with.
+    const served = () => new Promise((resolve, reject) => {
+      const socket = tls.connect({ host: '127.0.0.1', port: Number(new URL(s.base).port), servername: 'three-eight.test', rejectUnauthorized: false }, () => {
+        const { subject } = socket.getPeerX509Certificate();
+        socket.end();
+        resolve(subject);
+      });
+      socket.on('error', reject);
+    });
+    const count = (re) => (s.out.log.match(new RegExp(re, 'g')) || []).length;
+    /** Send SIGHUP and wait until the log shows `re` once more. */
+    const hup = async (re) => {
+      const before = count(re);
+      s.child.kill('SIGHUP');
+      for (let i = 0; i < 100 && count(re) === before; i++) await new Promise((r) => setTimeout(r, 50));
+      assert.strictEqual(count(re), before + 1, `the log shows ${re}:\n${s.out.log}`);
+    };
+    assert.strictEqual(await served(), 'CN=first.test');
+    assert.match(s.out.log, /TLS certificate valid until .*20\d\d GMT; it is read again on SIGHUP/);
+
+    const second = selfSigned('second.test');
+    install(second);
+    await hup('certificate reloaded, valid until');
+    assert.strictEqual(await served(), 'CN=second.test', 'renewed without a restart');
+
+    // A renewal caught half-way (new certificate, old key), files that do not parse, an expired certificate (an old copy
+    // put back), a file that is gone: the current certificate stays.
+    install({ cert: selfSigned('third.test').cert, key: first.key });
+    await hup('not usable, keeping the current certificate: .*key values mismatch');
+    install({ cert: 'not a certificate', key: 'nor a key' });
+    await hup('not usable, keeping the current certificate');
+    const day = 86400e3;
+    install(selfSigned('old.test', { from: new Date(Date.now() - 90 * day), to: new Date(Date.now() - day) }));
+    await hup('not usable, keeping the current certificate: the certificate is out of date: it expired on');
+    fs.rmSync(files.key);
+    await hup('cannot read the certificate files');
+    assert.strictEqual(await served(), 'CN=second.test');
+    install(second);
+    await hup('have not changed');
+
+    assert.strictEqual(await getStatus(s.base + '/healthz'), 200, 'still serving, over HTTPS');
+    assert.strictEqual(s.child.exitCode, null, 'SIGHUP does not stop a server with TLS');
+  } finally {
+    s.stop();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('admin logout behind a TLS proxy clears a Secure cookie and ends the session (X-Forwarded-Proto in any case)', async () => {
