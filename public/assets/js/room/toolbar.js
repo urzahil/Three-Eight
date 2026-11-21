@@ -24,6 +24,15 @@ export class Toolbar {
         prompt('Room link', url);
       }
     };
+    // A microphone or camera that was unplugged while on is replaced by the default one (see LocalMedia._reopen).
+    this.media.addEventListener('change', (e) => {
+      if (!e.detail.ended) return;
+      const audio = e.detail.kind === 'audio';
+      const what = audio ? 'microphone' : 'camera';
+      const track = audio ? this.media.audioTrack : this.media.videoTrack;
+      if (track) toast(`Your ${what} was disconnected. Now using ${track.label ? `“${track.label}”` : 'the default one'}.`);
+      else toast(`Your ${what} was disconnected.`, 'warn');
+    });
     $('sidebar-close').onclick = () => this.toggleSidebar(null);
     for (const tab of document.querySelectorAll('.tab')) tab.onclick = () => this._selectTab(tab.dataset.tab);
     this._refreshToolbar();

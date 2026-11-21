@@ -1,6 +1,10 @@
 // Local camera / microphone handling.
 
 const VIDEO_CONSTRAINTS = { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 24, max: 30 } };
+// Plugging in a headset can fire 'devicechange' several times in a row: one 'devices' event after it settles.
+const DEVICE_CHANGE_DEBOUNCE_MS = 300;
+// A device whose new track ends again this soon after being reopened automatically is left closed (no loop).
+const REOPEN_COOLDOWN_MS = 10000;
 
 export class LocalMedia extends EventTarget {
   constructor(prefs = {}) {
@@ -12,10 +16,20 @@ export class LocalMedia extends EventTarget {
     this.deviceIds = { audio: prefs.audioDevice || '', video: prefs.videoDevice || '' };
     this.processing = prefs.processing !== false;
     this.errors = { audio: null, video: null };
+    this._reopenedAt = { audio: -Infinity, video: -Infinity };
+    // A device plugged in or removed: 'devices' tells the device lists to refill (see devices()).
+    this._onDeviceChange = () => {
+      clearTimeout(this._deviceTimer);
+      this._deviceTimer = setTimeout(() => {
+        if (!this.stopped) this.dispatchEvent(new CustomEvent('devices'));
+      }, DEVICE_CHANGE_DEBOUNCE_MS);
+    };
+    navigator.mediaDevices?.addEventListener?.('devicechange', this._onDeviceChange);
   }
 
-  _emit(kind) {
-    this.dispatchEvent(new CustomEvent('change', { detail: { kind } }));
+  /** `ended`: the device's track ended (unplugged) while it was on; it was replaced, or there is none now. */
+  _emit(kind, ended = false) {
+    this.dispatchEvent(new CustomEvent('change', { detail: { kind, ended } }));
   }
 
   _audioConstraints() {
@@ -108,6 +122,11 @@ export class LocalMedia extends EventTarget {
     }
   }
 
+  /**
+   * The browser ends a track when its device is unplugged (or taken away). A microphone or camera that is on is
+   * then reopened, once per ended track: the saved device if it is still there, else the default one (see _get).
+   * Only an ended track does this, never 'devicechange' alone: on iOS, opening a camera ends the one that runs.
+   */
   _watchEnded() {
     for (const t of [this.audioTrack, this.videoTrack]) {
       if (t && !t._watched) {
@@ -115,15 +134,27 @@ export class LocalMedia extends EventTarget {
         t.addEventListener('ended', () => {
           if (t === this.videoTrack) {
             this.videoTrack = null;
-            this.camOn = false;
-            this._emit('video');
+            this._reopen('video');
           } else if (t === this.audioTrack) {
             this.audioTrack = null;
-            this._emit('audio');
+            this._reopen('audio');
           }
         });
       }
     }
+  }
+
+  async _reopen(kind) {
+    const on = kind === 'audio' ? this.micOn : this.camOn;
+    const now = Date.now();
+    // A device whose reopened track ended right away again (it keeps failing) stays closed: no loop.
+    if (on && !this.stopped && now - this._reopenedAt[kind] >= REOPEN_COOLDOWN_MS) {
+      this._reopenedAt[kind] = now;
+      await this._acquire(kind);
+    }
+    if (kind === 'video' && !this.videoTrack) this.camOn = false; // as before: a camera that is gone is off
+    this._watchEnded();
+    this._emit(kind, on && !this.stopped); // with the new track (the mesh sends it), or none
   }
 
   /** The microphone is on and has a track: what the buttons show as "on". */
@@ -234,6 +265,8 @@ export class LocalMedia extends EventTarget {
 
   stop() {
     this.stopped = true;
+    clearTimeout(this._deviceTimer);
+    navigator.mediaDevices?.removeEventListener?.('devicechange', this._onDeviceChange);
     this.audioTrack?.stop();
     this.videoTrack?.stop();
     this.audioTrack = null;

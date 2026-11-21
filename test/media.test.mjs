@@ -27,8 +27,11 @@ const requested = (c) => (c && c.deviceId?.exact) || undefined;
 function fakeDevices({ fail = false, gate = null, oneCamera = false, endsOtherCamera = false, broken = {} } = {}) {
   const calls = [];
   const made = [];
+  const listeners = new Set();
   const nav = {
     mediaDevices: {
+      addEventListener(type, fn) { if (type === 'devicechange') listeners.add(fn); },
+      removeEventListener(type, fn) { if (type === 'devicechange') listeners.delete(fn); },
       async getUserMedia(c) {
         calls.push(c);
         if (gate) await gate;
@@ -49,7 +52,8 @@ function fakeDevices({ fail = false, gate = null, oneCamera = false, endsOtherCa
     },
   };
   Object.defineProperty(globalThis, 'navigator', { value: nav, configurable: true, writable: true });
-  return { calls, made };
+  // devicechange(): the system's device list changed (a headset was plugged in or removed).
+  return { calls, made, listeners, devicechange: () => { for (const fn of [...listeners]) fn(); } };
 }
 
 const keys = (c) => ({ audio: !!c.audio, video: !!c.video });
@@ -245,13 +249,125 @@ test('unmute right after the microphone was blocked asks for it at once (not on 
   assert.equal(m.micActive, false, 'and the next one mutes');
 });
 
-test('unmute after the microphone was unplugged opens one again at once', async () => {
+test('unmute after the microphone was unplugged (and none could be reopened) opens one again at once', async () => {
   fakeDevices();
   const m = new LocalMedia({ mic: true, cam: false });
   await m.init();
-  m.audioTrack.end(); // unplugged
+  navigator.mediaDevices.getUserMedia = async () => { throw err('NotFoundError'); };
+  m.audioTrack.end(); // unplugged, and no other microphone
   assert.equal(m.audioTrack, null);
+  await settle();
   assert.equal(m.micActive, false);
+  fakeDevices(); // a microphone is plugged in
   await m.toggleMic();
   assert.ok(m.audioTrack && m.audioTrack.enabled, 'a new track, enabled');
 });
+
+const settle = (ms = 0) => new Promise((r) => setTimeout(r, ms));
+
+test('devicechange bursts become one "devices" event; none after stop()', async () => {
+  const { listeners, devicechange } = fakeDevices();
+  const m = new LocalMedia({ mic: false, cam: false });
+  let n = 0;
+  m.addEventListener('devices', () => n++);
+  devicechange();
+  devicechange();
+  await settle(100);
+  devicechange();
+  assert.equal(n, 0, 'waits for the burst to settle');
+  await settle(450);
+  assert.equal(n, 1);
+  devicechange();
+  m.stop();
+  await settle(450);
+  assert.equal(n, 1, 'no event after leaving');
+  assert.equal(listeners.size, 0, 'the listener is removed');
+});
+
+test('an unplugged microphone that is on is replaced by the default one, with one request and one change', async () => {
+  // The saved microphone is gone: the reopen falls back to the default one (an exact request, then the default).
+  const broken = {};
+  const { calls } = fakeDevices({ broken });
+  const m = new LocalMedia({ mic: true, cam: false, audioDevice: 'usb' });
+  await m.init();
+  assert.equal(m.audioTrack.deviceId, 'usb');
+  broken.usb = 'OverconstrainedError'; // unplugged
+  const before = calls.length;
+  const seen = [];
+  m.addEventListener('change', (e) => seen.push([e.detail.kind, m.audioTrack?.deviceId, e.detail.ended]));
+  const old = m.audioTrack;
+  old.end();
+  await settle();
+  assert.deepEqual(calls.slice(before).map((c) => requested(c.audio) || 'default'), ['usb', 'default']);
+  assert.ok(m.audioTrack && m.audioTrack !== old && m.audioTrack.enabled);
+  assert.equal(m.deviceIds.audio, '', 'the default device is used from now on');
+  assert.deepEqual(seen, [['audio', 'default-audio', true]], 'one change, with the new track (and "ended": the room says so)');
+});
+
+test('a microphone that cannot be reopened is not asked for again, nor one whose new track ends at once', async () => {
+  const { calls } = fakeDevices();
+  const m = new LocalMedia({ mic: true, cam: false });
+  await m.init();
+  const seen = [];
+  m.addEventListener('change', (e) => seen.push(e.detail.kind));
+  // 1. The new track ends right away (a device that keeps failing): it is not reopened a second time.
+  m.audioTrack.end();
+  await settle();
+  assert.equal(calls.length, 2, 'one request after the first end');
+  m.audioTrack.end();
+  await settle();
+  assert.equal(calls.length, 2, 'no request after the second end');
+  assert.equal(m.audioTrack, null);
+  assert.deepEqual(seen, ['audio', 'audio'], 'the mesh hears of each change');
+  // 2. The request fails: nothing more is asked.
+  const again = fakeDevices({ fail: true });
+  const m2 = new LocalMedia({ mic: true, cam: false });
+  navigator.mediaDevices.getUserMedia = async () => fakeStream('audio');
+  await m2.init();
+  navigator.mediaDevices.getUserMedia = async (c) => { again.calls.push(c); throw err('NotReadableError'); };
+  m2.audioTrack.end();
+  await settle(50);
+  assert.equal(again.calls.length, 1);
+  assert.equal(m2.audioTrack, null);
+  assert.equal(m2.micOn, true, 'the preference stays on: the button offers "Unmute"');
+});
+
+test('a muted microphone or a camera that is off is not reopened; a camera that is on is, or goes off', async () => {
+  const { calls } = fakeDevices();
+  const m = new LocalMedia({ mic: true, cam: true });
+  await m.init();
+  await m.setMic(false);
+  m.audioTrack.end();
+  await settle();
+  assert.equal(calls.length, 1, 'muted: no request (unmuting asks for one, see above)');
+  m.videoTrack.end();
+  await settle();
+  assert.equal(calls.length, 2, 'the camera is reopened');
+  assert.ok(m.videoTrack && m.camOn);
+  // The camera is gone for good: it is off, as before.
+  navigator.mediaDevices.getUserMedia = async () => { throw err('NotFoundError'); };
+  m._reopenedAt.video = -Infinity; // past the cooldown
+  const seen = [];
+  m.addEventListener('change', (e) => seen.push(e.detail.kind));
+  m.videoTrack.end();
+  await settle();
+  assert.equal(m.videoTrack, null);
+  assert.equal(m.camOn, false);
+  assert.deepEqual(seen, ['video']);
+});
+
+test('a track that ends after leaving is not reopened', async () => {
+  const { calls } = fakeDevices();
+  const m = new LocalMedia({ mic: true, cam: false });
+  await m.init();
+  const t = m.audioTrack;
+  m.stop();
+  t.end();
+  await settle();
+  assert.equal(calls.length, 1);
+});
+
+function fakeStream(kind) {
+  const t = fakeTrack(kind);
+  return { getTracks: () => [t], getAudioTracks: () => (kind === 'audio' ? [t] : []), getVideoTracks: () => (kind === 'video' ? [t] : []) };
+}

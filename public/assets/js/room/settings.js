@@ -38,6 +38,13 @@ export class Settings {
       store.set('shareFile', e.target.checked);
     };
 
+    // A headset plugged in or removed while Settings are open shows up in the lists at once, and so does the device
+    // that replaced an unplugged one.
+    const refill = () => {
+      if ($('settings-dialog').open) this._fillDeviceLists();
+    };
+    this.media.addEventListener('devices', refill);
+    this.media.addEventListener('change', refill);
     $('set-audio-dev').onchange = (e) => this._changeDevice('audio', e.target.value);
     $('set-video-dev').onchange = (e) => this._changeDevice('video', e.target.value);
     $('set-noise').onchange = (e) => {
@@ -131,14 +138,19 @@ export class Settings {
     store.set('media', { ...store.get('media', {}), [kind === 'audio' ? 'audioDevice' : 'videoDevice']: this.media.deviceIds[kind] });
   }
 
-  async openSettings() {
-    $('set-name').value = this.name;
+  /** The microphone and camera lists, with the devices in use selected. */
+  async _fillDeviceLists() {
     const d = await this.media.devices();
     for (const kind of ['audio', 'video']) {
       const sel = $(`set-${kind}-dev`);
       sel.replaceChildren(...d[kind].map((dev, i) => new Option(dev.label || `${kind === 'audio' ? 'Microphone' : 'Camera'} ${i + 1}`, dev.deviceId)));
       sel.value = this.media.currentDeviceId(kind);
     }
+  }
+
+  async openSettings() {
+    $('set-name').value = this.name;
+    await this._fillDeviceLists();
     $('settings-dialog').showModal();
   }
 }

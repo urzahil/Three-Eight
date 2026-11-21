@@ -1,6 +1,7 @@
 # Feature plans
 
-Implementation notes for features that Three-Eight does not have yet. Each section is meant to be picked up on its own
+Implementation notes for features that Three-Eight did not have when they were written. Those built since are marked
+**Done** in the table, and their sections say what was built. Each section is meant to be picked up on its own
 (by a person or a Claude session): what to build, where it goes in the code, the edge cases that matter, and how to
 test it. They are not ordered by priority; the table says what each costs and what it is worth.
 
@@ -8,7 +9,7 @@ test it. They are not ordered by priority; the table says what each costs and wh
 |---|---|---|---|---|
 | 1 | [Per-person volume and mute](#1-per-person-volume-and-mute) | S | no | Purely local |
 | 2 | [Speaker / headphone picker](#2-speaker--headphone-picker) | S | no | Chrome, Edge, Firefox |
-| 3 | [Devices plugged in or removed mid-call](#3-devices-plugged-in-or-removed-mid-call) | S | no | |
+| 3 | [Devices plugged in or removed mid-call](#3-devices-plugged-in-or-removed-mid-call) | S | no | **Done** |
 | 4 | [Resume where you left off](#4-resume-where-you-left-off) | S | no | |
 | 5 | [Next episode from the Drive folder](#5-next-episode-from-the-drive-folder) | M | no | |
 | 6 | [Countdown before play](#6-countdown-before-play) | S | no | Compatible with older clients |
@@ -89,6 +90,12 @@ element. Apply again after a `devicechange` (see 3).
 in a browser check that choosing the default calls `setSinkId('')` without errors.
 
 ## 3. Devices plugged in or removed mid-call
+
+**Done.** Built as described below (`LocalMedia` in `media.js`: the `'devices'` event and `_reopen`), with three
+additions: a reopened device whose new track ends again within 10 s is left closed (a failing device cannot loop); the
+`'change'` event says `ended: true` after a reopen, and the room shows a toast naming the device that took over; and the
+lobby and Settings lists also refill on `'change'`, so they show the device that replaced an unplugged one. Tests:
+`test/media.test.mjs`.
 
 **Goal.** Plugging in a headset shows it in the device lists at once; unplugging the microphone in use switches to the
 default one instead of leaving you silent.
